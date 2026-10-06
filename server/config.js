@@ -12,7 +12,6 @@ export function loadConfig(env = process.env) {
     if (!Number.isInteger(n) || n < min || n > max) { problems.push(`${name} must be a whole number from ${min} to ${max} (got "${raw}")`); return fallback; }
     return n;
   };
-  const bool = (name) => ['1', 'true', 'yes'].includes(String(env[name] || '').toLowerCase());
   const oneOf = (name, options, fallback) => {
     const raw = env[name] || fallback;
     if (!options.includes(raw)) problems.push(`${name} must be one of ${options.join(', ')} (got "${raw}")`);
@@ -45,7 +44,16 @@ export function loadConfig(env = process.env) {
     dataDir: path.resolve(env.DATA_DIR || './data'),
     logLevel: oneOf('LOG_LEVEL', LEVELS, 'info'),
     logFormat: oneOf('LOG_FORMAT', ['json', 'pretty'], env.NODE_ENV === 'production' || !process.stdout.isTTY ? 'json' : 'pretty'),
-    trustProxy: bool('TRUST_PROXY'),
+    // Where the real client IP comes from: the socket (default), Fly-Client-IP, CF-Connecting-IP,
+    // or the last X-Forwarded-For entry (one generic reverse proxy in front). Only set it when that proxy is the sole way in.
+    trustProxy: (() => {
+      const modes = { '': null, 0: null, false: null, fly: 'fly', cloudflare: 'cloudflare', 1: 'xff', true: 'xff', xff: 'xff' };
+      const raw = String(env.TRUST_PROXY || '').toLowerCase();
+      if (raw in modes) return modes[raw];
+      problems.push(`TRUST_PROXY must be one of fly, cloudflare, xff (got "${env.TRUST_PROXY}")`);
+      return null;
+    })(),
+    maxConnections: int('MAX_CONNECTIONS', 5000, 10, 1_000_000),
     sentry,
     environment: env.SENTRY_ENVIRONMENT || env.NODE_ENV || 'development',
     // Per-minute budgets. Public routes are per IP, writes are per user.

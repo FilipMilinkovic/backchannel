@@ -37,10 +37,11 @@ export function createRepo(db) {
       run('INSERT INTO users (id, handle, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)', user.id, handle, name, tokenHash, user.createdAt);
       return user;
     },
-    // Replaces the main token and signs out every browser session.
+    // Replaces the main token and signs out every browser session, including sign-in links not used yet.
     setToken: (userId, tokenHash) => db.tx(() => {
       run('UPDATE users SET token_hash = ? WHERE id = ?', tokenHash, userId);
       run('DELETE FROM sessions WHERE user_id = ?', userId);
+      run('DELETE FROM login_codes WHERE user_id = ?', userId);
     }),
     createSession: (userId, hash, label) => db.tx(() => {
       const now = Date.now();
@@ -137,7 +138,9 @@ export function createRepo(db) {
       return [...map.values()].map((t) => ({ ...t, participants: [...t.participants] })).sort((a, b) => b.updated - a.updated);
     },
 
-    enqueue: (teamId, agentId, messageId) => run('INSERT OR IGNORE INTO inbox (team_id, agent_id, message_id) VALUES (?, ?, ?)', teamId, agentId, messageId),
+    // Inboxes are delivered in the order messages were posted. A no-op if the agent is gone.
+    enqueue: (teamId, agentId, messageId) => run(`INSERT OR IGNORE INTO inbox (team_id, agent_id, message_id)
+      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?)`, teamId, agentId, messageId, teamId, agentId),
     inbox: (teamId, agentId) => all(`SELECT m.body FROM inbox i JOIN messages m ON m.id = i.message_id
       WHERE i.team_id = ? AND i.agent_id = ? ORDER BY m.seq`, teamId, agentId).map(toMessage),
     // Hands the whole inbox over and empties it.

@@ -17,10 +17,17 @@ export function readLegacy(dir, log) {
   const messages = [];
   const logFile = path.join(dir, 'messages.jsonl');
   if (fs.existsSync(logFile)) {
-    for (const line of fs.readFileSync(logFile, 'utf8').split('\n')) {
-      if (!line.trim()) continue;
-      try { messages.push(JSON.parse(line)); } catch { log?.warn('skipping an invalid line in messages.jsonl'); }
-    }
+    const raw = fs.readFileSync(logFile, 'utf8');
+    const lines = raw.split('\n');
+    const last = lines.findLastIndex((l) => l.trim());
+    lines.forEach((line, i) => {
+      if (!line.trim()) return;
+      try { messages.push(JSON.parse(line)); } catch {
+        // A crash mid-append leaves one unterminated last line; that one is safe to drop. Anything else is damage.
+        if (i === last && !raw.endsWith('\n')) log?.warn('dropping an incomplete last line in messages.jsonl', { line: i + 1 });
+        else throw new Error(`can't import messages.jsonl: line ${i + 1} is not valid JSON. Fix or remove that line and start again.`);
+      }
+    });
   }
   const registry = read(dir, 'agents.json', { agents: [], inboxes: {} });
   const agents = Array.isArray(registry) ? registry : registry.agents || [];

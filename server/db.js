@@ -6,7 +6,8 @@ import { readLegacy, LEGACY_FILES } from './legacy.js';
 
 // Append only. Each entry moves the schema from version i to i + 1.
 const MIGRATIONS = [
-  `CREATE TABLE users (
+  `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+   CREATE TABLE users (
      id TEXT PRIMARY KEY, handle TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
      token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
    CREATE TABLE sessions (
@@ -40,17 +41,22 @@ const MIGRATIONS = [
      FOREIGN KEY (team_id, agent_id) REFERENCES agents(team_id, id) ON DELETE CASCADE);`,
 ];
 
+export const DB_FILE = 'backchannel.db';
+
 export function openDb(dir, log) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, 'backchannel.db');
+  const file = path.join(dir, DB_FILE);
   const fresh = !fs.existsSync(file);
   const db = new DatabaseSync(file);
   if (fresh) fs.chmodSync(file, 0o600);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  // Nested calls join the outer transaction. (Tracked by hand: db.isTransaction needs a newer Node than 22.13.)
+  let depth = 0;
   db.tx = (fn) => {
-    if (db.isTransaction) return fn();
+    if (depth) { depth++; try { return fn(); } finally { depth--; } }
     db.exec('BEGIN IMMEDIATE');
-    try { const out = fn(); db.exec('COMMIT'); return out; } catch (err) { db.exec('ROLLBACK'); throw err; }
+    depth = 1;
+    try { const out = fn(); db.exec('COMMIT'); return out; } catch (err) { db.exec('ROLLBACK'); throw err; } finally { depth = 0; }
   };
   const version = db.prepare('PRAGMA user_version').get().user_version;
   if (version > MIGRATIONS.length) {
@@ -64,52 +70,69 @@ export function openDb(dir, log) {
   return db;
 }
 
-// One-time import of the JSON files used before SQLite (v2, and v1 through readLegacy). Runs only into an empty database,
-// in one transaction, and then renames the files to *.imported so nothing is lost.
+// One-time import of the JSON files used before SQLite (v2, and v1 through readLegacy). The data and a completion
+// marker commit in one transaction; the files are renamed to *.imported afterwards, so nothing is deleted.
+// If the process dies between the commit and the renames, the next start sees the marker and only finishes the renames.
 function importLegacy(db, dir, log) {
   const present = LEGACY_FILES.filter((f) => fs.existsSync(path.join(dir, f)));
   if (!present.length) return;
-  const empty = !db.prepare('SELECT 1 FROM users UNION ALL SELECT 1 FROM teams UNION ALL SELECT 1 FROM messages LIMIT 1').get();
-  if (!empty) {
-    log?.warn('found JSON data files next to a non-empty database; ignoring them', { files: present });
+  const rename = (files) => {
+    for (const f of files) {
+      if (fs.existsSync(path.join(dir, f + '.imported'))) log?.warn(`leaving ${f} alone: it was already imported once`, { file: f });
+      else fs.renameSync(path.join(dir, f), path.join(dir, f + '.imported'));
+    }
+  };
+  if (db.prepare("SELECT 1 AS x FROM meta WHERE key = 'json_import'").get()) return rename(present);
+  if (db.prepare('SELECT 1 AS x FROM users UNION ALL SELECT 1 FROM teams UNION ALL SELECT 1 FROM messages LIMIT 1').get()) {
+    log?.warn('found JSON data files next to a database that already has data; ignoring them', { files: present });
     return;
   }
-  const data = readLegacy(dir, log);
+  const data = readLegacy(dir, log); // throws with file and line on damaged data
+  const skipped = { members: 0, agents: 0, messages: 0, inboxEntries: 0, sessions: 0 };
   db.tx(() => {
+    const now = Date.now();
     const users = db.prepare('INSERT INTO users (id, handle, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)');
+    // Imported sessions count as used now, so nobody is signed out by the upgrade.
     const sessions = db.prepare('INSERT OR IGNORE INTO sessions (hash, user_id, label, created_at, last_used_at) VALUES (?, ?, ?, ?, ?)');
     for (const u of data.users) {
-      users.run(u.id, u.handle, u.name || u.handle, u.tokenHash, u.createdAt || Date.now());
-      for (const s of u.sessions || []) sessions.run(s.hash, u.id, s.label || 'browser', s.createdAt || Date.now(), s.createdAt || Date.now());
+      users.run(u.id, u.handle, u.name || u.handle, u.tokenHash, u.createdAt || now);
+      for (const s of u.sessions || []) skipped.sessions += 1 - Number(sessions.run(s.hash, u.id, String(s.label || 'browser'), s.createdAt || now, now).changes);
     }
     const userIds = new Set(data.users.map((u) => u.id));
     const teams = db.prepare('INSERT INTO teams (id, name, max_hops, created_at) VALUES (?, ?, ?, ?)');
     const members = db.prepare('INSERT INTO members (team_id, user_id, role, joined_at, seq) VALUES (?, ?, ?, ?, ?)');
     const invites = db.prepare('INSERT INTO invites (code, team_id, role, created_by, created_at, expires_at, uses_left) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const t of data.teams) {
-      teams.run(t.id, t.name, t.maxHops || 8, t.createdAt || Date.now());
-      (t.members || []).filter((m) => userIds.has(m.userId)).forEach((m, i) => members.run(t.id, m.userId, m.role, m.joinedAt || Date.now(), i));
-      for (const i of t.invites || []) invites.run(i.code, t.id, i.role, i.createdBy ?? null, i.createdAt || Date.now(), i.expiresAt, i.usesLeft);
+      teams.run(t.id, t.name, t.maxHops || 8, t.createdAt || now);
+      const known = (t.members || []).filter((m) => userIds.has(m.userId));
+      skipped.members += (t.members || []).length - known.length;
+      known.forEach((m, i) => members.run(t.id, m.userId, m.role, m.joinedAt || now, i));
+      for (const i of t.invites || []) invites.run(i.code, t.id, i.role, i.createdBy ?? null, i.createdAt || now, i.expiresAt, i.usesLeft);
     }
     const teamIds = new Set(data.teams.map((t) => t.id));
     const agents = db.prepare('INSERT OR IGNORE INTO agents (team_id, id, owner_user_id, card, registered_at) VALUES (?, ?, ?, ?, ?)');
     for (const a of data.agents) {
-      if (!teamIds.has(a.teamId)) continue;
       const { teamId, id, ownerUserId, registeredAt, lastSeen, state, stateThread, ...card } = a;
-      agents.run(teamId, id, ownerUserId && userIds.has(ownerUserId) ? ownerUserId : null, JSON.stringify(card), registeredAt || Date.now());
+      if (!teamIds.has(teamId) || !id) { skipped.agents++; continue; }
+      skipped.agents += 1 - Number(agents.run(teamId, id, ownerUserId && userIds.has(ownerUserId) ? ownerUserId : null, JSON.stringify(card), registeredAt || now).changes);
     }
+    // File order is kept: it becomes the message sequence.
     const messages = db.prepare('INSERT OR IGNORE INTO messages (id, team_id, thread_id, ts, body) VALUES (?, ?, ?, ?, ?)');
     for (const m of data.messages) {
-      if (!m.id || !teamIds.has(m.teamId)) continue;
-      messages.run(String(m.id), m.teamId, String(m.threadId || m.id), Number(m.ts) || 0, JSON.stringify(m));
+      if (!m.id || !teamIds.has(m.teamId)) { skipped.messages++; continue; }
+      skipped.messages += 1 - Number(messages.run(String(m.id), m.teamId, String(m.threadId || m.id), Number(m.ts) || 0, JSON.stringify(m)).changes);
     }
+    // Inboxes come from the saved queues (never from recipients, which would redeliver consumed messages).
     const inbox = db.prepare(`INSERT OR IGNORE INTO inbox (team_id, agent_id, message_id)
-      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?) AND EXISTS (SELECT 1 FROM messages WHERE id = ?)`);
+      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?) AND EXISTS (SELECT 1 FROM messages WHERE id = ? AND team_id = ?)`);
     for (const [key, ids] of Object.entries(data.inboxes)) {
       const [teamId, agentId] = key.split('/');
-      for (const id of ids) inbox.run(teamId, agentId, id, teamId, agentId, id);
+      for (const id of ids) skipped.inboxEntries += 1 - Number(inbox.run(teamId, agentId, id, teamId, agentId, id, teamId).changes);
     }
+    db.prepare("INSERT INTO meta (key, value) VALUES ('json_import', ?)").run(JSON.stringify({ at: now, files: present, skipped }));
   });
-  for (const f of present) fs.renameSync(path.join(dir, f), path.join(dir, f + '.imported'));
+  rename(present);
   log?.info('imported JSON data into the database', { users: data.users.length, teams: data.teams.length, messages: data.messages.length, files: present });
+  if (Object.values(skipped).some(Boolean)) log?.warn('some imported records were skipped (duplicates or references to missing data)', { skipped });
 }
+

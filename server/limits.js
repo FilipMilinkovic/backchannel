@@ -1,6 +1,8 @@
 // In-memory abuse limits for a single hub process: token buckets and per-user caps on open streams.
 import { httpError } from './auth.js';
 
+const MAX_KEYS = 50_000;
+
 export class RateLimiter {
   constructor(perMinute) {
     this.capacity = perMinute;
@@ -12,6 +14,8 @@ export class RateLimiter {
   // Throws 429 when the key has no budget left; sets retryAfter (seconds) on the error.
   take(key, cost = 1) {
     const now = Date.now();
+    // Bounded memory: under a flood of distinct keys, forget full buckets first, then everything.
+    if (this.buckets.size >= MAX_KEYS && !this.buckets.has(key)) { this.sweep(); if (this.buckets.size >= MAX_KEYS) this.buckets.clear(); }
     const b = this.buckets.get(key) || { tokens: this.capacity, at: now };
     b.tokens = Math.min(this.capacity, b.tokens + (now - b.at) * this.refillPerMs);
     b.at = now;

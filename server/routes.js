@@ -24,10 +24,24 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       skills: a.skills?.length ? a.skills : [{ id: 'chat', name: 'Chat', description: a.description || 'General conversation' }],
       'x-backend': a.backend, 'x-handle': `@${a.id}` };
   }
-  const closeUser = (userId, teamId) => rt.closeUser(userId, teamId, (key) => {
+  const ownedBy = (userId) => (key) => {
     const [t, id] = key.split('/');
     return repo.agent(t, id)?.ownerUserId === userId;
-  });
+  };
+  const closeUser = (userId, teamId) => rt.closeUser(userId, teamId, ownedBy(userId));
+  // Re-checks every live stream's credential and membership; SSE time counts as session activity.
+  function revalidateStreams() {
+    const now = Date.now();
+    rt.revalidate((c) => {
+      if (!stillValid(repo, c.auth) || !repo.member(c.teamId, c.userId)) return false;
+      if (c.auth.sessionHash) {
+        const s = repo.sessionByHash(c.auth.sessionHash);
+        if (now - s.lastUsedAt > config.sessionDays * 86_400_000) return false;
+        if (now - s.lastUsedAt > 60_000) repo.touchSession(s.hash, now);
+      }
+      return true;
+    });
+  }
   function removeAgent(teamId, id) { repo.deleteAgent(teamId, id); rt.forget(teamId, id); }
   function validName(name) {
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 200) throw httpError(400, 'name must be 1 to 200 characters');
@@ -150,11 +164,15 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
 
     // Exchange a one-time sign-in link for a browser session token.
     if (publicLogin && req.method === 'POST') {
-      const userId = repo.takeLoginCode(hashToken(publicLogin[1]));
-      const owner = userId && repo.userById(userId);
-      if (!owner) throw httpError(404, 'this sign-in link is invalid, expired or already used');
       const token = newToken();
-      repo.createSession(owner.id, hashToken(token), String(b.label || 'browser').slice(0, 60));
+      const owner = repo.tx(() => {
+        const userId = repo.takeLoginCode(hashToken(publicLogin[1]));
+        const found = userId && repo.userById(userId);
+        if (found) repo.createSession(found.id, hashToken(token), String(b.label || 'browser').slice(0, 60));
+        return found;
+      });
+      if (!owner) throw httpError(404, 'this sign-in link is invalid, expired or already used');
+      revalidateStreams(); // the session cap may have evicted an older browser
       return send(res, 200, { token, user: publicUser(owner) });
     }
     if (publicInvite) {
@@ -197,6 +215,9 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     if (p === '/api/me/logout' && req.method === 'POST') {
       if (!auth.sessionHash) throw httpError(400, "that's your main token; rotate it instead (POST /api/me/token)");
       repo.deleteSession(auth.sessionHash);
+      // Close what this browser still has open; the user's other credentials keep working.
+      revalidateStreams();
+      rt.wakeIf(ownedBy(user.id));
       return send(res, 200, { ok: true });
     }
     if (p === '/api/me/token' && req.method === 'POST') {
@@ -273,7 +294,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
       res.write(`data: ${JSON.stringify({ type: 'hello', agents: agentList(team.id), config: teamConfig(team), members: members(team.id), role: member.role })}\n\n`);
       res.on('close', release);
-      rt.addClient({ res, teamId: team.id, userId: user.id });
+      rt.addClient({ res, teamId: team.id, userId: user.id, auth });
       return;
     }
     if (rest === '/agents' && req.method === 'GET') return send(res, 200, agentList(team.id));
@@ -337,6 +358,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     throw httpError(404, 'no such endpoint');
   }
   handle.broadcastAgents = broadcastAgents;
+  handle.revalidateStreams = revalidateStreams;
   return handle;
 }
 

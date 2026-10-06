@@ -1,0 +1,201 @@
+// Operational behavior: health, headers, logs, limits, revocation of open streams, shutdown, config, backup.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { startHub, query, prefix, delay, tempDir, ROOT } from './helpers.js';
+
+// Opens an SSE stream; resolves with { res, events, ended } once the hello event arrived.
+function openStream(url) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      const s = { res, status: res.statusCode, events: [], ended: false, req };
+      res.setEncoding('utf8');
+      let buf = '';
+      res.on('data', (d) => {
+        buf += d;
+        for (const block of buf.split('\n\n').slice(0, -1)) {
+          const line = block.split('\n').find((l) => l.startsWith('data: '));
+          if (line) s.events.push(JSON.parse(line.slice(6)));
+        }
+        buf = buf.slice(buf.lastIndexOf('\n\n') + 2);
+        if (s.events.length === 1) resolve(s);
+      });
+      res.on('end', () => { s.ended = true; });
+      res.on('close', () => { s.ended = true; });
+      if (res.statusCode !== 200) { resolve(s); res.resume(); }
+    });
+    req.on('error', reject);
+  });
+}
+const waitFor = async (cond, ms = 3000) => {
+  const end = Date.now() + ms;
+  while (!cond()) { if (Date.now() > end) throw new Error('timed out'); await delay(10); }
+};
+
+test('health, readiness, version, request ids and security headers', async (t) => {
+  const h = await startHub(t);
+  const health = await h.api('/healthz');
+  assert.equal(health.status, 200); assert.equal(health.body.ok, true); assert.match(health.body.version, /^\d+\.\d+\.\d+/);
+  assert.equal((await h.api('/readyz')).status, 200);
+  assert.equal((await h.api('/api/version')).body.version, health.body.version);
+
+  const generated = await h.api('/api/me');
+  assert.match(generated.headers.get('x-request-id'), /^[a-f0-9]{16}$/);
+  assert.equal((await h.api('/api/me', null, 'GET', undefined, { 'x-request-id': 'trace-123' })).headers.get('x-request-id'), 'trace-123');
+  assert.notEqual((await h.api('/api/me', null, 'GET', undefined, { 'x-request-id': 'bad id!' })).headers.get('x-request-id'), 'bad id!');
+
+  const page = await fetch(h.base + '/');
+  const html = await page.text();
+  for (const [k, v] of [['x-content-type-options', 'nosniff'], ['referrer-policy', 'no-referrer'], ['x-frame-options', 'DENY'], ['cache-control', 'no-cache']]) {
+    assert.equal(page.headers.get(k), v, k);
+  }
+  assert.equal(page.headers.get('strict-transport-security'), null, 'no HSTS without an https PUBLIC_URL');
+  const csp = page.headers.get('content-security-policy');
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  assert.ok(csp.includes(`'sha256-${crypto.createHash('sha256').update(script).digest('base64')}'`), 'the UI script is allowed by hash');
+  assert.ok(!/script-src[^;]*unsafe-inline/.test(csp));
+  assert.equal((await fetch(h.base + '/../package.json')).status, 404);
+  assert.equal((await fetch(h.base + '/%2e%2e/package.json')).status, 404);
+});
+
+test('JSON access logs carry request ids and never contain tokens or invite codes', async (t) => {
+  const h = await startHub(t);
+  const setup = h.setup;
+  const owner = await h.bootstrap();
+  await h.ok('/api/me', owner.token);
+  const stream = await openStream(`${h.base}${prefix(owner)}/events?token=${owner.token}`);
+  stream.req.destroy();
+  await h.api('/api/me', null, 'GET', undefined, { 'x-request-id': 'find-me' });
+  await waitFor(() => h.logs().some((l) => l.requestId === 'find-me'));
+  const entry = h.logs().find((l) => l.requestId === 'find-me');
+  assert.equal(entry.msg, 'request'); assert.equal(entry.status, 401); assert.equal(entry.path, '/api/me'); assert.equal(typeof entry.ms, 'number');
+  const accept = h.logs().find((l) => l.path?.includes('/accept'));
+  assert.equal(accept.path, `/api/invites/${setup.slice(0, 4)}…/accept`);
+  const afterSetup = h.output.slice(h.output.indexOf(`"path":"/api/invites`));
+  assert.ok(!afterSetup.includes(setup), 'invite code is redacted from request logs');
+  assert.ok(!h.output.includes(owner.token), 'token never logged');
+  assert.ok(h.output.includes('token=[redacted]'));
+});
+
+test('browser errors are logged with their context and rate-limited', async (t) => {
+  const h = await startHub(t);
+  const res = await h.api('/api/client-errors', null, 'POST', { message: 'boom bc_' + 'a'.repeat(64), stack: 'at render (app.js:1:2)', url: 'http://x/#delegations' });
+  assert.equal(res.status, 202);
+  await waitFor(() => h.logs().some((l) => l.source === 'browser'));
+  const entry = h.logs().find((l) => l.source === 'browser');
+  assert.equal(entry.level, 'error'); assert.match(entry.msg, /^browser error: boom bc_\[redacted\]/);
+  assert.equal(entry.page, 'http://x/#delegations'); assert.match(entry.err.stack, /render/);
+  let limited = 0;
+  for (let i = 0; i < 12; i++) if ((await h.api('/api/client-errors', null, 'POST', { message: 'x' })).status === 429) limited++;
+  assert.ok(limited >= 2);
+});
+
+test('rate limits on public routes and writes, with Retry-After', async (t) => {
+  const h = await startHub(t, null, { RATE_PUBLIC_PER_MIN: '4', RATE_WRITES_PER_MIN: '5' });
+  const owner = await h.bootstrap(); // 1 public request
+  for (let i = 0; i < 3; i++) assert.equal((await h.api('/api/invites/abcdef')).status, 404);
+  const limited = await h.api('/api/invites/abcdef');
+  assert.equal(limited.status, 429); assert.ok(Number(limited.headers.get('retry-after')) >= 1);
+  const p = prefix(owner);
+  const statuses = [];
+  for (let i = 0; i < 7; i++) statuses.push((await h.api(p + '/messages', owner.token, 'POST', { text: 'hi' })).status);
+  assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429, 429]);
+  assert.equal((await h.api('/api/me', owner.token)).status, 200, 'reads have their own budget');
+});
+
+test('open streams per user are capped', async (t) => {
+  const h = await startHub(t, null, { MAX_STREAMS_PER_USER: '2' });
+  const owner = await h.bootstrap();
+  const url = `${h.base}${prefix(owner)}/events?token=${owner.token}`;
+  const a = await openStream(url), b = await openStream(url);
+  const c = await openStream(url);
+  assert.equal(c.status, 429);
+  a.req.destroy();
+  await delay(50);
+  const d = await openStream(url);
+  assert.equal(d.status, 200);
+  b.req.destroy(); d.req.destroy();
+});
+
+test('signing out a browser closes its open stream; the main token keeps its own', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  const link = await h.ok('/api/me/login-link', owner.token, 'POST');
+  const browser = await h.ok(`/api/login/${link.code}`, null, 'POST');
+  const viaSession = await openStream(`${h.base}${prefix(owner)}/events?token=${browser.token}`);
+  const viaToken = await openStream(`${h.base}${prefix(owner)}/events?token=${owner.token}`);
+  await h.ok('/api/me/logout', browser.token, 'POST');
+  await waitFor(() => viaSession.ended);
+  await delay(50);
+  assert.equal(viaToken.ended, false);
+  // Rotating the main token invalidates sign-in links that weren't used yet.
+  const unused = await h.ok('/api/me/login-link', owner.token, 'POST');
+  await h.ok('/api/me/token', owner.token, 'POST');
+  assert.equal((await h.api(`/api/login/${unused.code}`, null, 'POST')).status, 404);
+  await waitFor(() => viaToken.ended);
+});
+
+test('SIGTERM releases long polls without dequeuing, ends streams and exits cleanly', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  const p = prefix(owner);
+  await h.ok(p + '/agents', owner.token, 'POST', { id: 'worker' });
+  await h.ok(p + '/agents', owner.token, 'POST', { id: 'other' });
+  const stream = await openStream(`${h.base}${p}/events?token=${owner.token}`);
+  const poll = fetch(`${h.base}${p}/agents/worker/inbox?wait=30`, { headers: { authorization: `Bearer ${owner.token}` } });
+  await delay(100);
+  // A message for another agent sits in its inbox through the restart.
+  await h.ok(p + '/messages', owner.token, 'POST', { text: '@other later' });
+  const started = Date.now();
+  const exited = once(h.child, 'exit');
+  h.child.kill('SIGTERM');
+  const res = await poll;
+  assert.equal(res.status, 200); assert.deepEqual(await res.json(), []);
+  const [code] = await exited;
+  assert.equal(code, 0);
+  assert.ok(Date.now() - started < 3000, 'drains fast');
+  await waitFor(() => stream.ended);
+  assert.ok(h.logs().some((l) => l.msg === 'shutting down' && l.signal === 'SIGTERM'));
+  assert.equal(query(h.dir, 'SELECT count(*) AS n FROM inbox')[0].n, 1);
+  await h.restart();
+  assert.equal((await h.ok(p + '/agents/other/inbox', owner.token))[0].text, '@other later');
+});
+
+test('bad configuration fails fast with a clear message', () => {
+  const run = (env) => spawnSync(process.execPath, ['hub.js'], { cwd: ROOT, env: { ...process.env, ...env }, encoding: 'utf8', timeout: 5000 });
+  const r = run({ PORT: 'eighty', PUBLIC_URL: 'ftp://x', TRUST_PROXY: 'maybe', LOG_LEVEL: 'loud' });
+  assert.equal(r.status, 1);
+  for (const want of ['PORT must be', 'PUBLIC_URL must be', 'TRUST_PROXY must be', 'LOG_LEVEL must be']) assert.ok(r.stderr.includes(want), want);
+});
+
+test('trusted proxy headers are used only when TRUST_PROXY says so', async (t) => {
+  const plain = await startHub(t);
+  await plain.api('/api/me', null, 'GET', undefined, { 'fly-client-ip': '203.0.113.9', 'x-request-id': 'p1' });
+  await waitFor(() => plain.logs().some((l) => l.requestId === 'p1'));
+  assert.equal(plain.logs().find((l) => l.requestId === 'p1').ip, '127.0.0.1');
+  const fly = await startHub(t, null, { TRUST_PROXY: 'fly' });
+  await fly.api('/api/me', null, 'GET', undefined, { 'fly-client-ip': '203.0.113.9', 'x-forwarded-for': '1.1.1.1', 'x-request-id': 'p2' });
+  await waitFor(() => fly.logs().some((l) => l.requestId === 'p2'));
+  assert.equal(fly.logs().find((l) => l.requestId === 'p2').ip, '203.0.113.9');
+});
+
+test('setup-link and backup commands; a backup restores as a working hub', async (t) => {
+  const h = await startHub(t);
+  const cli = (...args) => spawnSync(process.execPath, ['hub.js', ...args], { cwd: ROOT, env: { ...process.env, DATA_DIR: h.dir, PUBLIC_URL: 'https://hub.example' }, encoding: 'utf8' });
+  assert.equal(cli('setup-link').stdout.trim(), `https://hub.example/#join/${h.setup}`);
+  const owner = await h.bootstrap();
+  await h.ok(prefix(owner) + '/messages', owner.token, 'POST', { text: 'keep me' });
+  assert.match(cli('setup-link').stdout, /already has an owner/);
+  const backups = tempDir(t);
+  const file = path.join(backups, 'copy.db');
+  const r = cli('backup', file); // while the hub is running
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(cli('backup', file).status, 1, 'never overwrites');
+  const restored = await startHub(t, (dir) => fs.copyFileSync(file, path.join(dir, 'backchannel.db')));
+  assert.equal((await restored.ok(prefix(owner) + '/messages', owner.token))[0].text, 'keep me');
+});

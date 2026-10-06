@@ -40,14 +40,15 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
   const hsts = config.publicUrl?.startsWith('https://');
 
   function clientIp(req) {
-    if (config.trustProxy) {
-      const direct = req.headers['fly-client-ip'] || req.headers['cf-connecting-ip'];
-      if (direct) return String(direct);
+    const header = (name) => { const v = req.headers[name]; return typeof v === 'string' && v.length < 100 ? v.trim() : null; };
+    let ip = null;
+    if (config.trustProxy === 'fly') ip = header('fly-client-ip');
+    else if (config.trustProxy === 'cloudflare') ip = header('cf-connecting-ip');
+    else if (config.trustProxy === 'xff') {
       // The right-most entry is the one our own proxy added; anything left of it is client-supplied.
-      const fwd = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
-      if (fwd.length) return fwd[fwd.length - 1];
+      ip = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean).pop() || null;
     }
-    return req.socket.remoteAddress || 'unknown';
+    return ip || req.socket.remoteAddress || 'unknown';
   }
 
   async function readBody(req) {
@@ -112,6 +113,7 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
         ms: Math.round(ms), ip: ctx.ip, userId: ctx.userId, ...(res.writableFinished ? {} : { aborted: true }) });
     });
 
+    inflight++;
     try {
       const p = ctx.path;
       if (p === '/healthz') return send(res, 200, { ok: true, version });
@@ -131,19 +133,29 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
       if (!res.headersSent && !res.destroyed) {
         send(res, err.status || 500, err.status ? { error: err.message } : { error: 'internal server error', requestId });
       } else if (!res.writableEnded) res.end();
+    } finally {
+      if (--inflight === 0) for (const done of idle.splice(0)) done();
     }
   });
+  let inflight = 0;
+  const idle = [];
   // Longer than typical proxy idle timeouts (Fly, ALB use 60 s), so the hub never closes a connection the proxy is about to reuse.
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 66_000;
+  server.maxConnections = config.maxConnections;
 
+  // Background jobs. A failing job is reported, never fatal.
+  const every = (ms, name, fn) => setInterval(() => {
+    try { fn(); } catch (err) { reporter.error(err, { message: `background job failed: ${name}` }); }
+  }, ms);
   const timers = [
-    setInterval(() => { for (const teamId of new Set([...rt.sseClients].map((c) => c.teamId))) api.broadcastAgents(teamId); }, 10_000),
-    setInterval(() => { for (const c of rt.sseClients) c.res.write(': ping\n\n'); }, 20_000),
-    setInterval(() => {
+    every(10_000, 'agent presence', () => { for (const teamId of new Set([...rt.sseClients].map((c) => c.teamId))) api.broadcastAgents(teamId); }),
+    every(20_000, 'stream keepalive', () => { for (const c of rt.sseClients) rt.write(c, ': ping\n\n'); }),
+    every(30_000, 'stream revalidation', () => api.revalidateStreams()),
+    every(3_600_000, 'session expiry', () => {
       const n = repo.pruneSessions(Date.now() - config.sessionDays * 86_400_000);
       if (n) log.info('expired browser sessions removed', { count: n });
-    }, 3_600_000),
+    }),
   ];
   for (const t of timers) t.unref();
 
@@ -151,19 +163,28 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
     server,
     setPublicUrl(url) { publicUrl = url; },
     get publicUrl() { return publicUrl; },
-    // Stop taking requests, release live connections, and resolve once the server is closed (or after the timeout).
+    // Stop taking requests (readiness fails, new requests get 503), release long polls with an empty answer
+    // (nothing is dequeued) and end streams, then wait for running handlers so the database can close safely.
     async shutdown() {
       if (draining) return;
       draining = true;
       for (const t of timers) clearInterval(t);
       const closed = new Promise((resolve) => server.close(resolve));
       rt.closeAll();
+      // Released polls and ended streams leave keep-alive sockets idle a moment later; keep sweeping them.
       server.closeIdleConnections();
-      const timeout = new Promise((resolve) => setTimeout(resolve, config.shutdownMs).unref());
-      if (await Promise.race([closed.then(() => true), timeout.then(() => false)]) === false) {
-        log.warn('shutdown timeout; closing remaining connections');
+      const sweep = setInterval(() => server.closeIdleConnections(), 50);
+      closed.then(() => clearInterval(sweep));
+      const handlersDone = () => (inflight ? new Promise((resolve) => idle.push(resolve)) : Promise.resolve());
+      const deadline = new Promise((resolve) => setTimeout(() => resolve('timeout'), config.shutdownMs).unref());
+      if (await Promise.race([Promise.all([closed, handlersDone()]), deadline]) === 'timeout') {
+        log.warn('shutdown timeout; closing remaining connections', { inflight });
         server.closeAllConnections();
+        await Promise.race([handlersDone(), new Promise((resolve) => setTimeout(resolve, 1000).unref())]);
       }
+      clearInterval(sweep);
+      // Let socket close events (which may put undelivered messages back in an inbox) run before the database closes.
+      await new Promise((resolve) => setImmediate(resolve));
     },
   };
 }

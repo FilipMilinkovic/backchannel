@@ -1,85 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
-import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
 import { openDb } from '../server/db.js';
 import { createRepo } from '../server/repo.js';
 import { authenticate, hashToken, newToken } from '../server/auth.js';
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-// Reads the hub's database directly (only while the hub is stopped, or for read-only checks).
-function query(dir, sql, ...params) {
-  const db = new DatabaseSync(path.join(dir, 'backchannel.db'));
-  try { return db.prepare(sql).all(...params).map((r) => ({ ...r })); } finally { db.close(); }
-}
-function userCount(dir) {
-  if (fs.existsSync(path.join(dir, 'backchannel.db'))) return query(dir, 'SELECT count(*) AS n FROM users')[0].n;
-  const usersFile = path.join(dir, 'users.json');
-  return fs.existsSync(usersFile) ? JSON.parse(fs.readFileSync(usersFile, 'utf8')).length : 0;
-}
-
-async function startHub(t, seed) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-hub-test-'));
-  if (seed) seed(dir);
-  let child;
-  let output;
-  let base;
-  async function stop() {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const ended = once(child, 'exit');
-      child.kill('SIGTERM');
-      await ended;
-    }
-  }
-  async function start() {
-    output = '';
-    const needsSetup = userCount(dir) === 0;
-    child = spawn(process.execPath, ['hub.js'], { cwd: ROOT,
-      env: { ...process.env, DATA_DIR: dir, HOST: '127.0.0.1', PORT: '0', PUBLIC_URL: '', HUB_TOKEN: '', MAX_HOPS: '' },
-      stdio: ['ignore', 'pipe', 'pipe'] });
-    child.stdout.on('data', (data) => { output += data; });
-    child.stderr.on('data', (data) => { output += data; });
-    const deadline = Date.now() + 5000;
-    while (!/Backchannel hub on http:\/\/127\.0\.0\.1:\d+\D/.test(output)
-      || (needsSetup && !/Setup link: \S*\/#join\/[a-f0-9]{24}\b/.test(output))) {
-      if (child.exitCode !== null || Date.now() > deadline) throw new Error(`Hub failed to start: ${output}`);
-      await delay(10);
-    }
-    base = output.match(/Backchannel hub on (http:\/\/127\.0\.0\.1:\d+)/)[1];
-  }
-  t.after(async () => { await stop(); fs.rmSync(dir, { recursive: true, force: true }); });
-  await start();
-  const hub = {
-    dir, get base() { return base; }, get output() { return output; },
-    get setup() { return output.match(/Setup link: .*\/#join\/([a-f0-9]+)/)?.[1]; },
-    async restart() { await stop(); await start(); },
-    async api(route, token, method = 'GET', body) {
-      const response = await fetch(base + route, { method,
-        headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-      return { status: response.status, body: await response.json() };
-    },
-    async ok(route, token, method = 'GET', body) {
-      const result = await this.api(route, token, method, body);
-      assert.equal(result.status, 200, JSON.stringify(result.body));
-      return result.body;
-    },
-    async bootstrap(handle = 'alice') { return this.ok(`/api/invites/${this.setup}/accept`, null, 'POST', { handle, name: handle }); },
-    async join(owner, role, handle, teamId = owner.team.id) {
-      const invite = await this.ok(`/api/teams/${teamId}/invites`, owner.token, 'POST', { role });
-      return this.ok(`/api/invites/${invite.code}/accept`, null, 'POST', { handle });
-    },
-  };
-  return hub;
-}
-const prefix = (account) => `/api/teams/${account.team.id}`;
+import { startHub, query, prefix, delay, tempDir } from './helpers.js';
 
 test('messages persist one row each and validate optional titles', async (t) => {
   const h = await startHub(t);
@@ -385,11 +312,6 @@ test('v1 migration preserves messages, agents, inboxes and configured hop limit'
   assert.equal((await h.ok(p + '/messages', owner.token)).length, 1);
 });
 
-function tempDir(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-db-test-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
 
 test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
@@ -429,7 +351,13 @@ test('db: imports v2 JSON data once, including sessions, inboxes and invites', (
   const msgs = [
     { id: 'm1', teamId: team.id, threadId: 'm1', inReplyTo: null, from: 'maya', fromKind: 'user', by: 'u1', text: 'first', ts: 10, hop: 0, to: [] },
     { id: 'm2', teamId: team.id, threadId: 'm1', inReplyTo: 'm1', from: 'maya', fromKind: 'user', by: 'u1', text: '@bot hi', ts: 11, hop: 0, to: ['bot'], title: 'T' }];
-  fs.writeFileSync(path.join(dir, 'messages.jsonl'), msgs.map((m) => JSON.stringify(m)).join('\n') + '\n{not json\n');
+  const lines = msgs.map((m) => JSON.stringify(m));
+  // Damage in the middle of the log stops the import (and changes nothing)...
+  fs.writeFileSync(path.join(dir, 'messages.jsonl'), [lines[0], '{not json', lines[1]].join('\n') + '\n');
+  assert.throws(() => openDb(dir), /messages\.jsonl: line 2 is not valid JSON/);
+  assert.ok(fs.existsSync(path.join(dir, 'users.json')));
+  // ...but a torn last line from a crash mid-append is dropped.
+  fs.writeFileSync(path.join(dir, 'messages.jsonl'), lines.join('\n') + '\n{"id":"torn');
 
   const repo = createRepo(openDb(dir));
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.imported')).sort(),
@@ -450,6 +378,13 @@ test('db: imports v2 JSON data once, including sessions, inboxes and invites', (
   const reopened = createRepo(openDb(dir));
   assert.equal(reopened.countUsers(), 2);
   assert.ok(fs.existsSync(path.join(dir, 'users.json')), 'files next to a non-empty database are left alone');
+
+  // A crash after the import committed but before the renames: the next start only finishes the renames.
+  fs.rmSync(path.join(dir, 'users.json'));
+  fs.renameSync(path.join(dir, 'teams.json.imported'), path.join(dir, 'teams.json'));
+  const finished = createRepo(openDb(dir));
+  assert.equal(finished.countUsers(), 2);
+  assert.ok(!fs.existsSync(path.join(dir, 'teams.json')) && fs.existsSync(path.join(dir, 'teams.json.imported')));
 });
 
 test('db: inbox take and restore, session cap and login codes', (t) => {
