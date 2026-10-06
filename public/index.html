@@ -64,7 +64,7 @@ button { cursor: pointer; }
 svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
 /* ---------- shell ---------- */
-.app { display: grid; grid-template-columns: 232px minmax(0, 1fr); height: 100vh; }
+.app { display: grid; grid-template-columns: 232px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; }
 .rail { background: var(--rail); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 22px; font-weight: 600; font-size: var(--text-body); letter-spacing: -0.015em; }
 .brand svg { width: 20px; height: 20px; }
@@ -98,7 +98,7 @@ svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none;
 
 /* ---------- views ---------- */
 main { display: flex; min-height: 0; min-width: 0; }
-.view.active { flex: 1; }
+.view.active { flex: 1; min-height: 0; }
 .view { display: none; min-height: 0; min-width: 0; }
 .view.active { display: flex; }
 .pane-head {
@@ -109,7 +109,7 @@ main { display: flex; min-height: 0; min-width: 0; }
 
 /* delegations: list + detail */
 #view-delegations { display: none; }
-#view-delegations.active { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(420px, 560px); }
+#view-delegations.active { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(420px, 560px); grid-template-rows: minmax(0, 1fr); }
 .list-pane { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
 .seg { display: inline-flex; padding: 2px; background: var(--rail); border: 1px solid var(--line); border-radius: var(--r); }
 .seg button { border: 0; background: none; color: var(--ink-3); padding: 3px 10px; border-radius: 6px; font-size: var(--text-sm); transition: color var(--t) var(--ease), background var(--t) var(--ease); }
@@ -167,10 +167,11 @@ kbd { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); 
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* detail */
-.detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--bg); }
+.detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; background: var(--bg); }
 .detail-head { padding: 20px 24px 16px; border-bottom: 1px solid var(--line); }
 .detail-head .back { display: none; margin: -6px 0 10px -8px; }
-.detail-head h2 { margin: 0 0 12px; font-size: var(--text-lg); font-weight: 600; line-height: 1.35; letter-spacing: -0.015em; text-wrap: balance; overflow-wrap: anywhere; }
+.detail-head h2 { margin: 0 0 12px; font-size: var(--text-lg); font-weight: 600; line-height: 1.35; letter-spacing: -0.015em; text-wrap: balance; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 .facts { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; color: var(--ink-3); font-size: var(--text-sm); }
 .facts .who { color: var(--ink-2); }
 .pill { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 999px; font-size: var(--text-xs); font-weight: 500; background: var(--raised-2); color: var(--ink-2); }
@@ -518,12 +519,27 @@ function threads() {
   for (const t of map.values()) {
     t.first = t.msgs[0]; t.last = t.msgs[t.msgs.length - 1];
     t.from = t.first.from; t.to = t.first.to || [];
-    t.title = (stripLead(t.first.text) || t.first.text).replace(/`/g, '');
+    t.title = t.first.title || summarize(t.first.text);
     t.updated = t.last.ts;
     t.status = statusOf(t);
     out.push(t);
   }
   return out.sort((a, b) => b.updated - a.updated);
+}
+
+// A delegation's title: the sender's explicit title, or the first substantial sentence of the request,
+// without markdown, greetings like "Codex here." or routing @handles, cut at a word boundary.
+function summarize(text) {
+  const plain = stripLead(text)
+    .replace(/```[\s\S]*?```/g, ' ').replace(/[*`#>]+|\b__?|__?\b(?!\w)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+  const firstLine = plain.split(/\n/).map((l) => l.trim()).find(Boolean) || '';
+  const sentences = firstLine.split(/(?<=[.!?])\s+/);
+  const greeting = /^(hi|hey|hello|thanks|ok(ay)?|quick question)\b|\bhere[.!]?$|^(i'?m|i am|this is)\b.{0,40}\b(agent|claude|codex|code|session)[.!]?$/i;
+  let pick = sentences.map((x) => x.trim()).find((x) => x.length > 12 && !greeting.test(x)) || firstLine;
+  pick = pick.replace(/[.:;,]+$/, '');
+  if (pick.length <= 80) return pick || 'Untitled delegation';
+  const cut = pick.slice(0, 80);
+  return cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : 80).replace(/[,;:\s-]+$/, '') + '…';
 }
 
 function stripLead(text) { return text.replace(/^(\s*[,:;]*\s*@[a-zA-Z][\w-]*)+[\s,:;]*/, '').trim(); }

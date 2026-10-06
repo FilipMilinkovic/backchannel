@@ -1,8 +1,10 @@
-// Tiny hub client shared by the connector (agent.js) and the MCP server (mcp.js).
+// Tiny hub client shared by the connector (agent.js), the MCP server (mcp.js) and the CLI (cli.js).
+// Every agent and message call is scoped to one team: /api/teams/:team/...
 export class Hub {
-  constructor(url, token) {
-    this.url = url.replace(/\/$/, '');
+  constructor(url, token, team) {
+    this.url = String(url || 'http://127.0.0.1:7777').replace(/\/$/, '');
     this.token = token;
+    this.team = team || null;
   }
 
   async req(method, p, body) {
@@ -16,23 +18,51 @@ export class Hub {
     return data;
   }
 
-  register(card) { return this.req('POST', '/api/agents', card); }
-  agents() { return this.req('GET', '/api/agents'); }
-  thread(id) { return this.req('GET', `/api/threads/${id}`); }
-  post(msg) { return this.req('POST', '/api/messages', msg); }
-  status(id, state, threadId) { return this.req('POST', `/api/agents/${id}/status`, { state, threadId }); }
-  requeue(id, ids) { return this.req('POST', `/api/agents/${id}/requeue`, { ids }); }
-  inbox(id, wait = 25) { return this.req('GET', `/api/agents/${id}/inbox?wait=${wait}`); }
+  // Picks the team: the configured one, or the user's only team. Call once before team-scoped calls.
+  async resolveTeam() {
+    if (!this.token) throw new Error('HUB_TOKEN is not set. Join a team first (node cli.js join <invite-link>) and use the token it prints.');
+    const me = await this.req('GET', '/api/me');
+    if (this.team) {
+      const t = me.teams.find((x) => x.id === this.team || x.name.toLowerCase() === String(this.team).toLowerCase());
+      if (!t) throw new Error(`you're not a member of team "${this.team}". Your teams: ${me.teams.map((x) => `${x.name} (${x.id})`).join(', ') || 'none'}`);
+      this.team = t.id;
+    } else if (me.teams.length === 1) {
+      this.team = me.teams[0].id;
+    } else {
+      throw new Error(me.teams.length
+        ? `you're in several teams; set HUB_TEAM to one of: ${me.teams.map((x) => `${x.id} (${x.name})`).join(', ')}`
+        : "you're not in any team yet. Accept an invite first.");
+    }
+    this.me = me;
+    return me;
+  }
+
+  t(p) {
+    if (!this.team) throw new Error('team not resolved; call resolveTeam() first');
+    return `/api/teams/${this.team}${p}`;
+  }
+
+  register(card) { return this.req('POST', this.t('/agents'), card); }
+  agents() { return this.req('GET', this.t('/agents')); }
+  thread(id) { return this.req('GET', this.t(`/threads/${id}`)); }
+  post(msg) { return this.req('POST', this.t('/messages'), msg); }
+  status(id, state, threadId) { return this.req('POST', this.t(`/agents/${id}/status`), { state, threadId }); }
+  requeue(id, ids) { return this.req('POST', this.t(`/agents/${id}/requeue`), { ids }); }
+  inbox(id, wait = 25) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}`)); }
 
   // Register, then long-poll the inbox forever. Re-registers if the hub restarts; backs off if it's down.
+  // Stops on auth/permission errors, since retrying can't fix those.
   async listen(card, onMessage, log = () => {}) {
     let registered = false, backoff = 1000;
     for (;;) {
       try {
-        if (!registered) { await this.register(card); registered = true; backoff = 1000; log(`@${card.id} online`); }
+        if (!this.team) await this.resolveTeam();
+        if (!registered) { await this.register(card); registered = true; backoff = 1000; log(`@${card.id} online in team ${this.team}`); }
         for (const msg of await this.inbox(card.id)) await onMessage(msg);
       } catch (err) {
-        if (err.status === 404) { registered = false; continue; }
+        if (err.status === 401 || err.status === 403 || err.status === 409) { log(`stopped: ${err.message}`); throw err; }
+        // A 404 while registered means the hub forgot the agent (restart, removal): register again right away.
+        if (err.status === 404 && registered) { registered = false; continue; }
         if (registered) log(`hub unreachable (${err.message}), retrying…`);
         registered = false;
         await new Promise((r) => setTimeout(r, backoff));
