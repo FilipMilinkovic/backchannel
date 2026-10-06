@@ -1,84 +1,60 @@
 #!/usr/bin/env node
-// Backchannel hub: registry, @mention routing, threads, live feed. Zero dependencies.
+// Backchannel hub: team registry, @mention routing, threads, live feed. Zero dependencies.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { Store, agentKey } from './server/store.js';
+import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, requireRole } from './server/auth.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7777);
 const HOST = process.env.HOST || '127.0.0.1';
-const TOKEN = process.env.HUB_TOKEN || '';
-const CONFIG_FILE = path.join(ROOT, 'data', 'config.json');
+let publicUrl = (process.env.PUBLIC_URL || `http://${HOST}:${PORT}`).replace(/\/$/, '');
 const ONLINE_MS = 40_000;
-const DATA_DIR = path.join(ROOT, 'data');
-const LOG_FILE = path.join(DATA_DIR, 'messages.jsonl');
-const REGISTRY_FILE = path.join(DATA_DIR, 'agents.json');
-
-const agents = new Map();   // id -> agent card + presence
-const inboxes = new Map();  // id -> pending messages
-const waiters = new Map();  // id -> [resolve] long-poll callbacks
-const messages = [];
-const byId = new Map();
+const store = new Store(path.resolve(process.env.DATA_DIR || './data'));
+const { agents, inboxes, messages, byId } = store;
+const waiters = new Map();
 const sseClients = new Set();
 
-// ---------- persistence ----------
-fs.mkdirSync(DATA_DIR, { recursive: true });
-if (fs.existsSync(LOG_FILE)) {
-  for (const line of fs.readFileSync(LOG_FILE, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try { const m = JSON.parse(line); messages.push(m); byId.set(m.id, m); } catch {}
-  }
+function members(team) {
+  return team.members.map((m) => {
+    const { handle, name } = store.users.find((u) => u.id === m.userId);
+    return { ...m, handle, name };
+  });
 }
-const config = { maxHops: Number(process.env.MAX_HOPS || 8) };
-try { Object.assign(config, JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))); } catch {}
-const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-const persist = (m) => fs.appendFileSync(LOG_FILE, JSON.stringify(m) + '\n');
-
-// Registry: agents plus undelivered inbox messages (stored as message ids; the bodies live in the log).
-// Agents come back offline and idle; they show online again as soon as their connector or session polls.
-try {
-  const saved = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
-  for (const a of saved.agents || []) agents.set(a.id, { ...a, state: 'idle', stateThread: null });
-  for (const [id, ids] of Object.entries(saved.inboxes || {})) {
-    if (agents.has(id)) inboxes.set(id, ids.map((x) => byId.get(x)).filter(Boolean));
-  }
-} catch (err) {
-  if (err.code !== 'ENOENT') console.warn(`Could not read ${REGISTRY_FILE}: ${err.message}`);
+function publicTeam(team, user) {
+  return { id: team.id, name: team.name, role: team.members.find((m) => m.userId === user.id)?.role,
+    maxHops: team.maxHops, members: members(team) };
 }
-function writeRegistry() {
-  const data = {
-    agents: [...agents.values()],
-    inboxes: Object.fromEntries([...inboxes].filter(([, box]) => box.length).map(([id, box]) => [id, box.map((m) => m.id)])),
-  };
-  const tmp = REGISTRY_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, REGISTRY_FILE);
-}
-let saveTimer = null;
-function saveRegistry() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => { saveTimer = null; writeRegistry(); }, 250);
-}
-function flushRegistry() {
-  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-  writeRegistry();
-}
-
-// ---------- helpers ----------
-const newId = () => crypto.randomBytes(6).toString('hex');
-const HANDLE = /^[a-z][a-z0-9_-]{0,31}$/;
-
 function publicAgent(a) {
-  return { ...a, online: Date.now() - a.lastSeen < ONLINE_MS };
+  return { ...a, ownerHandle: store.users.find((u) => u.id === a.ownerUserId)?.handle || null,
+    online: Date.now() - a.lastSeen < ONLINE_MS };
 }
-function agentList() {
-  return [...agents.values()].map(publicAgent).sort((a, b) => a.id.localeCompare(b.id));
+function agentList(teamId) {
+  return [...agents.values()].filter((a) => a.teamId === teamId).map(publicAgent).sort((a, b) => a.id.localeCompare(b.id));
 }
-
-// Recipients are the @handles a message *starts* with: "@grok @gpt what do you think?"
-// Mentions later in the text are just references, so quoting or naming an agent doesn't wake it.
+function config(team) { return { name: team.name, maxHops: team.maxHops, tokenRequired: true }; }
+function broadcast(teamId, event) {
+  for (const client of sseClients) if (client.teamId === teamId) client.res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+function closeSessions(userId, teamId) {
+  for (const client of sseClients) if (client.userId === userId && (!teamId || client.teamId === teamId)) {
+    client.res.end();
+    sseClients.delete(client);
+  }
+  for (const [key, list] of waiters) {
+    const agent = agents.get(key);
+    if (agent?.ownerUserId === userId && (!teamId || agent.teamId === teamId)) for (const wake of [...list]) wake();
+  }
+}
+function removeAgent(agent) {
+  const key = agentKey(agent.teamId, agent.id);
+  agents.delete(key);
+  inboxes.delete(key);
+  for (const wake of [...(waiters.get(key) || [])]) wake();
+  waiters.delete(key);
+}
 function leadingMentions(text) {
   const out = [];
   const re = /^[\s,:;]*@([a-zA-Z][\w-]*)/;
@@ -86,294 +62,345 @@ function leadingMentions(text) {
   while ((m = rest.match(re))) { out.push(m[1].toLowerCase()); rest = rest.slice(m[0].length); }
   return [...new Set(out)];
 }
-
-function broadcast(event) {
-  const data = `data: ${JSON.stringify(event)}\n\n`;
-  for (const res of sseClients) res.write(data);
+function threadMessages(teamId, threadId) { return messages.filter((m) => m.teamId === teamId && m.threadId === threadId); }
+function ownedAgent(team, user, id) {
+  const agent = agents.get(agentKey(team.id, id));
+  if (!agent) throw httpError(404, 'unknown agent');
+  if (agent.ownerUserId !== user.id) throw httpError(403, 'agent belongs to another user');
+  return agent;
 }
-
-function deliver(agentId, msg) {
-  if (!inboxes.has(agentId)) inboxes.set(agentId, []);
-  inboxes.get(agentId).push(msg);
-  saveRegistry();
-  const ws = waiters.get(agentId) || [];
-  waiters.set(agentId, []);
-  for (const wake of ws) wake();
-}
-
-function threadMessages(threadId) {
-  return messages.filter((m) => m.threadId === threadId);
-}
-
-function postMessage({ from, text, threadId, inReplyTo, to, kind }) {
-  from = String(from || 'human').toLowerCase();
-  text = String(text || '').trim();
-  if (!text) throw httpError(400, 'text is required');
-  const fromAgent = agents.has(from);
-
-  let parent = inReplyTo ? byId.get(inReplyTo) : null;
-  if (!parent && threadId) {
-    // A human posting into an existing thread with no @mention continues with the last agent that spoke.
-    parent = [...threadMessages(threadId)].reverse().find((m) => agents.has(m.from) && m.from !== from) || null;
+function postMessage(team, user, b) {
+  if (typeof b.text !== 'string' || !b.text.trim()) throw httpError(400, 'text is required');
+  if (b.title !== undefined && (typeof b.title !== 'string' || b.title.trim().length > 120)) {
+    throw httpError(400, 'title must be a string of at most 120 characters');
   }
-
-  const msg = {
-    id: newId(),
-    threadId: threadId || parent?.threadId || null,
-    inReplyTo: parent?.id || null,
-    from,
-    text,
-    ts: Date.now(),
-    hop: fromAgent ? (parent?.hop ?? 0) + 1 : 0,
-  };
-  if (kind === 'error' || kind === 'declined') msg.kind = kind;
+  const text = b.text.trim();
+  const fromKind = b.from === undefined ? 'user' : 'agent';
+  const from = fromKind === 'user' ? user.handle : String(b.from).toLowerCase();
+  if (fromKind === 'agent') ownedAgent(team, user, from);
+  if (b.to !== undefined && (!Array.isArray(b.to) || b.to.some((id) => typeof id !== 'string' || !HANDLE.test(id.toLowerCase())))) {
+    throw httpError(400, 'to must be an array of handles');
+  }
+  let parent = b.inReplyTo ? byId.get(b.inReplyTo) : null;
+  if (b.inReplyTo && (!parent || parent.teamId !== team.id)) throw httpError(404, 'unknown parent message');
+  if (b.threadId && !threadMessages(team.id, b.threadId).length) throw httpError(404, 'unknown thread');
+  if (parent && b.threadId && parent.threadId !== b.threadId) throw httpError(400, 'parent is in another thread');
+  if (!parent && b.threadId) {
+    parent = [...threadMessages(team.id, b.threadId)].reverse().find((m) => m.fromKind === 'agent'
+      && agents.has(agentKey(team.id, m.from)) && (fromKind !== 'agent' || m.from !== from)) || null;
+  }
+  const msg = { id: newId(), teamId: team.id, threadId: b.threadId || parent?.threadId || null,
+    inReplyTo: parent?.id || null, from, fromKind, by: user.id, text, ts: Date.now(),
+    hop: fromKind === 'agent' ? (parent?.hop ?? 0) + 1 : 0 };
+  if (b.kind === 'error' || b.kind === 'declined') msg.kind = b.kind;
+  if (b.title !== undefined) msg.title = b.title.trim();
   if (!msg.threadId) msg.threadId = msg.id;
-
-  let recipients = Array.isArray(to) ? to.map((x) => String(x).toLowerCase()) : leadingMentions(text);
-  if (!Array.isArray(to) && recipients.length === 0 && parent) recipients = [parent.from];
-  recipients = recipients.filter((r) => r !== from);
-  msg.to = recipients;
-
-  const agentRecipients = recipients.filter((r) => agents.has(r));
-  if (msg.hop >= config.maxHops && agentRecipients.length) {
-    msg.note = `hop limit (${config.maxHops}) reached; not delivered. Post a new message to continue.`;
-  } else {
-    for (const r of agentRecipients) deliver(r, msg);
+  let recipients = Array.isArray(b.to) ? b.to.map((id) => id.toLowerCase()) : leadingMentions(text);
+  if (!Array.isArray(b.to) && !recipients.length && parent?.fromKind === 'agent') recipients = [parent.from];
+  msg.to = [...new Set(recipients)].filter((id) => fromKind !== 'agent' || id !== from);
+  const targets = msg.to.filter((id) => agents.has(agentKey(team.id, id)));
+  if (msg.hop >= team.maxHops && targets.length) {
+    msg.note = `hop limit (${team.maxHops}) reached; not delivered. Post a new message to continue.`;
   }
-
-  messages.push(msg);
-  byId.set(msg.id, msg);
-  persist(msg);
-  broadcast({ type: 'message', message: msg });
+  store.persistMessage(msg);
+  if (!msg.note) {
+    for (const id of targets) {
+      const key = agentKey(team.id, id);
+      if (!inboxes.has(key)) inboxes.set(key, []);
+      inboxes.get(key).push(msg);
+      for (const wake of [...(waiters.get(key) || [])]) wake();
+    }
+    store.saveRegistry();
+  }
+  broadcast(team.id, { type: 'message', message: msg });
   return msg;
 }
-
-function threadSummaries() {
+function threadSummaries(teamId) {
   const map = new Map();
   for (const m of messages) {
+    if (m.teamId !== teamId) continue;
     const t = map.get(m.threadId) || { id: m.threadId, title: m.text.slice(0, 80), started: m.ts, updated: m.ts, count: 0, participants: new Set() };
     t.updated = m.ts; t.count++; t.participants.add(m.from);
     map.set(m.threadId, t);
   }
-  return [...map.values()]
-    .map((t) => ({ ...t, participants: [...t.participants] }))
-    .sort((a, b) => b.updated - a.updated);
+  return [...map.values()].map((t) => ({ ...t, participants: [...t.participants] })).sort((a, b) => b.updated - a.updated);
 }
-
-function publicConfig() {
-  return { maxHops: config.maxHops, tokenRequired: !!TOKEN, host: HOST, port: PORT, version: '0.1.0', root: ROOT };
-}
-
-// A2A-shaped agent card, so a real A2A binding can be added later without changing the data model.
-function agentCard(a, base) {
-  return {
-    protocolVersion: 'agent-network/0.1 (A2A-shaped)',
-    name: a.name,
-    description: a.description,
-    url: `${base}/api/agents/${a.id}`,
-    version: '0.1.0',
-    provider: { organization: a.owner || 'unknown' },
-    capabilities: { streaming: false, pushNotifications: false },
-    defaultInputModes: ['text/plain'],
-    defaultOutputModes: ['text/plain'],
+function agentCard(a) {
+  return { protocolVersion: 'agent-network/0.1 (A2A-shaped)', name: a.name, description: a.description,
+    url: `${publicUrl}/api/teams/${a.teamId}/agents/${a.id}`, version: '0.1.0', provider: { organization: a.owner || 'unknown' },
+    capabilities: { streaming: false, pushNotifications: false }, defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
     skills: a.skills?.length ? a.skills : [{ id: 'chat', name: 'Chat', description: a.description || 'General conversation' }],
-    'x-backend': a.backend,
-    'x-handle': `@${a.id}`,
-  };
+    'x-backend': a.backend, 'x-handle': `@${a.id}` };
 }
-
-// ---------- http ----------
-function httpError(status, message) { const e = new Error(message); e.status = status; return e; }
-
 function send(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json' });
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
 }
-
 async function readJson(req) {
   let raw = '';
   for await (const chunk of req) { raw += chunk; if (raw.length > 2_000_000) throw httpError(413, 'body too large'); }
   if (!raw) return {};
-  try { return JSON.parse(raw); } catch { throw httpError(400, 'invalid JSON'); }
+  let body;
+  try { body = JSON.parse(raw); } catch { throw httpError(400, 'invalid JSON'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw httpError(400, 'body must be an object');
+  return body;
 }
-
-function authorized(req, url) {
-  if (!TOKEN) return true;
-  const header = req.headers.authorization || '';
-  return header === `Bearer ${TOKEN}` || url.searchParams.get('token') === TOKEN;
+function validName(name) {
+  if (typeof name !== 'string' || !name.trim() || name.trim().length > 200) throw httpError(400, 'name must be 1 to 200 characters');
+  return name.trim();
 }
-
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 function serveStatic(res, pathname) {
-  const file = path.join(ROOT, 'public', pathname === '/' ? 'index.html' : pathname);
-  if (!file.startsWith(path.join(ROOT, 'public')) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+  const root = path.join(ROOT, 'public');
+  const file = path.resolve(root, pathname === '/' ? 'index.html' : '.' + pathname);
+  if (!file.startsWith(root + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
     res.writeHead(404); return res.end('not found');
   }
   res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
   fs.createReadStream(file).pipe(res);
 }
+async function poll(req, res, url, team, user, member, id) {
+  requireRole(member, ['owner', 'member']);
+  const a = ownedAgent(team, user, id);
+  const tokenHash = user.tokenHash;
+  const key = agentKey(team.id, id);
+  const wasOnline = Date.now() - a.lastSeen < ONLINE_MS;
+  a.lastSeen = Date.now();
+  if (!wasOnline) broadcast(team.id, { type: 'agents', agents: agentList(team.id) });
+  const seconds = Number(url.searchParams.get('wait') || 0);
+  if (!Number.isFinite(seconds) || seconds < 0) throw httpError(400, 'wait must be a non-negative number');
+  const wait = Math.min(seconds, 30) * 1000;
+  const take = () => {
+    const box = inboxes.get(key) || [];
+    if (box.length) { inboxes.set(key, []); store.saveRegistry(); }
+    return box;
+  };
+  let gone = res.destroyed;
+  let box = [];
+  let restored = false;
+  const restore = () => {
+    if (!restored && box.length && agents.get(key) === a) {
+      restored = true;
+      inboxes.set(key, [...box, ...(inboxes.get(key) || [])]);
+      store.saveRegistry();
+    }
+  };
+  res.on('close', () => { if (!res.writableFinished) { gone = true; restore(); } });
+  box = take();
+  if (!box.length && wait && !gone) {
+    await new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        res.off('close', wake);
+        const list = waiters.get(key);
+        if (list) { const index = list.indexOf(wake); if (index !== -1) list.splice(index, 1); if (!list.length) waiters.delete(key); }
+        resolve();
+      };
+      const timer = setTimeout(wake, wait);
+      const list = waiters.get(key) || [];
+      list.push(wake); waiters.set(key, list);
+      res.on('close', wake);
+    });
+    if (gone) return;
+    if (agents.get(key) !== a) throw httpError(404, 'agent was removed');
+    if (user.tokenHash !== tokenHash) throw httpError(401, 'token was rotated');
+    if (!team.members.includes(member)) throw httpError(404, 'unknown team');
+    requireRole(member, ['owner', 'member']);
+    a.lastSeen = Date.now();
+    box = take();
+  }
+  if (gone) { restore(); return; }
+  send(res, 200, box);
+}
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const p = url.pathname;
   try {
-    if (!p.startsWith('/api/')) return serveStatic(res, p);
-    if (!authorized(req, url)) throw httpError(401, 'missing or wrong HUB_TOKEN');
-
-    // live feed for the UI
-    if (p === '/api/events' && req.method === 'GET') {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const p = url.pathname;
+    if (p !== '/api' && !p.startsWith('/api/')) return serveStatic(res, p);
+    // Authenticate before reading bodies, then again after the await to honor revocations.
+    const publicInvite = /^\/api\/invites\/([a-f0-9]+)(\/accept)?$/.exec(p);
+    authenticate(req, url, store.users, !!publicInvite);
+    const b = ['POST', 'PATCH'].includes(req.method) ? await readJson(req) : {};
+    let user = authenticate(req, url, store.users, !!publicInvite);
+    if (publicInvite) {
+      const found = store.findInvite(publicInvite[1]);
+      if (!found) throw httpError(404, 'invalid invite');
+      const { team, invite } = found;
+      if (!publicInvite[2] && req.method === 'GET') return send(res, 200, {
+        teamName: team.name, role: invite.role, invitedBy: store.users.find((u) => u.id === invite.createdBy)?.handle || null, expiresAt: invite.expiresAt,
+      });
+      if (publicInvite[2] && req.method === 'POST') {
+        let token;
+        if (!user) {
+          if (typeof b.handle !== 'string' || !HANDLE.test(b.handle)) throw httpError(400, 'invalid handle');
+          if (store.users.some((u) => u.handle === b.handle)) throw httpError(409, 'handle already exists');
+          const name = b.name === undefined ? b.handle : validName(b.name);
+          token = newToken();
+          user = { id: newId(), handle: b.handle, name, tokenHash: hashToken(token), createdAt: Date.now() };
+          store.users.push(user);
+          store.saveUsers();
+        }
+        if (!team.members.some((m) => m.userId === user.id)) {
+          team.members.push({ userId: user.id, role: invite.role, joinedAt: Date.now() });
+          invite.usesLeft--;
+          if (invite.createdBy === null) {
+            for (const a of agents.values()) if (a.teamId === team.id && !a.ownerUserId) a.ownerUserId = user.id;
+            store.saveRegistry();
+          }
+          store.saveTeams();
+          broadcast(team.id, { type: 'members', members: members(team) });
+          broadcast(team.id, { type: 'agents', agents: agentList(team.id) });
+        }
+        return send(res, 200, { ...(token ? { token } : {}), user: publicUser(user), team: publicTeam(team, user) });
+      }
+      throw httpError(404, 'no such endpoint');
+    }
+    if (p === '/api/me' && req.method === 'GET') return send(res, 200, {
+      user: publicUser(user), teams: store.teams.filter((t) => t.members.some((m) => m.userId === user.id))
+        .map((t) => ({ id: t.id, name: t.name, role: t.members.find((m) => m.userId === user.id).role })),
+    });
+    if (p === '/api/me/token' && req.method === 'POST') {
+      const token = newToken(); user.tokenHash = hashToken(token); store.saveUsers(); closeSessions(user.id);
+      return send(res, 200, { token });
+    }
+    if (p === '/api/teams' && req.method === 'POST') {
+      const team = store.createTeam(validName(b.name), user.id);
+      return send(res, 200, { team: publicTeam(team, user) });
+    }
+    const route = /^\/api\/teams\/([a-f0-9]+)(\/.*)?$/.exec(p);
+    const team = route && store.teams.find((t) => t.id === route[1]);
+    const member = team?.members.find((m) => m.userId === user.id);
+    if (!member) throw httpError(404, 'unknown team');
+    const rest = route[2] || '/';
+    if (rest === '/' && req.method === 'GET') return send(res, 200, publicTeam(team, user));
+    if (rest === '/' && req.method === 'PATCH') {
+      requireRole(member, ['owner']);
+      const name = b.name === undefined ? team.name : validName(b.name);
+      const maxHops = b.maxHops === undefined ? team.maxHops : b.maxHops;
+      if (!Number.isInteger(maxHops) || maxHops < 1 || maxHops > 50) throw httpError(400, 'maxHops must be a whole number from 1 to 50');
+      Object.assign(team, { name, maxHops }); store.saveTeams();
+      broadcast(team.id, { type: 'config', config: config(team) });
+      return send(res, 200, publicTeam(team, user));
+    }
+    if (rest === '/members' && req.method === 'GET') return send(res, 200, members(team));
+    let m;
+    if ((m = /^\/members\/([a-f0-9]+)$/.exec(rest)) && ['PATCH', 'DELETE'].includes(req.method)) {
+      if (req.method !== 'DELETE' || m[1] !== user.id) requireRole(member, ['owner']);
+      const target = team.members.find((x) => x.userId === m[1]);
+      if (!target) throw httpError(404, 'unknown member');
+      if (req.method === 'PATCH' && !ROLES.includes(b.role)) throw httpError(400, 'invalid role');
+      if (target.role === 'owner' && (req.method === 'DELETE' || b.role !== 'owner') && team.members.filter((x) => x.role === 'owner').length === 1) {
+        throw httpError(403, 'the last owner cannot be demoted or removed');
+      }
+      if (req.method === 'DELETE') {
+        team.members.splice(team.members.indexOf(target), 1);
+        for (const a of agents.values()) if (a.teamId === team.id && a.ownerUserId === target.userId) removeAgent(a);
+        store.saveRegistry();
+      } else target.role = b.role;
+      store.saveTeams();
+      closeSessions(target.userId, team.id);
+      broadcast(team.id, { type: 'members', members: members(team) });
+      broadcast(team.id, { type: 'agents', agents: agentList(team.id) });
+      return send(res, 200, { ok: true });
+    }
+    if (rest === '/invites') {
+      requireRole(member, ['owner']);
+      if (req.method === 'GET') return send(res, 200, team.invites.filter((i) => store.activeInvite(i)).map((i) => ({ ...i, url: `${publicUrl}/#join/${i.code}` })));
+      if (req.method === 'POST') {
+        const { role = 'member', expiresInHours = 168, uses = 1 } = b;
+        if (!ROLES.includes(role)) throw httpError(400, 'invalid role');
+        if (typeof expiresInHours !== 'number' || !Number.isFinite(expiresInHours) || expiresInHours <= 0 || !Number.isFinite(Date.now() + expiresInHours * 3_600_000)) throw httpError(400, 'invalid expiry');
+        if (!Number.isSafeInteger(uses) || uses < 1) throw httpError(400, 'uses must be a positive integer');
+        const invite = store.createInvite(team, role, user.id, expiresInHours, uses);
+        return send(res, 200, { ...invite, url: `${publicUrl}/#join/${invite.code}` });
+      }
+    }
+    if ((m = /^\/invites\/([a-f0-9]+)$/.exec(rest)) && req.method === 'DELETE') {
+      requireRole(member, ['owner']);
+      const index = team.invites.findIndex((i) => i.code === m[1]);
+      if (index === -1) throw httpError(404, 'unknown invite');
+      team.invites.splice(index, 1); store.saveTeams();
+      return send(res, 200, { ok: true });
+    }
+    if (rest === '/events' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      res.write(`data: ${JSON.stringify({ type: 'hello', agents: agentList(), config: publicConfig() })}\n\n`);
-      sseClients.add(res);
-      req.on('close', () => sseClients.delete(res));
+      res.write(`data: ${JSON.stringify({ type: 'hello', agents: agentList(team.id), config: config(team), members: members(team), role: member.role })}\n\n`);
+      const client = { res, teamId: team.id, userId: user.id };
+      sseClients.add(client); res.on('close', () => sseClients.delete(client));
       return;
     }
-
-    if (p === '/api/agents' && req.method === 'GET') return send(res, 200, agentList());
-
-    if (p === '/api/agents' && req.method === 'POST') {
-      const b = await readJson(req);
+    if (rest === '/agents' && req.method === 'GET') return send(res, 200, agentList(team.id));
+    if (rest === '/agents' && req.method === 'POST') {
+      requireRole(member, ['owner', 'member']);
       const id = String(b.id || '').toLowerCase();
-      if (!HANDLE.test(id)) throw httpError(400, 'id must be a lowercase handle like "grok" or "filip-claude"');
-      if (id === 'human') throw httpError(400, '"human" is reserved');
-      const prev = agents.get(id);
-      const agent = {
-        id,
-        name: b.name || id,
-        backend: b.backend || 'unknown',
-        model: b.model || null,
-        owner: b.owner || null,
-        description: b.description || '',
-        kind: b.kind === 'session' ? 'session' : 'agent',
-        access: b.access === 'write' ? 'write' : 'read',
-        repo: b.repo || null,
-        skills: b.skills || [],
-        state: prev?.state || 'idle',
-        registeredAt: prev?.registeredAt || Date.now(),
-        lastSeen: Date.now(),
-      };
-      // Update in place so open long-polls keep pointing at the live record.
-      if (prev) Object.assign(prev, agent); else agents.set(id, agent);
-      saveRegistry();
-      broadcast({ type: 'agents', agents: agentList() });
-      return send(res, 200, publicAgent(agents.get(id)));
+      if (!HANDLE.test(id) || id === 'human') throw httpError(400, 'id must be a handle; "human" is reserved');
+      const key = agentKey(team.id, id);
+      const prev = agents.get(key);
+      if (prev && prev.ownerUserId !== user.id) throw httpError(409, 'agent belongs to another user');
+      const agent = { id, teamId: team.id, ownerUserId: user.id, name: b.name || id, backend: b.backend || 'unknown',
+        model: b.model || null, owner: b.owner || null, description: b.description || '', kind: b.kind === 'session' ? 'session' : 'agent',
+        access: b.access === 'write' ? 'write' : 'read', repo: b.repo || null, skills: Array.isArray(b.skills) ? b.skills : [],
+        state: prev?.state || 'idle', stateThread: prev?.stateThread || null, registeredAt: prev?.registeredAt || Date.now(), lastSeen: Date.now() };
+      // Preserve object identity for active long polls.
+      if (prev) Object.assign(prev, agent); else agents.set(key, agent);
+      store.saveRegistry(); broadcast(team.id, { type: 'agents', agents: agentList(team.id) });
+      return send(res, 200, publicAgent(agents.get(key)));
     }
-
-    let m;
-    if ((m = p.match(/^\/api\/agents\/([\w-]+)$/)) && req.method === 'DELETE') {
-      if (!agents.delete(m[1])) throw httpError(404, 'unknown agent');
-      inboxes.delete(m[1]);
-      for (const wake of waiters.get(m[1]) || []) wake();
-      waiters.delete(m[1]);
-      saveRegistry();
-      broadcast({ type: 'agents', agents: agentList() });
-      return send(res, 200, { ok: true });
-    }
-
-    if ((m = p.match(/^\/api\/agents\/([\w-]+)\/card$/))) {
-      const a = agents.get(m[1]);
+    if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|status|requeue))?$/.exec(rest))) {
+      const a = agents.get(agentKey(team.id, m[1]));
       if (!a) throw httpError(404, 'unknown agent');
-      return send(res, 200, agentCard(a, `http://${req.headers.host}`));
-    }
-
-    if ((m = p.match(/^\/api\/agents\/([\w-]+)\/inbox$/)) && req.method === 'GET') {
-      const a = agents.get(m[1]);
-      if (!a) throw httpError(404, 'unknown agent; register first');
-      const wasOnline = Date.now() - a.lastSeen < ONLINE_MS;
-      a.lastSeen = Date.now();
-      if (!wasOnline) broadcast({ type: 'agents', agents: agentList() });
-      const wait = Math.min(Number(url.searchParams.get('wait') || 0), 30) * 1000;
-      const take = () => {
-        const box = inboxes.get(a.id) || [];
-        if (box.length) { inboxes.set(a.id, []); saveRegistry(); }
-        return box;
-      };
-      let gone = false;
-      res.on('close', () => { if (!res.writableFinished) gone = true; });
-      let box = take();
-      if (!box.length && wait) {
-        await new Promise((resolve) => {
-          const timer = setTimeout(resolve, wait);
-          const list = waiters.get(a.id) || [];
-          list.push(() => { clearTimeout(timer); resolve(); });
-          waiters.set(a.id, list);
-          res.on('close', resolve);
-        });
-        if (agents.get(a.id) !== a) return gone ? undefined : send(res, 404, { error: 'agent was removed' });
-        a.lastSeen = Date.now();
-        box = take();
+      const key = agentKey(team.id, a.id);
+      if (!m[2] && req.method === 'DELETE') {
+        requireRole(member, ['owner', 'member']);
+        if (member.role !== 'owner') ownedAgent(team, user, a.id);
+        removeAgent(a); store.saveRegistry(); broadcast(team.id, { type: 'agents', agents: agentList(team.id) });
+        return send(res, 200, { ok: true });
       }
-      if (gone) { // connector went away mid-poll: put messages back
-        if (box.length) { inboxes.set(a.id, [...box, ...(inboxes.get(a.id) || [])]); saveRegistry(); }
-        return;
+      if (m[2] === 'card' && req.method === 'GET') return send(res, 200, agentCard(a));
+      if (m[2] === 'inbox' && req.method === 'GET') return await poll(req, res, url, team, user, member, a.id);
+      if (['status', 'requeue'].includes(m[2]) && req.method === 'POST') {
+        requireRole(member, ['owner', 'member']); ownedAgent(team, user, a.id);
+        if (m[2] === 'requeue') {
+          if (!Array.isArray(b.ids) || b.ids.some((id) => typeof id !== 'string')) throw httpError(400, 'ids must be an array');
+          const box = inboxes.get(key) || [];
+          const back = [...new Set(b.ids)].map((id) => byId.get(id)).filter((msg) => msg?.teamId === team.id && msg.to?.includes(a.id) && !msg.note && !box.includes(msg));
+          inboxes.set(key, [...back, ...box]); store.saveRegistry();
+          for (const wake of [...(waiters.get(key) || [])]) wake();
+          return send(res, 200, { requeued: back.length });
+        }
+        if (b.threadId && !threadMessages(team.id, b.threadId).length) throw httpError(404, 'unknown thread');
+        a.state = ['working', 'approval'].includes(b.state) ? b.state : 'idle';
+        a.stateThread = a.state === 'idle' ? null : b.threadId || null;
+        a.lastSeen = Date.now(); store.saveRegistry();
+        broadcast(team.id, { type: 'status', id: a.id, state: a.state, threadId: a.stateThread });
+        return send(res, 200, { ok: true });
       }
-      return send(res, 200, box);
     }
-
-    // A session shutting down hands back messages it took but never showed to its agent.
-    if ((m = p.match(/^\/api\/agents\/([\w-]+)\/requeue$/)) && req.method === 'POST') {
-      const a = agents.get(m[1]);
-      if (!a) throw httpError(404, 'unknown agent');
-      const b = await readJson(req);
-      const box = inboxes.get(a.id) || [];
-      const back = (b.ids || []).map((x) => byId.get(x)).filter((msg) => msg && !box.includes(msg));
-      inboxes.set(a.id, [...back, ...box]);
-      saveRegistry();
-      return send(res, 200, { requeued: back.length });
+    if (rest === '/messages' && req.method === 'POST') {
+      requireRole(member, ['owner', 'member']); return send(res, 200, postMessage(team, user, b));
     }
-
-    if ((m = p.match(/^\/api\/agents\/([\w-]+)\/status$/)) && req.method === 'POST') {
-      const a = agents.get(m[1]);
-      if (!a) throw httpError(404, 'unknown agent');
-      const b = await readJson(req);
-      a.state = ['working', 'approval'].includes(b.state) ? b.state : 'idle';
-      a.stateThread = a.state === 'idle' ? null : b.threadId || null;
-      a.lastSeen = Date.now();
-      saveRegistry();
-      broadcast({ type: 'status', id: a.id, state: a.state, threadId: b.threadId || null });
-      return send(res, 200, { ok: true });
+    if (rest === '/messages' && req.method === 'GET') return send(res, 200, messages.filter((msg) => msg.teamId === team.id).slice(-5000));
+    if (rest === '/threads' && req.method === 'GET') return send(res, 200, threadSummaries(team.id));
+    if ((m = /^\/threads\/([\w-]+)$/.exec(rest)) && req.method === 'GET') {
+      const thread = threadMessages(team.id, m[1]);
+      if (!thread.length) throw httpError(404, 'unknown thread');
+      return send(res, 200, thread);
     }
-
-    if (p === '/api/messages' && req.method === 'POST') {
-      return send(res, 200, postMessage(await readJson(req)));
-    }
-
-    if (p === '/api/messages' && req.method === 'GET') return send(res, 200, messages.slice(-5000));
-
-    if (p === '/api/config' && req.method === 'GET') return send(res, 200, publicConfig());
-    if (p === '/api/config' && req.method === 'POST') {
-      const b = await readJson(req);
-      if (b.maxHops !== undefined) {
-        const n = Number(b.maxHops);
-        if (!Number.isInteger(n) || n < 1 || n > 50) throw httpError(400, 'maxHops must be a whole number from 1 to 50');
-        config.maxHops = n;
-      }
-      saveConfig();
-      broadcast({ type: 'config', config: publicConfig() });
-      return send(res, 200, publicConfig());
-    }
-
-    if (p === '/api/threads' && req.method === 'GET') return send(res, 200, threadSummaries());
-
-    if ((m = p.match(/^\/api\/threads\/([\w-]+)$/)) && req.method === 'GET') {
-      return send(res, 200, threadMessages(m[1]));
-    }
-
     throw httpError(404, 'no such endpoint');
   } catch (err) {
-    if (!res.headersSent) send(res, err.status || 500, { error: err.message });
+    if (!res.headersSent && !res.destroyed) send(res, err.status || 500, { error: err.status ? err.message : 'internal server error' });
+    if (!err.status) console.error(err);
   }
 });
 
-// Persist lastSeen periodically, and flush everything on shutdown.
-setInterval(saveRegistry, 30_000).unref();
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { flushRegistry(); process.exit(0); });
-
-// Presence ticks so the UI notices agents going offline.
-setInterval(() => broadcast({ type: 'agents', agents: agentList() }), 10_000).unref();
-setInterval(() => { for (const r of sseClients) r.write(': ping\n\n'); }, 20_000).unref();
-
+setInterval(() => store.saveRegistry(), 30_000).unref();
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { store.saveRegistry(); process.exit(0); });
+setInterval(() => { for (const team of store.teams) broadcast(team.id, { type: 'agents', agents: agentList(team.id) }); }, 10_000).unref();
+setInterval(() => { for (const client of sseClients) client.res.write(': ping\n\n'); }, 20_000).unref();
 server.listen(PORT, HOST, () => {
-  console.log(`Backchannel hub on http://${HOST}:${PORT}  (max hops ${config.maxHops}${TOKEN ? ', token required' : ''})`);
-  if (HOST !== '127.0.0.1' && !TOKEN) console.warn('WARNING: hub is exposed beyond localhost without HUB_TOKEN.');
+  const port = server.address().port;
+  if (!process.env.PUBLIC_URL) publicUrl = `http://${HOST}:${port}`;
+  console.log(`Backchannel hub on http://${HOST}:${port}${process.env.PUBLIC_URL ? ` (public URL ${publicUrl})` : ''}`);
+  if (store.setupInvite) console.log(`Setup link: ${publicUrl}/#join/${store.setupInvite.code}`);
 });

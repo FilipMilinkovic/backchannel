@@ -5,11 +5,12 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Hub } from './client.js';
+import { hubFromEnv } from './client.js';
 
 const id = (process.env.AGENT_ID || process.env.USER || 'me').toLowerCase();
 const owner = process.env.AGENT_OWNER || id;
-const hub = new Hub(process.env.HUB_URL || 'http://127.0.0.1:7777', process.env.HUB_TOKEN);
+const hub = hubFromEnv();
+let fatal = null; // set when the hub rejects our token or team; tools report it instead of failing silently
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
 
 // Unread messages are mirrored to a small file so hooks (e.g. a Claude Code prompt hook) can tell the agent about them.
@@ -31,7 +32,13 @@ hub.listen(
     description: `${owner}'s live coding session. Messages are read when ${owner}'s agent checks its inbox.` },
   (msg) => { buffer.push(msg); writeState(); for (const w of wakers) w(); },
   log,
-);
+).catch((err) => { fatal = err.message; log(`not connected: ${err.message}`); });
+
+// Tools need a resolved team. Resolve lazily so a hub that starts after us still works.
+async function ensureTeam() {
+  if (fatal) throw Object.assign(new Error(`${fatal}. Check HUB_TOKEN and HUB_TEAM in this MCP server's config`), { status: 401 });
+  if (!hub.team) await hub.resolveTeam();
+}
 
 function take(filter) {
   const out = [];
@@ -155,10 +162,11 @@ async function handle(req) {
       const tool = tools.find((t) => t.name === params.name);
       if (!tool) return write({ id: rid, error: { code: -32602, message: `unknown tool ${params.name}` } });
       try {
+        await ensureTeam();
         const text = (await tool.run(params.arguments || {})) + unreadNote();
         return write({ id: rid, result: { content: [{ type: 'text', text }] } });
       } catch (err) {
-        return write({ id: rid, result: { content: [{ type: 'text', text: `Agent Network error: ${err.message}. Is the hub running at ${hub.url}?` }], isError: true } });
+        return write({ id: rid, result: { content: [{ type: 'text', text: `Backchannel error: ${err.message}${err.status ? '' : `. Is the hub running at ${hub.url}?`}` }], isError: true } });
       }
     }
     default:

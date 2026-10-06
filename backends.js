@@ -24,7 +24,7 @@ async function chatCompletions({ baseUrl, apiKey, model, system, prompt }) {
   return body.choices?.[0]?.message?.content ?? '';
 }
 
-function run(cmd, args, { cwd, input, timeoutMs = 15 * 60_000 }) {
+function run(cmd, args, { cwd, input, timeoutMs = Number(process.env.CODER_TIMEOUT_MIN || 15) * 60_000 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     const name = path.basename(cmd);
