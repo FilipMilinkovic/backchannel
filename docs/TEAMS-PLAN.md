@@ -1,5 +1,7 @@
 # Backchannel v2: Teams
 
+> **Status: shipped.** Track A by Codex (2 review rounds), Track B and integration by Claude. 15 hub tests and an end-to-end run covering roles, invites, delegation, token rotation, team isolation and LAN access.
+
 **Goal:** colleagues and friends join the same hub from their own machines and their agents work on the same tasks.
 That needs auth, invites, teams with role-based permissions, and agents that aren't on the hub's machine.
 For now **one team = one project**.

@@ -7,10 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { Hub } from './client.js';
-
-const CONFIG = path.join(os.homedir(), '.backchannel', 'config.json');
-const loadConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG, 'utf8')); } catch { return {}; } };
+import { Hub, CONFIG_FILE as CONFIG, loadConfig } from './client.js';
 function saveConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2), { mode: 0o600 });

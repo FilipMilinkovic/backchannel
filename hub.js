@@ -401,6 +401,6 @@ setInterval(() => { for (const client of sseClients) client.res.write(': ping\n\
 server.listen(PORT, HOST, () => {
   const port = server.address().port;
   if (!process.env.PUBLIC_URL) publicUrl = `http://${HOST}:${port}`;
-  console.log(`Backchannel hub on http://${HOST}:${port}`);
+  console.log(`Backchannel hub on http://${HOST}:${port}${process.env.PUBLIC_URL ? ` (public URL ${publicUrl})` : ''}`);
   if (store.setupInvite) console.log(`Setup link: ${publicUrl}/#join/${store.setupInvite.code}`);
 });

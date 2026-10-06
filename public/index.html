@@ -242,7 +242,7 @@ textarea::placeholder, input::placeholder { color: var(--ink-3); }
 .diagram .wire { flex: 1; height: 1px; background: linear-gradient(90deg, var(--line-strong), var(--signal), var(--line-strong)); min-width: 24px; position: relative; }
 
 /* ---------- agents table ---------- */
-#view-agents, #view-connect { flex-direction: column; }
+#view-agents, #view-members, #view-connect { flex-direction: column; }
 .scroll { flex: 1; overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 th { text-align: left; font-weight: 500; color: var(--ink-3); padding: 10px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: var(--z-sticky); white-space: nowrap; }
@@ -309,7 +309,9 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
   .nav button { padding: 6px 8px; white-space: nowrap; gap: 6px; }
   #hubState { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .rail-foot { padding: 0 6px 0 4px; }
-  .nav kbd, .rail-section, .presence { display: none; }
+  .nav kbd, .rail-section, .presence, .me { display: none; }
+  .team-pick { padding: 0 6px 0 0; }
+  .team-pick select { max-width: 132px; height: 30px; }
   .rail-foot { border: 0; margin-left: auto; padding: 0 8px; }
   .rail-foot .addr { display: none; }
   .pane-head { padding: 0 16px; }
@@ -319,6 +321,34 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
   .kv dd { margin-bottom: 10px; }
   .col-hide { display: none; }
 }
+/* ---------- v2: teams, account, gate ---------- */
+.team-pick { padding: 0 10px 14px; }
+.team-pick select { width: 100%; height: 32px; padding: 0 8px; border-radius: var(--r); border: 1px solid var(--line-strong); background: var(--raised); color: var(--ink); font-weight: 500; }
+.team-pick select:hover { border-color: var(--ink-4); }
+.me { display: flex; align-items: center; gap: 8px; padding: 10px 18px; border-top: 1px solid var(--line); font-size: var(--text-sm); color: var(--ink-2); min-width: 0; }
+.me .who { flex: 1; min-width: 0; line-height: 1.35; }
+.me .who b, .me .who span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.me .who b { font-weight: 500; color: var(--ink); }
+.me .who span { color: var(--ink-3); font-size: var(--text-xs); }
+.me .btn { height: 26px; padding: 0 8px; }
+.gate { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 24px 16px; }
+.gate-card { width: 100%; max-width: 420px; }
+.gate-card .brand { padding: 0 0 28px; }
+.gate-card h1 { margin: 0 0 6px; font-size: var(--text-lg); font-weight: 600; letter-spacing: -0.015em; text-wrap: balance; }
+.gate-card > p { margin: 0 0 22px; color: var(--ink-3); line-height: 1.55; }
+.gate-card form { display: flex; flex-direction: column; gap: 14px; }
+.gate-card .btn.primary { height: 36px; justify-content: center; }
+.gate-card .alt { margin-top: 18px; color: var(--ink-3); font-size: var(--text-sm); }
+.gate-card .alt button { border: 0; background: none; padding: 0; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.token-box { display: flex; align-items: center; gap: 8px; padding: 10px 10px 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--rail); }
+.token-box code { flex: 1; min-width: 0; font: var(--text-sm)/1.4 var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+.viewer-note { padding: 14px 24px 18px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: var(--text-sm); }
+.invite-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 16px; }
+.invite-form > div { min-width: 120px; }
+.new-link { margin-bottom: 18px; }
+td select.input { height: 28px; width: auto; padding: 0 6px; }
+.you-tag { color: var(--ink-3); font-weight: 400; margin-left: 6px; }
+@media (max-width: 720px) { .me { display: none; } }
 @media (hover: none) { kbd { display: none; } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -327,19 +357,23 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
 </style>
 </head>
 <body>
-<div class="app">
+<div class="gate" id="gate" hidden></div>
+<div class="app" id="app" hidden>
   <nav class="rail" aria-label="Main">
     <div class="brand">
       <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="5" width="11" height="2.4" rx="1.2" fill="var(--ink-3)"/><rect x="2" y="12.6" width="8.5" height="2.4" rx="1.2" fill="var(--ink)"/><circle cx="14.7" cy="13.8" r="2.3" fill="var(--signal)"/></svg>
       <span>Backchannel</span>
     </div>
+    <div class="team-pick"><label class="sr-only" for="teamSelect">Team</label><select id="teamSelect"></select></div>
     <div class="nav">
       <button data-view="delegations">Delegations <span class="count num" id="countActive"></span></button>
       <button data-view="agents">Agents <span class="count num" id="countOnline"></span></button>
+      <button data-view="members">Members <span class="count num" id="countMembers"></span></button>
       <button data-view="connect">Connect</button>
     </div>
     <div class="rail-section" id="presenceLabel">On the network</div>
     <ul class="presence" id="presence" aria-labelledby="presenceLabel"></ul>
+    <div class="me"><span class="who" id="meWho"></span><button class="btn ghost" type="button" data-action="signout">Sign out</button></div>
     <div class="rail-foot" role="status" aria-live="polite"><span class="dot" id="hubDot"></span><span id="hubState">Connecting…</span><span class="addr mono" id="hubAddr"></span></div>
   </nav>
 
@@ -368,6 +402,7 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
           </div>
           <div class="form-error" id="replyError" role="alert"></div>
         </form>
+        <div class="viewer-note" id="viewerNote" hidden>You're a viewer in this team, so you can follow delegations but not send messages.</div>
         <form class="new" id="newForm" hidden>
           <h2>New delegation</h2>
           <p class="lede">Pick whose agent should handle it. It works in its owner's environment and replies here.</p>
@@ -389,6 +424,32 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
       <div class="scroll" id="agentsBody"></div>
     </section>
 
+    <!-- Members -->
+    <section class="view" id="view-members" aria-label="Members">
+      <div class="pane-head"><h1>Members</h1><span class="num" style="color:var(--ink-3)" id="membersSummary"></span></div>
+      <div class="scroll">
+        <div id="membersBody"></div>
+        <div class="connect" style="padding-top:0">
+          <section class="block" aria-labelledby="inviteH" id="inviteBlock">
+            <h2 id="inviteH">Invite people</h2>
+            <p id="inviteLede">Send someone a link. They pick a handle, get their own access token, and can connect their agents to this team.</p>
+            <form class="invite-form" id="inviteForm">
+              <div><label class="label" for="iRole">Role</label>
+                <select class="input" id="iRole"><option value="member">Member</option><option value="viewer">Viewer</option><option value="owner">Owner</option></select></div>
+              <div><label class="label" for="iUses">Uses</label><input class="input narrow num" id="iUses" type="number" min="1" max="100" value="1"></div>
+              <div><label class="label" for="iExpiry">Expires in</label>
+                <select class="input" id="iExpiry"><option value="24">1 day</option><option value="168" selected>7 days</option><option value="720">30 days</option></select></div>
+              <button class="btn primary" type="submit" id="iCreate">Create link</button>
+            </form>
+            <div class="form-error" id="iError" role="alert"></div>
+            <div class="new-link" id="newLink" hidden><div class="code"><pre id="newLinkUrl"></pre><button class="btn" type="button" data-copy="newLinkUrl">Copy</button></div></div>
+            <div id="invitesList"></div>
+            <div class="help" id="roleHelp" style="margin-top:14px">Members can delegate and connect their own agents. Viewers can only watch. Owners also manage members, invites and settings.</div>
+          </section>
+        </div>
+      </div>
+    </section>
+
     <!-- Connect -->
     <section class="view" id="view-connect" aria-label="Connect">
       <div class="pane-head"><h1>Connect</h1></div>
@@ -398,13 +459,14 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
           <p>The relay every agent connects to. Agents only make outbound requests, so they work from behind a firewall or NAT.</p>
           <dl class="kv">
             <dt>Address</dt><dd><span class="mono" id="cfgAddr"></span></dd>
-            <dt>Access</dt><dd id="cfgToken"></dd>
+            <dt>Team</dt><dd><span id="cfgTeam"></span> <span class="mono" style="color:var(--ink-3)" id="cfgTeamId"></span></dd>
             <dt>Hop limit</dt>
             <dd>
               <form id="hopsForm" style="display:flex;gap:8px;align-items:center">
                 <label class="sr-only" for="hopsInput">Hop limit</label>
                 <input class="input narrow num" id="hopsInput" type="number" min="1" max="50" inputmode="numeric">
                 <button class="btn" type="submit" id="hopsSave">Save</button>
+                <span class="help" style="margin:0" id="hopsOwnerOnly" hidden>Only owners can change this.</span>
                 <span id="hopsMsg" class="help" style="margin:0" role="status"></span>
               </form>
             </dd>
@@ -412,9 +474,19 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
           </dl>
         </section>
 
+        <section class="block" aria-labelledby="tokenH">
+          <h2 id="tokenH">Your access token</h2>
+          <p>Your connectors, MCP servers and the CLI use it to act as you. Anyone with it can too, so keep it private. The commands below include it when you copy them.</p>
+          <div class="token-box"><code id="tokenShown"></code>
+            <button class="btn ghost" type="button" data-action="reveal" id="revealBtn">Show</button>
+            <button class="btn" type="button" data-action="copy-token">Copy</button>
+            <button class="btn ghost danger" type="button" data-action="rotate" id="rotateBtn">Rotate</button></div>
+          <div class="help" id="tokenMsg" role="status"></div>
+        </section>
+
         <section class="block" aria-labelledby="reachH">
           <h2 id="reachH">Make an agent reachable</h2>
-          <p>Run this next to your agent. It joins the network under your name and handles requests from other people's agents.</p>
+          <p>Run this next to your agent, on any machine that can reach this hub. It joins this team as yours and handles requests from teammates' agents. First clone the repo there: <span class="mono">git clone https://github.com/FilipMilinkovic/backchannel ~/backchannel</span></p>
           <div class="grid-form">
             <div><label class="label" for="cHandle">Handle</label><input class="input mono" id="cHandle" placeholder="maya" autocomplete="off" spellcheck="false"><div class="help" id="cHandleHelp">Lowercase letters, numbers and dashes.</div></div>
             <div><label class="label" for="cOwner">Owner</label><input class="input" id="cOwner" placeholder="Maya Chen" autocomplete="off"></div>
@@ -440,7 +512,7 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
           <h2 id="delegH">Delegate from your coding agent</h2>
           <p>Adds <span class="mono">list_agents</span>, <span class="mono">ask_agent</span> and <span class="mono">check_inbox</span> tools to your session. When your agent needs something from a teammate, it asks their agent and gets the answer back mid-task.</p>
           <div class="grid-form" style="grid-template-columns:repeat(auto-fit,minmax(200px,280px))">
-            <div><label class="label" for="mHandle">Your handle</label><input class="input mono" id="mHandle" placeholder="filip" autocomplete="off" spellcheck="false"></div>
+            <div><label class="label" for="mHandle">Session handle</label><input class="input mono" id="mHandle" placeholder="filip" autocomplete="off" spellcheck="false"></div>
             <div><label class="label" for="mOwner">Your name</label><input class="input" id="mOwner" placeholder="Filip" autocomplete="off"></div>
           </div>
           <div class="seg tabs" role="group" aria-label="Coding agent" id="mTabs">
@@ -464,7 +536,8 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 
 const S = {
-  token: new URLSearchParams(location.search).get('token') || store.get('bc.token', ''),
+  token: store.get('bc.token', ''),
+  me: null, teams: [], team: null, role: null, members: [], invites: [],
   agents: [], messages: [], config: null, live: {}, // live: agentId -> { state, threadId, since }
   view: 'delegations', filter: store.get('bc.filter', 'active'), selected: null, composing: true,
   fresh: new Set(), connected: false,
@@ -492,21 +565,29 @@ function glyph(status) {
 // ---------- data ----------
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) } });
-  if (res.status === 401) {
-    const t = prompt('This hub requires an access token (HUB_TOKEN):');
-    if (t === null) throw new Error('Access token required');
-    S.token = t; store.set('bc.token', t);
-    return api(path, opts);
-  }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  if (res.status === 401 && S.token && S.me) { signOut('Your session ended (the token was rotated or removed). Sign in again.'); }
+  if (!res.ok) { const err = new Error(body.error || `Request failed (${res.status})`); err.status = res.status; throw err; }
   return body;
 }
+const tapi = (p, opts) => api(`/api/teams/${encodeURIComponent(S.team)}${p}`, opts);
+const post = (p, data, method = 'POST') => tapi(p, { method, body: JSON.stringify(data) });
 
 const agentById = (id) => S.agents.find((a) => a.id === id);
-const isPerson = (id) => !agentById(id);
-const display = (id) => id === 'human' ? 'You' : '@' + id;
-const ownerOf = (id) => agentById(id)?.owner || '';
+const memberByHandle = (h) => S.members.find((m) => m.handle === h);
+const isOwner = () => S.role === 'owner';
+const canPost = () => S.role === 'owner' || S.role === 'member';
+// Senders: agents are @handles; people show by name, and you as "You".
+function senderName(m) {
+  if (m.fromKind === 'user' || (!m.fromKind && !agentById(m.from))) {
+    if (S.me && m.from === S.me.user.handle) return 'You';
+    if (m.from === 'human') return 'Someone';
+    return memberByHandle(m.from)?.name || '@' + m.from;
+  }
+  return '@' + m.from;
+}
+const display = (id) => (S.me && id === S.me.user.handle && !agentById(id) ? 'You' : '@' + id);
+const ownerOf = (id) => { const a = agentById(id); return a ? (memberByHandle(a.ownerHandle)?.name || a.owner || '') : ''; };
 
 function threads() {
   const map = new Map();
@@ -603,9 +684,13 @@ function renderRail() {
     const label = !a.online ? 'offline' : a.state === 'working' ? 'working' : a.state === 'approval' ? 'waiting for approval' : 'online';
     return `<li class="${a.online ? '' : 'off'}" title="@${esc(a.id)}: ${label}">
       <span class="dot ${busy ? 'busy' : a.online ? 'on' : ''}" aria-hidden="true"></span>
-      <span class="who">@${esc(a.id)}${a.owner ? ` <span>${esc(a.owner)}</span>` : ''}</span><span class="sr-only">${label}</span></li>`;
+      <span class="who">@${esc(a.id)}${ownerOf(a.id) ? ` <span>${esc(ownerOf(a.id))}</span>` : ''}</span><span class="sr-only">${label}</span></li>`;
   }).join('') : `<li class="empty-note">No agents yet. Connect one to start.</li>`;
 
+  $('countMembers').textContent = S.members.length || '';
+  $('teamSelect').innerHTML = S.teams.map((t) => `<option value="${esc(t.id)}" ${t.id === S.team ? 'selected' : ''}>${esc(t.name)}</option>`).join('')
+    + '<option value="__new">New team…</option>';
+  $('meWho').innerHTML = S.me ? `<b>${esc(S.me.user.name || S.me.user.handle)}</b><span>@${esc(S.me.user.handle)} · ${esc(S.role || '')}</span>` : '';
   $('hubDot').className = 'dot ' + (S.connected ? 'on' : '');
   $('hubState').textContent = S.connected ? 'Live' : 'Reconnecting…';
   $('hubAddr').textContent = location.host;
@@ -613,6 +698,7 @@ function renderRail() {
 
 // ---------- render: list ----------
 function renderList() {
+  $('newBtn').hidden = !canPost();
   const ts = threads();
   const nActive = ts.filter((t) => ACTIVE.has(t.status)).length;
   $('nActive').textContent = nActive || '';
@@ -626,7 +712,7 @@ function renderList() {
       : `<div class="diagram" aria-hidden="true"><span class="node mono">your agent</span><span class="wire"></span><span class="node mono">their agent</span></div>
          <h3>No delegations yet</h3>
          <p>A delegation is one agent asking another for an answer or a change, so neither person has to stop and ask. Start one here, or connect your coding agent so it can delegate on its own mid-task.</p>
-         <div style="display:flex;gap:8px"><button class="btn primary" data-action="new">New delegation</button><button class="btn" data-goto="connect">Connect</button></div>`}</li>`;
+         <div style="display:flex;gap:8px">${canPost() ? '<button class="btn primary" data-action="new">New delegation</button>' : ''}<button class="btn" data-goto="connect">Connect</button></div>`}</li>`;
     return;
   }
   $('rows').innerHTML = shown.map((t) => {
@@ -636,7 +722,7 @@ function renderList() {
       <span class="glyph">${glyph(t.status)}</span>
       <span class="title">${esc(t.title)}</span>
       <span class="time num">${rel(t.updated)}</span>
-      <span class="route"><b>${esc(display(t.from))}</b> to <b>${esc(to)}</b> · ${n} ${n === 1 ? 'message' : 'messages'}</span>
+      <span class="route"><b>${esc(senderName(t.first))}</b> to <b>${esc(to)}</b> · ${n} ${n === 1 ? 'message' : 'messages'}</span>
       <span class="state ${t.status}">${LABEL[t.status]}</span>
     </li>`;
   }).join('');
@@ -648,13 +734,15 @@ let renderedThread = null, renderedCount = 0;
 function renderDetail() {
   const t = S.selected && threads().find((x) => x.id === S.selected);
   $('view-delegations').classList.toggle('show-detail', !!(t || S.composing) && S.mobileDetail);
+  $('viewerNote').hidden = canPost();
   if (!t) {
-    $('detailBody').hidden = true; $('replyForm').hidden = true; $('newForm').hidden = false;
+    $('detailBody').hidden = !!canPost(); $('replyForm').hidden = true; $('newForm').hidden = !canPost();
+    if (!canPost()) { $('detailBody').innerHTML = '<div class="empty"><h3>Pick a delegation</h3><p>Select one on the left to follow along.</p></div>'; renderedThread = null; return; }
     renderPicker();
     renderedThread = null;
     return;
   }
-  $('newForm').hidden = true; $('detailBody').hidden = false; $('replyForm').hidden = false;
+  $('newForm').hidden = true; $('detailBody').hidden = false; $('replyForm').hidden = !canPost();
   const hops = t.last.hop || 0, max = S.config?.maxHops ?? 8;
   const live = workingIn(t.id);
   const isNew = renderedThread !== t.id;
@@ -668,21 +756,22 @@ function renderDetail() {
       <h2>${esc(t.title)}</h2>
       <div class="facts">
         <span class="pill ${t.status}">${LABEL[t.status]}</span>
-        <span><span class="who">${esc(display(t.from))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
+        <span><span class="who">${esc(senderName(t.first))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
         <span class="num">Started ${clock(t.first.ts)}</span>
         <span class="num" title="Agent-to-agent replies used out of the hop limit">Hops ${hops} of ${max}</span>
       </div>
     </header>
     <div class="timeline" aria-live="polite">
       ${t.msgs.map((m, i) => {
-        const a = agentById(m.from);
-        const you = m.from === 'human';
+        const a = m.fromKind === 'user' ? null : agentById(m.from);
+        const name = senderName(m);
+        const you = name === 'You';
         const enter = !isNew && i >= renderedCount ? ' enter' : '';
         return `<article class="msg ${m.kind || ''}${enter}">
-          <div class="mono-av ${you ? 'you' : ''}" aria-hidden="true">${esc(you ? 'Y' : m.from[0])}</div>
+          <div class="mono-av ${you ? 'you' : ''}" aria-hidden="true">${esc((name.replace('@', '')[0] || '?'))}</div>
           <div>
-            <div class="msg-head"><span class="name">${esc(display(m.from))}</span>
-              ${a ? `<span class="meta">${esc([a.owner, BACKEND[a.backend] || a.backend].filter(Boolean).join(' · '))}</span>` : ''}
+            <div class="msg-head"><span class="name">${esc(name)}</span>
+              ${a ? `<span class="meta">${esc([ownerOf(a.id), BACKEND[a.backend] || a.backend].filter(Boolean).join(' · '))}</span>` : ''}
               ${m.to?.length ? `<span class="meta">to ${esc(m.to.map(display).join(', '))}</span>` : ''}
               <span class="meta num">${clock(m.ts)}</span></div>
             <div class="msg-body">${md(m.to?.length ? (stripLead(m.text) || m.text) : m.text)}</div>
@@ -728,7 +817,7 @@ function renderPicker() {
   $('picker').innerHTML = legend + list.map((a) => `
     <label class="pick">
       <input type="radio" name="to" value="${esc(a.id)}" ${a.id === chosen ? 'checked' : ''}>
-      <span><span class="nm">@${esc(a.id)}</span> <span style="color:var(--ink-3)">${esc(a.owner || '')}</span>
+      <span><span class="nm">@${esc(a.id)}</span> <span style="color:var(--ink-3)">${esc(ownerOf(a.id))}</span>
         <span class="sub">${esc(BACKEND[a.backend] || a.backend)}${a.repo ? ` in ${esc(a.repo)}` : ''} · ${a.access === 'write' ? 'can edit' : 'read-only'}</span></span>
       <span class="st"><span class="dot ${a.online ? (a.state !== 'idle' ? 'busy' : 'on') : ''}" aria-hidden="true"></span>${a.online ? (a.state === 'working' ? 'Busy' : 'Online') : 'Offline'}</span>
     </label>`).join('');
@@ -739,7 +828,7 @@ function renderAgents() {
   const online = S.agents.filter((a) => a.online).length;
   $('agentsSummary').textContent = S.agents.length ? `${online} of ${S.agents.length} online` : '';
   if (!S.agents.length) {
-    $('agentsBody').innerHTML = `<div class="empty" style="margin-top:12vh"><h3>No agents on this hub</h3>
+    $('agentsBody').innerHTML = `<div class="empty" style="margin-top:12vh"><h3>No agents in this team yet</h3>
       <p>An agent appears here once its connector or session connects. It stays listed while offline, and across hub restarts, until you remove it.</p>
       <button class="btn primary" data-goto="connect">Connect an agent</button></div>`;
     return;
@@ -751,14 +840,14 @@ function renderAgents() {
       const st = !a.online ? `Offline · seen ${rel(a.lastSeen)}` : a.state === 'working' ? 'Working' : a.state === 'approval' ? 'Waiting for approval' : 'Online';
       return `<tr>
         <td><div class="h">@${esc(a.id)}</div><div class="d" title="${esc(a.description)}">${esc(a.description)}</div></td>
-        <td>${esc(a.owner || '')}</td>
+        <td>${esc(ownerOf(a.id))}${a.ownerUserId && S.me && a.ownerUserId === S.me.user.id ? '<span class="you-tag">you</span>' : ''}</td>
         <td class="col-hide">${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}${a.kind === 'session' ? ' <span class="tag">live session</span>' : ''}</td>
         <td class="col-hide">${a.kind === 'session' ? '<span class="tag">asks others</span>' : `<span class="tag ${a.access === 'write' ? 'write' : ''}">${a.access === 'write' ? 'Can edit' : 'Read-only'}</span>${a.repo ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.repo)}</span>` : ''}`}</td>
         <td><span class="status-cell"><span class="dot ${a.online ? (a.state !== 'idle' ? 'busy' : 'on') : ''}" aria-hidden="true"></span>${st}</span></td>
         <td><div class="actions">
-          <a class="btn ghost" href="/api/agents/${encodeURIComponent(a.id)}/card${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}" target="_blank" rel="noopener">Card</a>
-          ${a.kind !== 'session' && a.online ? `<button class="btn" data-delegate="${esc(a.id)}">Delegate</button>` : ''}
-          ${!a.online ? `<button class="btn ghost danger" data-remove="${esc(a.id)}" aria-label="Remove @${esc(a.id)}">Remove</button>` : ''}
+          <button class="btn ghost" type="button" data-card="${esc(a.id)}">Card</button>
+          ${a.kind !== 'session' && a.online && canPost() ? `<button class="btn" data-delegate="${esc(a.id)}">Delegate</button>` : ''}
+          ${!a.online && (isOwner() || (S.me && a.ownerUserId === S.me.user.id)) ? `<button class="btn ghost danger" data-remove="${esc(a.id)}" aria-label="Remove @${esc(a.id)}">Remove</button>` : ''}
         </div></td></tr>`;
     }).join('')}</tbody></table>`;
 }
@@ -773,7 +862,7 @@ async function removeAgent(btn) {
   }
   btn.disabled = true; btn.textContent = 'Removing…';
   try {
-    await api(`/api/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await tapi(`/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
     S.agents = S.agents.filter((a) => a.id !== id);
     renderAll();
   } catch (err) {
@@ -784,23 +873,36 @@ async function removeAgent(btn) {
 
 // ---------- render: connect ----------
 const shq = (s) => /^[\w@%+=:,./~-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`;
+const ROOT = '~/backchannel';
+const masked = () => (S.token ? `${S.token.slice(0, 7)}…${S.token.slice(-4)}` : '');
+let tokenRevealed = false;
+// Commands are shown with a masked token and copied with the real one.
+function setCmd(id, build) {
+  $(id).textContent = build(masked());
+  $(id).dataset.copyText = build(S.token);
+}
 function renderConnect() {
   const c = S.config;
   if (!c) return;
   $('cfgAddr').textContent = location.origin;
-  $('cfgToken').innerHTML = c.tokenRequired ? '<span class="tag">Token required</span>' : `<span class="tag">Open</span><span class="help" style="margin:0">${c.host === '127.0.0.1' || c.host === 'localhost' ? 'Only this machine can connect.' : 'Anyone who can reach this address can connect. Set HUB_TOKEN.'}</span>`;
+  $('cfgTeam').textContent = c.name || '';
+  $('cfgTeamId').textContent = S.team;
   if (document.activeElement !== $('hopsInput')) $('hopsInput').value = c.maxHops;
+  $('hopsInput').disabled = !isOwner(); $('hopsSave').hidden = !isOwner(); $('hopsOwnerOnly').hidden = isOwner();
+  $('tokenShown').textContent = tokenRevealed ? S.token : masked();
+  $('revealBtn').textContent = tokenRevealed ? 'Hide' : 'Show';
   buildConnector(); buildMcp();
 }
 
 function buildConnector() {
-  const root = S.config?.root || '/path/to/backchannel';
+  const root = ROOT;
   const backend = $('cBackend').value;
   const coder = backend === 'claude-code' || backend === 'codex';
   $('cFolderWrap').hidden = !coder;
   $('cWrite').disabled = !coder;
+  if (S.me) { $('cHandle').placeholder = `${S.me.user.handle}-${backend === 'claude-code' ? 'claude' : backend}`; $('cOwner').placeholder = S.me.user.name || S.me.user.handle; }
   const raw = $('cHandle').value.trim();
-  const handle = raw.toLowerCase() || 'maya';
+  const handle = raw.toLowerCase() || $('cHandle').placeholder;
   const valid = !raw || /^[a-z][a-z0-9_-]{0,31}$/.test(raw);
   $('cHandle').setAttribute('aria-invalid', String(!valid));
   $('cHandleHelp').textContent = valid ? 'Lowercase letters, numbers and dashes.' : 'Start with a letter; use only lowercase letters, numbers, - and _.';
@@ -808,15 +910,15 @@ function buildConnector() {
   const env = [];
   if (backend === 'openai') env.push('OPENAI_API_KEY=sk-…');
   if (backend === 'grok') env.push('XAI_API_KEY=xai-…');
-  env.push(`HUB_URL=${location.origin}`);
-  if (S.config?.tokenRequired) env.push('HUB_TOKEN=…');
+  env.push(`HUB_URL=${location.origin}`, 'HUB_TOKEN=%TOKEN%', `HUB_TEAM=${S.team}`);
   const args = [`--id ${shq(handle)}`, `--backend ${backend}`];
   const owner = $('cOwner').value.trim();
   if (owner) args.push(`--owner ${shq(owner)}`);
   if (coder) args.push(`--cwd ${shq($('cFolder').value.trim() || '~/code/your-repo')}`);
   if (coder && $('cWrite').checked) args.push('--write');
   if ($('cApprove').checked) args.push('--approve');
-  $('cCmd').textContent = `${env.join(' ')} \\\n  node ${shq(root + '/agent.js')} \\\n  ${args.join(' ')}`;
+  const cmd = `${env.join(' ')} \\\n  node ${root}/agent.js \\\n  ${args.join(' ')}`;
+  setCmd('cCmd', (tok) => cmd.replace('%TOKEN%', tok));
   const notes = {
     'claude-code': 'Uses the <b>claude</b> CLI and the account it’s signed in to. Requests run headless in the folder.',
     codex: 'Uses the <b>codex</b> CLI and the account it’s signed in to. Runs in Codex’s sandbox.',
@@ -824,25 +926,25 @@ function buildConnector() {
     grok: 'Set <b>XAI_MODEL</b> to pick a model. Answers from knowledge only, with no access to files.',
     echo: 'Repeats each message back. Useful to check the network works before adding keys.',
   };
-  $('cNote').innerHTML = `<span>${notes[backend]}${coder && $('cWrite').checked && !$('cApprove').checked ? ' <b>Edits without approval:</b> anyone on this hub can change files in that folder.' : ''}</span>`;
+  $('cNote').innerHTML = `<span>${notes[backend]}${coder && $('cWrite').checked && !$('cApprove').checked ? ' <b>Edits without approval:</b> anyone in this team can change files in that folder.' : ''}</span>`;
   store.set('bc.connector', JSON.stringify({ h: raw, o: owner, b: backend, f: $('cFolder').value, w: $('cWrite').checked, a: $('cApprove').checked }));
 }
 
 let mcpTool = store.get('bc.tool', 'claude');
 function buildMcp() {
-  const root = S.config?.root || '/path/to/backchannel';
-  const handle = ($('mHandle').value.trim() || 'you').toLowerCase();
-  const owner = $('mOwner').value.trim() || handle;
-  const tokenEnv = S.config?.tokenRequired ? ' -e HUB_TOKEN=…' : '';
+  const root = ROOT;
+  if (S.me) { $('mHandle').placeholder = S.me.user.handle; $('mOwner').placeholder = S.me.user.name || S.me.user.handle; }
+  const handle = ($('mHandle').value.trim() || S.me?.user.handle || 'you').toLowerCase();
+  const owner = $('mOwner').value.trim() || S.me?.user.name || handle;
   document.querySelectorAll('#mTabs button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.tool === mcpTool)));
   if (mcpTool === 'claude') {
     $('mWhere').textContent = 'Run once in your terminal';
-    $('mCmd').textContent = `claude mcp add backchannel --scope user \\\n  -e HUB_URL=${location.origin} -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)}${tokenEnv} \\\n  -- node ${shq(root + '/mcp.js')}`;
-    $('mNote').innerHTML = '<span>Then ask Claude something like <b>“ask @maya’s agent how refunds work in the payments service”</b>.</span>';
+    setCmd('mCmd', (tok) => `claude mcp add backchannel --scope user \\\n  -e HUB_URL=${location.origin} -e HUB_TOKEN=${tok} -e HUB_TEAM=${S.team} \\\n  -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)} \\\n  -- node ${root}/mcp.js`);
+    $('mNote').innerHTML = '<span>Then just work. Your agent asks teammates’ agents when it needs something from them.</span>';
   } else {
     $('mWhere').textContent = 'Add to ~/.codex/config.toml';
-    $('mCmd').textContent = `[mcp_servers.backchannel]\ncommand = "node"\nargs = ["${root}/mcp.js"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nHUB_URL = "${location.origin}"\nAGENT_ID = "${handle}"\nAGENT_OWNER = "${owner}"${S.config?.tokenRequired ? '\nHUB_TOKEN = "…"' : ''}`;
-    $('mNote').innerHTML = '<span><b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply. Codex’s default is too short for a coding agent.</span>';
+    setCmd('mCmd', (tok) => `[mcp_servers.backchannel]\ncommand = "node"\nargs = ["${root.replace('~', '/Users/you')}/mcp.js"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nHUB_URL = "${location.origin}"\nHUB_TOKEN = "${tok}"\nHUB_TEAM = "${S.team}"\nAGENT_ID = "${handle}"\nAGENT_OWNER = "${owner}"`);
+    $('mNote').innerHTML = '<span>Codex needs an absolute path in <b>args</b>. <b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
   }
   store.set('bc.mcp', JSON.stringify({ h: $('mHandle').value, o: $('mOwner').value }));
 }
@@ -852,11 +954,69 @@ function renderAll() {
   renderRail();
   if (S.view === 'delegations') { renderList(); renderDetail(); }
   if (S.view === 'agents') renderAgents();
+  if (S.view === 'members') renderMembers();
   if (S.view === 'connect') renderConnect();
 }
 
+// ---------- render: members ----------
+function renderMembers() {
+  const owners = S.members.filter((m) => m.role === 'owner').length;
+  $('membersSummary').textContent = `${S.members.length} ${S.members.length === 1 ? 'person' : 'people'}`;
+  $('membersBody').innerHTML = `<table>
+    <thead><tr><th>Name</th><th class="col-hide">Handle</th><th>Role</th><th class="col-hide">Agents</th><th class="col-hide">Joined</th><th><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>${S.members.map((m) => {
+      const self = S.me && m.userId === S.me.user.id;
+      const lastOwner = m.role === 'owner' && owners === 1;
+      const agents = S.agents.filter((a) => a.ownerUserId === m.userId).map((a) => '@' + a.id);
+      const role = isOwner() && !lastOwner
+        ? `<label class="sr-only" for="role-${esc(m.userId)}">Role for ${esc(m.name)}</label><select class="input" id="role-${esc(m.userId)}" data-role-for="${esc(m.userId)}">
+            ${['owner', 'member', 'viewer'].map((r) => `<option value="${r}" ${r === m.role ? 'selected' : ''}>${r[0].toUpperCase() + r.slice(1)}</option>`).join('')}</select>`
+        : `<span class="tag">${esc(m.role[0].toUpperCase() + m.role.slice(1))}</span>${lastOwner ? '<span class="help" style="margin:0 0 0 8px">Last owner</span>' : ''}`;
+      const action = self
+        ? (lastOwner ? '' : `<button class="btn ghost danger" data-remove-member="${esc(m.userId)}" data-self="1">Leave team</button>`)
+        : (isOwner() && !lastOwner ? `<button class="btn ghost danger" data-remove-member="${esc(m.userId)}">Remove</button>` : '');
+      return `<tr>
+        <td><div class="h">${esc(m.name || m.handle)}${self ? '<span class="you-tag">you</span>' : ''}</div></td>
+        <td class="col-hide mono">@${esc(m.handle)}</td>
+        <td>${role}</td>
+        <td class="col-hide">${agents.length ? esc(agents.join(', ')) : '<span style="color:var(--ink-3)">None</span>'}</td>
+        <td class="col-hide num">${m.joinedAt ? new Date(m.joinedAt).toLocaleDateString() : ''}</td>
+        <td><div class="actions">${action}</div></td></tr>`;
+    }).join('')}</tbody></table>`;
+
+  $('inviteForm').hidden = !isOwner();
+  $('inviteLede').textContent = isOwner()
+    ? 'Send someone a link. They pick a handle, get their own access token, and can connect their agents to this team.'
+    : 'Only owners can invite people. Ask an owner for a link.';
+  if (!isOwner()) { $('invitesList').innerHTML = ''; return; }
+  const active = S.invites.filter((i) => i.expiresAt > Date.now() && i.usesLeft > 0);
+  $('invitesList').innerHTML = active.length ? `<div class="code-label"><span>Active invites</span></div><table><tbody>${active.map((i) => `<tr>
+      <td><span class="tag">${esc(i.role)}</span></td>
+      <td class="num">${i.usesLeft} use${i.usesLeft === 1 ? '' : 's'} left</td>
+      <td class="num col-hide">Expires ${new Date(i.expiresAt).toLocaleDateString()}</td>
+      <td><div class="actions"><button class="btn ghost" data-copy-invite="${esc(i.url || inviteUrl(i.code))}">Copy link</button>
+        <button class="btn ghost danger" data-revoke="${esc(i.code)}">Revoke</button></div></td></tr>`).join('')}</tbody></table>` : '';
+}
+const inviteUrl = (code) => `${location.origin}/#join/${code}`;
+
+async function loadInvites() {
+  if (!isOwner()) { S.invites = []; return; }
+  try { S.invites = await tapi('/invites'); } catch { S.invites = []; }
+}
+
+// Two-step confirm used by destructive buttons: first click arms, second click (within 4s) acts.
+function armed(btn, label) {
+  if (btn.dataset.armed === '1') return true;
+  const orig = btn.textContent;
+  btn.dataset.armed = '1'; btn.textContent = label;
+  setTimeout(() => { if (btn.isConnected && btn.dataset.armed === '1') { btn.dataset.armed = ''; btn.textContent = orig; } }, 4000);
+  return false;
+}
+
 function setView(v) {
+  if (!['delegations', 'agents', 'members', 'connect'].includes(v)) v = 'delegations';
   S.view = v;
+  if (v === 'members') loadInvites().then(() => S.view === 'members' && renderMembers());
   document.querySelectorAll('.view').forEach((el) => el.classList.toggle('active', el.id === `view-${v}`));
   if (location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
   renderAll();
@@ -876,13 +1036,28 @@ function startNew(to) {
 }
 
 // ---------- events ----------
+let es = null;
 function connect() {
-  const es = new EventSource('/api/events' + (S.token ? `?token=${encodeURIComponent(S.token)}` : ''));
+  if (es) es.close();
+  const team = S.team;
+  es = new EventSource(`/api/teams/${encodeURIComponent(team)}/events?token=${encodeURIComponent(S.token)}`);
   es.onopen = () => { S.connected = true; renderRail(); };
   es.onerror = () => { S.connected = false; renderRail(); };
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.type === 'hello') { S.agents = ev.agents; if (ev.config) S.config = { ...S.config, ...ev.config }; }
+    if (team !== S.team) return;
+    if (ev.type === 'hello') {
+      if (ev.agents) S.agents = ev.agents;
+      if (ev.config) S.config = { ...S.config, ...ev.config };
+      if (ev.members) S.members = ev.members;
+      if (ev.role && ev.role !== S.role) { S.role = ev.role; const t = S.teams.find((x) => x.id === team); if (t) t.role = ev.role; loadInvites().then(renderAll); }
+    }
+    if (ev.type === 'members') {
+      if (ev.members) S.members = ev.members;
+      const mine = S.members.find((m) => S.me && m.userId === S.me.user.id);
+      if (!mine) { refreshAccount(); return; } // removed from this team
+      if (mine.role !== S.role) { S.role = mine.role; loadInvites().then(renderAll); }
+    }
     if (ev.type === 'agents') S.agents = ev.agents;
     if (ev.type === 'config') S.config = { ...S.config, ...ev.config };
     if (ev.type === 'status') {
@@ -908,15 +1083,85 @@ document.addEventListener('click', async (e) => {
   if (t.dataset.action === 'back') { S.mobileDetail = false; S.selected = null; S.composing = true; renderList(); return renderDetail(); }
   if (t.dataset.delegate) return startNew(t.dataset.delegate);
   if (t.dataset.remove) return removeAgent(t);
-  if (t.dataset.tool) { mcpTool = t.dataset.tool; store.set('bc.tool', mcpTool); return buildMcp(); }
-  if (t.dataset.copy) {
-    const text = $(t.dataset.copy).textContent;
-    try { await navigator.clipboard.writeText(text); t.textContent = 'Copied'; }
-    catch { t.textContent = 'Select & copy'; }
-    setTimeout(() => (t.textContent = 'Copy'), 1600);
+  if (t.dataset.action === 'signout') return signOut();
+  if (t.dataset.action === 'reveal') { tokenRevealed = !tokenRevealed; return renderConnect(); }
+  if (t.dataset.action === 'copy-token') return copy(t, S.token);
+  if (t.dataset.action === 'rotate') return rotateToken(t);
+  if (t.dataset.card) return showCard(t.dataset.card);
+  if (t.dataset.copyInvite) return copy(t, t.dataset.copyInvite);
+  if (t.dataset.revoke) {
+    if (!armed(t, 'Revoke?')) return;
+    try { await tapi(`/invites/${encodeURIComponent(t.dataset.revoke)}`, { method: 'DELETE' }); await loadInvites(); renderMembers(); }
+    catch (err) { t.textContent = "Couldn't revoke"; t.title = err.message; }
     return;
   }
+  if (t.dataset.removeMember) {
+    const self = t.dataset.self === '1';
+    if (!armed(t, self ? 'Leave? Your agents here go too' : 'Remove? Their agents go too')) return;
+    try {
+      await tapi(`/members/${encodeURIComponent(t.dataset.removeMember)}`, { method: 'DELETE' });
+      if (self) return refreshAccount();
+      S.members = await tapi('/members'); renderAll();
+    } catch (err) { t.textContent = "Couldn't remove"; t.title = err.message; }
+    return;
+  }
+  if (t.dataset.tool) { mcpTool = t.dataset.tool; store.set('bc.tool', mcpTool); return buildMcp(); }
+  if (t.dataset.copy) { const el = $(t.dataset.copy); return copy(t, el.dataset.copyText || el.textContent); }
   if (t.classList.contains('row')) return select(t.dataset.id);
+});
+
+async function copy(btn, text) {
+  const orig = btn.dataset.label || btn.textContent;
+  btn.dataset.label = orig;
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+  catch { btn.textContent = 'Copy failed'; }
+  setTimeout(() => (btn.textContent = orig), 1600);
+}
+
+async function showCard(id) {
+  try {
+    const card = await tapi(`/agents/${encodeURIComponent(id)}/card`);
+    const w = window.open('', '_blank');
+    if (w) { w.document.title = `@${id} agent card`; w.document.body.style.cssText = 'background:#111;color:#ddd;font:13px/1.6 ui-monospace,monospace;padding:24px;white-space:pre-wrap'; w.document.body.textContent = JSON.stringify(card, null, 2); }
+  } catch (err) { alert(`Couldn't load the card: ${err.message}`); }
+}
+
+async function rotateToken(btn) {
+  if (!armed(btn, 'Rotate? Old token stops working')) return;
+  btn.disabled = true;
+  try {
+    const { token } = await api('/api/me/token', { method: 'POST' });
+    S.token = token; store.set('bc.token', token); tokenRevealed = true;
+    $('tokenMsg').textContent = 'New token active. Update HUB_TOKEN in your connectors, MCP configs and CLI.';
+    connect(); renderConnect();
+  } catch (err) { $('tokenMsg').textContent = `Couldn't rotate: ${err.message}`; }
+  finally { btn.disabled = false; btn.dataset.armed = ''; btn.textContent = 'Rotate'; }
+}
+
+$('teamSelect').addEventListener('change', (e) => {
+  if (e.target.value === '__new') { e.target.value = S.team; return showGate('newteam'); }
+  switchTeam(e.target.value);
+});
+
+$('membersBody').addEventListener('change', async (e) => {
+  const userId = e.target.dataset.roleFor;
+  if (!userId) return;
+  e.target.disabled = true;
+  try { await post(`/members/${encodeURIComponent(userId)}`, { role: e.target.value }, 'PATCH'); S.members = await tapi('/members'); }
+  catch (err) { alert(`Couldn't change the role: ${err.message}`); }
+  renderAll();
+});
+
+$('inviteForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('iError').textContent = ''; $('iCreate').disabled = true;
+  try {
+    const inv = await post('/invites', { role: $('iRole').value, uses: Number($('iUses').value) || 1, expiresInHours: Number($('iExpiry').value) });
+    $('newLinkUrl').textContent = inv.url || inviteUrl(inv.code);
+    $('newLink').hidden = false;
+    await loadInvites(); renderMembers();
+  } catch (err) { $('iError').textContent = `Couldn't create the invite: ${err.message}`; }
+  finally { $('iCreate').disabled = false; }
 });
 
 $('picker').addEventListener('change', (e) => { if (e.target.name === 'to') { S.composeTo = e.target.value; store.set('bc.lastTo', S.composeTo); } });
@@ -927,7 +1172,7 @@ async function submit(form, textEl, errEl, btn, body) {
   if (!text) { errEl.textContent = 'Write a message first.'; textEl.focus(); return null; }
   btn.disabled = true;
   try {
-    const msg = await api('/api/messages', { method: 'POST', body: JSON.stringify(body(text)) });
+    const msg = await post('/messages', body(text));
     textEl.value = ''; autosize(textEl);
     if (msg.note) errEl.textContent = 'Not delivered: this delegation hit the hop limit. Raise it in Connect or start a new delegation.';
     return msg;
@@ -941,7 +1186,7 @@ $('newForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const to = S.composeTo;
   if (!to) return;
-  const msg = await submit($('newForm'), $('newText'), $('newError'), $('newSend'), (text) => ({ from: 'human', text: `@${to} ${text}` }));
+  const msg = await submit($('newForm'), $('newText'), $('newError'), $('newSend'), (text) => ({ text: `@${to} ${text}` }));
   if (msg) { S.messages.some((m) => m.id === msg.id) || S.messages.push(msg); if (S.filter === 'done') S.filter = 'active'; select(msg.threadId); }
 });
 
@@ -952,7 +1197,7 @@ $('replyForm').addEventListener('submit', async (e) => {
   const raw = $('replyText').value.trim();
   const target = defaultReplyTarget(t);
   const msg = await submit($('replyForm'), $('replyText'), $('replyError'), $('replySend'),
-    (text) => ({ from: 'human', threadId: t.id, text: /^@[a-zA-Z]/.test(raw) || !target ? text : `@${target} ${text}` }));
+    (text) => ({ threadId: t.id, text: /^@[a-zA-Z]/.test(raw) || !target ? text : `@${target} ${text}` }));
   if (msg && !S.messages.some((m) => m.id === msg.id)) { S.messages.push(msg); renderDetail(); }
   updateReplyHint();
 });
@@ -970,7 +1215,7 @@ $('hopsForm').addEventListener('submit', async (e) => {
   const n = Number($('hopsInput').value);
   if (!Number.isInteger(n) || n < 1 || n > 50) { $('hopsInput').setAttribute('aria-invalid', 'true'); $('hopsMsg').textContent = 'Use a whole number from 1 to 50.'; $('hopsMsg').style.color = 'var(--danger)'; return; }
   $('hopsInput').setAttribute('aria-invalid', 'false'); $('hopsSave').disabled = true;
-  try { S.config = { ...S.config, ...(await api('/api/config', { method: 'POST', body: JSON.stringify({ maxHops: n }) })) }; $('hopsMsg').style.color = ''; $('hopsMsg').textContent = 'Saved'; }
+  try { S.config = { ...S.config, ...(await post('', { maxHops: n }, 'PATCH')) }; $('hopsMsg').style.color = ''; $('hopsMsg').textContent = 'Saved'; }
   catch (err) { $('hopsMsg').style.color = 'var(--danger)'; $('hopsMsg').textContent = err.message; }
   finally { $('hopsSave').disabled = false; setTimeout(() => ($('hopsMsg').textContent = ''), 2000); }
 });
@@ -978,14 +1223,14 @@ $('hopsForm').addEventListener('submit', async (e) => {
 for (const id of ['cHandle', 'cOwner', 'cBackend', 'cFolder', 'cWrite', 'cApprove']) $(id).addEventListener('input', buildConnector);
 for (const id of ['mHandle', 'mOwner']) $(id).addEventListener('input', buildMcp);
 
-// keyboard: N new · J/K move · Esc back · 1-3 views
+// keyboard: N new · J/K move · Esc back · 1-4 views
 document.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName);
   if (e.key === 'Escape') { if (typing) document.activeElement.blur(); else if (S.view === 'delegations') { S.selected = null; S.composing = true; S.mobileDetail = false; renderList(); renderDetail(); } return; }
   if (typing) return;
-  if (e.key === 'n' || e.key === 'N') { e.preventDefault(); return startNew(); }
-  if (['1', '2', '3'].includes(e.key)) return setView(['delegations', 'agents', 'connect'][Number(e.key) - 1]);
+  if ((e.key === 'n' || e.key === 'N') && canPost() && !$('app').hidden) { e.preventDefault(); return startNew(); }
+  if (['1', '2', '3', '4'].includes(e.key)) return setView(['delegations', 'agents', 'members', 'connect'][Number(e.key) - 1]);
   if ((e.key === 'j' || e.key === 'k') && S.view === 'delegations') {
     const ids = [...document.querySelectorAll('#rows .row')].map((r) => r.dataset.id);
     if (!ids.length) return;
@@ -1002,28 +1247,158 @@ setInterval(() => {
 }, 1000);
 setInterval(() => { if (S.view === 'delegations') renderList(); }, 30000);
 
-// ---------- boot ----------
-(async () => {
+// ---------- gate: sign in, join, create team ----------
+const BRAND = document.querySelector('.brand').outerHTML;
+function gate(html) {
+  $('app').hidden = true;
+  $('gate').hidden = false;
+  $('gate').innerHTML = `<div class="gate-card">${BRAND}${html}</div>`;
+  $('gate').querySelector('input')?.focus();
+}
+function showGate(kind, note = '') {
+  if (es) { es.close(); es = null; }
+  if (kind === 'signin') {
+    gate(`<h1>Sign in</h1>
+      <p>${note ? esc(note) : 'Paste the access token you got when you joined a team. New here? Open the invite link a teammate sent you.'}</p>
+      <form id="signinForm"><div><label class="label" for="tokenIn">Access token</label>
+        <input class="input mono" id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="bc_…" required></div>
+        <div class="form-error" id="gateError" role="alert"></div>
+        <button class="btn primary" type="submit">Sign in</button></form>`);
+    $('signinForm').onsubmit = async (e) => {
+      e.preventDefault();
+      S.token = $('tokenIn').value.trim();
+      try { await refreshAccount(true); }
+      catch (err) { S.token = ''; $('gateError').textContent = err.status === 401 ? "That token isn't valid on this hub." : `Couldn't sign in: ${err.message}`; }
+    };
+  } else if (kind === 'down') {
+    gate(`<h1>Can't reach the hub</h1><p>${esc(note)}. Check that <span class="mono">node hub.js</span> is running, then retry.</p>
+      <button class="btn primary" type="button" id="retryBtn">Retry</button>`);
+    $('retryBtn').onclick = () => boot();
+  } else if (kind === 'noteam' || kind === 'newteam') {
+    gate(`<h1>${kind === 'noteam' ? "You're not in a team yet" : 'New team'}</h1>
+      <p>${kind === 'noteam' ? 'Ask a teammate for an invite link, or start your own team and invite them.' : 'A team is one project: its own agents, delegations, members and settings. You’ll be its owner.'}</p>
+      <form id="teamForm"><div><label class="label" for="teamName">Team name</label><input class="input" id="teamName" required maxlength="60" placeholder="Payments revamp"></div>
+        <div class="form-error" id="gateError" role="alert"></div>
+        <button class="btn primary" type="submit">Create team</button></form>
+      ${kind === 'newteam' ? '<div class="alt"><button type="button" id="cancelGate">Cancel</button></div>' : `<div class="alt">Wrong account? <button type="button" id="gateSignout">Sign out</button></div>`}`);
+    $('teamForm').onsubmit = async (e) => {
+      e.preventDefault();
+      try { const { team } = await api('/api/teams', { method: 'POST', body: JSON.stringify({ name: $('teamName').value.trim() }) }); store.set('bc.team', team.id); await refreshAccount(); }
+      catch (err) { $('gateError').textContent = `Couldn't create the team: ${err.message}`; }
+    };
+    if ($('cancelGate')) $('cancelGate').onclick = () => { $('gate').hidden = true; $('app').hidden = false; connect(); };
+    if ($('gateSignout')) $('gateSignout').onclick = () => signOut();
+  }
+}
+
+async function showJoin(code) {
+  let info;
+  try { info = await api(`/api/invites/${encodeURIComponent(code)}`); }
+  catch (err) {
+    return gate(`<h1>This invite doesn't work</h1><p>${err.status === 404 ? 'The link is invalid, expired or already used. Ask for a new one.' : esc(err.message)}</p>
+      <button class="btn primary" type="button" id="toApp">Continue</button>`), ($('toApp').onclick = () => { history.replaceState(null, '', '#'); boot(); });
+  }
+  let me = null;
+  if (S.token) { try { me = await api('/api/me'); } catch {} }
+  const head = `<h1>Join ${esc(info.teamName)}</h1>
+    <p>${info.invitedBy ? `${esc(info.invitedBy)} invited you` : 'You’re invited'} as a <b style="color:var(--ink-2)">${esc(info.role)}</b>. You'll be able to ${info.role === 'viewer' ? 'follow the team’s delegations' : 'delegate to teammates’ agents and connect your own'}.</p>`;
+  if (me) {
+    gate(`${head}<form id="joinForm"><div class="form-error" id="gateError" role="alert"></div>
+      <button class="btn primary" type="submit">Join as @${esc(me.user.handle)}</button></form>
+      <div class="alt">Not you? <button type="button" id="otherAcct">Use a different account</button></div>`);
+    $('otherAcct').onclick = () => { S.token = ''; store.set('bc.token', ''); showJoin(code); };
+  } else {
+    gate(`${head}<form id="joinForm">
+      <div><label class="label" for="jName">Your name</label><input class="input" id="jName" required maxlength="60" autocomplete="name" placeholder="Maya Chen"></div>
+      <div><label class="label" for="jHandle">Handle</label><input class="input mono" id="jHandle" required maxlength="32" pattern="[a-z][a-z0-9_\-]{0,31}" autocomplete="username" spellcheck="false" placeholder="maya">
+        <div class="help">How teammates mention you. Lowercase letters, numbers, - and _.</div></div>
+      <div class="form-error" id="gateError" role="alert"></div>
+      <button class="btn primary" type="submit">Create account and join</button></form>
+      <div class="alt">Already have an account? <button type="button" id="haveToken">Sign in first</button></div>`);
+    $('jName').oninput = () => { if (!$('jHandle').dataset.touched) $('jHandle').value = $('jName').value.toLowerCase().split(/\s+/)[0].replace(/[^a-z0-9_-]/g, ''); };
+    $('jHandle').oninput = () => { $('jHandle').dataset.touched = '1'; };
+    $('haveToken').onclick = () => showGate('signin', 'Sign in, then open the invite link again to join.');
+  }
+  $('joinForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type=submit]');
+    btn.disabled = true;
+    try {
+      const res = await api(`/api/invites/${encodeURIComponent(code)}/accept`, { method: 'POST',
+        body: JSON.stringify(me ? {} : { handle: $('jHandle').value.trim().toLowerCase(), name: $('jName').value.trim() }) });
+      store.set('bc.team', res.team.id);
+      history.replaceState(null, '', '#delegations');
+      if (res.token) {
+        S.token = res.token; store.set('bc.token', res.token);
+        gate(`<h1>You're in, @${esc(res.user.handle)}</h1>
+          <p>This is your personal access token. Your connectors, MCP servers and the CLI use it to act as you. Save it in your password manager. You can see it again later under Connect, in this browser.</p>
+          <div class="token-box"><code id="newToken">${esc(res.token)}</code><button class="btn" type="button" id="copyNew">Copy</button></div>
+          <div style="margin-top:18px"><button class="btn primary" type="button" id="toApp" style="width:100%;justify-content:center">Continue to ${esc(res.team.name)}</button></div>`);
+        $('copyNew').onclick = (ev) => copy(ev.currentTarget, res.token);
+        $('toApp').onclick = () => refreshAccount();
+      } else {
+        await refreshAccount();
+      }
+    } catch (err) {
+      btn.disabled = false;
+      $('gateError').textContent = err.status === 409 ? 'That handle is taken. Pick another.' : `Couldn't join: ${err.message}`;
+    }
+  };
+}
+
+function signOut(note) {
+  S.token = ''; S.me = null; store.set('bc.token', '');
+  showGate('signin', note);
+}
+
+// Loads the account and teams, then opens the chosen team.
+async function refreshAccount(fromSignin = false) {
+  const me = await api('/api/me');
+  if (fromSignin) store.set('bc.token', S.token);
+  S.me = me; S.teams = me.teams;
+  if (!me.teams.length) return showGate('noteam');
+  const want = store.get('bc.team', '');
+  await switchTeam(me.teams.some((t) => t.id === want) ? want : me.teams[0].id);
+}
+
+async function switchTeam(teamId) {
+  S.team = teamId; store.set('bc.team', teamId);
+  S.role = S.teams.find((t) => t.id === teamId)?.role || null;
+  Object.assign(S, { agents: [], messages: [], members: [], invites: [], live: {}, selected: null, composing: true, config: null });
+  const [team, agents, messages, members] = await Promise.all([tapi(''), tapi('/agents'), tapi('/messages'), tapi('/members')]);
+  S.config = team; S.role = team.role || S.role; S.agents = agents; S.messages = messages; S.members = members;
+  for (const a of agents) if (a.state && a.state !== 'idle') S.live[a.id] = { state: a.state, threadId: a.stateThread, since: Date.now() };
+  await loadInvites();
+  $('gate').hidden = true; $('app').hidden = false;
+  const v = location.hash.slice(1);
+  setView(['delegations', 'agents', 'members', 'connect'].includes(v) ? v : 'delegations');
+  connect();
+}
+
+async function boot() {
+  const join = location.hash.match(/^#join\/([\w-]+)/);
+  if (join) return showJoin(join[1]);
+  if (!S.token) return showGate('signin');
+  try { await refreshAccount(); }
+  catch (err) {
+    if (err.status === 401) return signOut('That access token no longer works. Sign in again.');
+    showGate('down', err.message);
+  }
+}
+
+(() => {
   try {
     const c = JSON.parse(store.get('bc.connector', '{}'));
     if (c.b) { $('cHandle').value = c.h || ''; $('cOwner').value = c.o || ''; $('cBackend').value = c.b; $('cFolder').value = c.f || ''; $('cWrite').checked = !!c.w; $('cApprove').checked = c.a !== false; }
     const m = JSON.parse(store.get('bc.mcp', '{}'));
     $('mHandle').value = m.h || ''; $('mOwner').value = m.o || '';
   } catch {}
-  try {
-    const [agents, messages, config] = await Promise.all([api('/api/agents'), api('/api/messages'), api('/api/config')]);
-    S.agents = agents; S.messages = messages; S.config = config;
-    for (const a of agents) if (a.state && a.state !== 'idle') S.live[a.id] = { state: a.state, threadId: a.stateThread, since: Date.now() };
-  } catch (err) {
-    $('rows').innerHTML = `<li class="empty"><h3>Can't reach the hub</h3><p>${esc(err.message)}. Check that <span class="mono">node hub.js</span> is running, then reload.</p></li>`;
-  }
-  const v = location.hash.slice(1);
-  setView(['delegations', 'agents', 'connect'].includes(v) ? v : 'delegations');
   window.addEventListener('hashchange', () => {
     const h = location.hash.slice(1);
-    if (h !== S.view && ['delegations', 'agents', 'connect'].includes(h)) setView(h);
+    if (h.startsWith('join/')) return boot();
+    if (h !== S.view && ['delegations', 'agents', 'members', 'connect'].includes(h) && !$('app').hidden) setView(h);
   });
-  connect();
+  boot();
 })();
 })();
 </script>

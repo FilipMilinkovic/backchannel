@@ -5,11 +5,11 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Hub } from './client.js';
+import { hubFromEnv } from './client.js';
 
 const id = (process.env.AGENT_ID || process.env.USER || 'me').toLowerCase();
 const owner = process.env.AGENT_OWNER || id;
-const hub = new Hub(process.env.HUB_URL || 'http://127.0.0.1:7777', process.env.HUB_TOKEN, process.env.HUB_TEAM);
+const hub = hubFromEnv();
 let fatal = null; // set when the hub rejects our token or team; tools report it instead of failing silently
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
 
@@ -36,7 +36,7 @@ hub.listen(
 
 // Tools need a resolved team. Resolve lazily so a hub that starts after us still works.
 async function ensureTeam() {
-  if (fatal) throw new Error(`${fatal}. Check HUB_TOKEN and HUB_TEAM in this MCP server's config`);
+  if (fatal) throw Object.assign(new Error(`${fatal}. Check HUB_TOKEN and HUB_TEAM in this MCP server's config`), { status: 401 });
   if (!hub.team) await hub.resolveTeam();
 }
 

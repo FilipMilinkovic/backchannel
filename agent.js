@@ -4,7 +4,7 @@
 import { parseArgs } from 'node:util';
 import readline from 'node:readline/promises';
 import path from 'node:path';
-import { Hub } from './client.js';
+import { hubFromEnv } from './client.js';
 import { backends } from './backends.js';
 
 const { values: opt } = parseArgs({
@@ -18,7 +18,7 @@ const { values: opt } = parseArgs({
     cwd: { type: 'string', default: process.cwd() },
     write: { type: 'boolean', default: false },   // let claude-code/codex edit files
     approve: { type: 'boolean', default: false }, // owner confirms each request in this terminal
-    hub: { type: 'string', default: process.env.HUB_URL || 'http://127.0.0.1:7777' },
+    hub: { type: 'string' },
     team: { type: 'string', default: process.env.HUB_TEAM },
   },
 });
@@ -29,10 +29,12 @@ if (!run) { console.error(`unknown backend "${opt.backend}". Options: ${Object.k
 const id = opt.id.toLowerCase();
 const cwd = path.resolve(opt.cwd.replace(/^~/, process.env.HOME));
 const isCoder = opt.backend === 'claude-code' || opt.backend === 'codex';
-const description = opt.about || (isCoder
-  ? `${opt.owner ? opt.owner + "'s" : 'A'} ${opt.backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to the ${path.basename(cwd)} repo.`
-  : `${opt.owner ? opt.owner + "'s" : 'A'} ${opt.backend} assistant.`);
-const hub = new Hub(opt.hub, process.env.HUB_TOKEN, opt.team);
+// Built from the owner's name, which may only be known once we've reached the hub.
+const describe = (owner) => opt.about || (isCoder
+  ? `${owner ? owner + "'s" : 'A'} ${opt.backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to the ${path.basename(cwd)} repo.`
+  : `${owner ? owner + "'s" : 'An'} ${opt.backend} assistant.`);
+let description = describe(opt.owner);
+const hub = hubFromEnv({ url: opt.hub, team: opt.team });
 const card = { id, name: opt.name || id, backend: opt.backend, model: opt.model, owner: opt.owner, description,
   access: isCoder && opt.write ? 'write' : 'read', repo: isCoder ? path.basename(cwd) : null };
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
@@ -99,11 +101,11 @@ async function handle(msg) {
   }
 }
 
-console.log(`@${id} (${opt.backend}${isCoder ? ` in ${cwd}` : ''}) connecting to ${opt.hub}…`);
+console.log(`@${id} (${opt.backend}${isCoder ? ` in ${cwd}` : ''}) connecting to ${hub.url}…`);
 try {
   // Fail fast on bad tokens or teams; if the hub is just down, listen() keeps retrying.
-  const me = await hub.resolveTeam().catch((err) => { if (err.status || !process.env.HUB_TOKEN) throw err; return null; });
-  if (me && !card.owner) card.owner = me.user.name || me.user.handle;
+  const me = await hub.resolveTeam().catch((err) => { if (err.status) throw err; return null; });
+  if (me && !card.owner) { card.owner = me.user.name || me.user.handle; card.description = description = describe(card.owner); }
   await hub.listen(card, handle, (s) => console.log(s));
 } catch (err) {
   console.error(`@${id} can't connect: ${err.message}`);

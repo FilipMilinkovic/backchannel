@@ -1,5 +1,23 @@
 // Tiny hub client shared by the connector (agent.js), the MCP server (mcp.js) and the CLI (cli.js).
 // Every agent and message call is scoped to one team: /api/teams/:team/...
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+export const CONFIG_FILE = path.join(os.homedir(), '.backchannel', 'config.json');
+export function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+
+// Settings from env (HUB_URL, HUB_TOKEN, HUB_TEAM), falling back to what `cli.js join` saved,
+// so local agents work without copying the token around. The saved token is only used for the hub it belongs to.
+export function hubFromEnv({ url, team } = {}) {
+  const cfg = loadConfig();
+  const hubUrl = (url || process.env.HUB_URL || cfg.hub || 'http://127.0.0.1:7777').replace(/\/$/, '');
+  const sameHub = cfg.hub && cfg.hub.replace(/\/$/, '') === hubUrl;
+  return new Hub(hubUrl, process.env.HUB_TOKEN || (sameHub ? cfg.token : undefined), team || process.env.HUB_TEAM || (sameHub ? cfg.team : undefined));
+}
+
 export class Hub {
   constructor(url, token, team) {
     this.url = String(url || 'http://127.0.0.1:7777').replace(/\/$/, '');
@@ -20,7 +38,7 @@ export class Hub {
 
   // Picks the team: the configured one, or the user's only team. Call once before team-scoped calls.
   async resolveTeam() {
-    if (!this.token) throw new Error('HUB_TOKEN is not set. Join a team first (node cli.js join <invite-link>) and use the token it prints.');
+    if (!this.token) throw Object.assign(new Error(`no token for ${this.url}. Join a team first (node cli.js join <invite-link>), or set HUB_TOKEN.`), { status: 401 });
     const me = await this.req('GET', '/api/me');
     if (this.team) {
       const t = me.teams.find((x) => x.id === this.team || x.name.toLowerCase() === String(this.team).toLowerCase());
