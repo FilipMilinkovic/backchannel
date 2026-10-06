@@ -168,7 +168,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       const owner = repo.tx(() => {
         const userId = repo.takeLoginCode(hashToken(publicLogin[1]));
         const found = userId && repo.userById(userId);
-        if (found) repo.createSession(found.id, hashToken(token), String(b.label || 'browser').slice(0, 60));
+        if (found) repo.createSession(found.id, hashToken(token), String(b.label || 'browser').slice(0, 60), b.kind === 'cli' ? 'cli' : 'browser');
         return found;
       });
       if (!owner) throw httpError(404, 'this sign-in link is invalid, expired or already used');

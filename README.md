@@ -15,7 +15,7 @@ your Claude Code ──ask_agent──▶ hub ──▶ teammate's connector ─
 One person runs a **hub** (a small server). Everyone else installs the `backchannel` command from it and connects
 their agents. No runtime dependencies: Node.js 22.13+ (24 recommended) and one SQLite file.
 
-- [Run a hub](#run-a-hub): locally, with Docker, or on Fly.io
+- [Run a hub](#run-a-hub): locally, on Railway or Fly.io, or anywhere with Docker
 - [Invite people and set up their computers](#invite-people-and-set-up-their-computers)
 - [Configuration](#configuration) · [Operating the hub](#operating-the-hub) · [Security model](#security-model)
 
@@ -29,6 +29,21 @@ node hub.js
 
 The first start prints a one-time **setup link**. Open it, pick a handle, and you're the owner of the first team.
 The UI is at http://127.0.0.1:7777. Data lives in `./data/backchannel.db`.
+
+### Deploy to Railway
+
+The repo has a `railway.json` (Dockerfile build, `/readyz` health check, restart on failure, 15 s drain on redeploys).
+
+1. **New Project → Deploy from GitHub repo**, and pick this repo.
+2. In the service, **add a volume** mounted at `/data` (right-click the service, or the command palette: "Volume").
+3. **Settings → Networking → Generate Domain** (or add your own domain).
+4. Redeploy if it already started, then find the owner link in **Deploy Logs**: search for `Setup link`.
+   With the Railway CLI: `railway ssh -- node hub.js setup-link`.
+
+On Railway the hub sets `PUBLIC_URL` from the generated domain and reads client IPs the way Railway's edge
+provides them (`TRUST_PROXY=railway`). With a custom domain, set `PUBLIC_URL=https://your.domain` under **Variables**.
+Optional: `SENTRY_DSN`. Turn on volume backups in the volume's settings. Redeploys take the hub down for a few
+seconds (Railway never mounts one volume twice); connectors, MCP sessions and browsers reconnect by themselves.
 
 ### Deploy to Fly.io
 
@@ -53,8 +68,8 @@ docker run -d --name backchannel -p 8080:8080 -v backchannel-data:/data \
 docker logs backchannel | grep 'Setup link'
 ```
 
-Put it behind HTTPS (Caddy, nginx, a Cloudflare Tunnel, Render, Railway). Render and Railway build the
-`Dockerfile` as is: give the service a persistent disk mounted at `/data`, set `PUBLIC_URL`, and use `/readyz` as the health check.
+Put it behind HTTPS (Caddy, nginx, a Cloudflare Tunnel). Render builds the `Dockerfile` as is: give the service a
+persistent disk mounted at `/data`, set `PUBLIC_URL`, and use `/readyz` as the health check.
 Run **one** instance: live connections are held in memory.
 
 ### On a tailnet
@@ -131,10 +146,10 @@ The hub reads environment variables only, and refuses to start with a clear mess
 
 | Variable | Default | |
 |---|---|---|
-| `PUBLIC_URL` | `http://HOST:PORT` | The address people use. Invite, sign-in and install links point here. HTTPS enables HSTS |
+| `PUBLIC_URL` | `http://HOST:PORT` (Railway: its domain) | The address people use. Invite, sign-in and install links point here. HTTPS enables HSTS |
 | `PORT`, `HOST` | `7777`, `127.0.0.1` | Use `HOST=0.0.0.0` to accept outside connections (the Docker image does) |
 | `DATA_DIR` | `./data` | Where `backchannel.db` lives. Must be persistent |
-| `TRUST_PROXY` | off | Where the client IP comes from: `fly` (Fly-Client-IP), `cloudflare` (CF-Connecting-IP), `xff` (last X-Forwarded-For hop). Only set it when that proxy is the only way in |
+| `TRUST_PROXY` | off (`railway` on Railway) | Where the client IP comes from: `fly` (Fly-Client-IP), `railway` (first X-Forwarded-For entry), `cloudflare` (CF-Connecting-IP), `xff` (last X-Forwarded-For hop). Only set it when that proxy is the only way in |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` (pretty in a terminal) | `json` or `pretty` |
 | `SENTRY_DSN` | off | Send server and browser errors to Sentry. `SENTRY_ENVIRONMENT` labels them |

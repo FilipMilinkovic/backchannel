@@ -931,7 +931,8 @@ function buildConnector() {
   const coder = backend === 'claude-code' || backend === 'codex';
   $('cFolderWrap').hidden = !coder;
   $('cWrite').disabled = !coder;
-  if (S.me) { $('cHandle').placeholder = `${S.me.user.handle}-${backend === 'claude-code' ? 'claude' : backend}`; $('cOwner').placeholder = S.me.user.name || S.me.user.handle; }
+  const suffix = backend === 'claude-code' ? 'claude' : backend;
+  if (S.me) { $('cHandle').placeholder = `${S.me.user.handle.slice(0, 31 - suffix.length)}-${suffix}`; $('cOwner').placeholder = S.me.user.name || S.me.user.handle; }
   const raw = $('cHandle').value.trim();
   const handle = raw.toLowerCase() || $('cHandle').placeholder;
   const valid = !raw || /^[a-z][a-z0-9_-]{0,31}$/.test(raw);
@@ -964,7 +965,7 @@ let mcpTool = store.get('bc.tool', 'claude');
 function buildMcp() {
   // Codex sessions default to <handle>-codex so a Claude Code session and a Codex session never share an inbox.
   const base = S.me?.user.handle || 'you';
-  const defaultHandle = mcpTool === 'codex' ? `${base}-codex` : base;
+  const defaultHandle = mcpTool === 'codex' ? `${base.slice(0, 26)}-codex` : base; // handles are at most 32 characters
   if (S.me) { $('mHandle').placeholder = defaultHandle; $('mOwner').placeholder = S.me.user.name || S.me.user.handle; }
   const handle = ($('mHandle').value.trim() || defaultHandle).toLowerCase();
   const owner = $('mOwner').value.trim() || S.me?.user.name || handle;

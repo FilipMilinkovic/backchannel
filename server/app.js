@@ -58,6 +58,7 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     let ip = null;
     if (config.trustProxy === 'fly') ip = header('fly-client-ip');
     else if (config.trustProxy === 'cloudflare') ip = header('cf-connecting-ip');
+    else if (config.trustProxy === 'railway') ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || null;
     else if (config.trustProxy === 'xff') {
       // The right-most entry is the one our own proxy added; anything left of it is client-supplied.
       ip = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean).pop() || null;
@@ -79,7 +80,9 @@ export function createApp({ config, repo, log, reporter, version, root }) {
 
   function serveStatic(req, res, pathname) {
     if (!['GET', 'HEAD'].includes(req.method)) throw httpError(405, 'method not allowed');
-    const file = path.resolve(publicDir, pathname === '/' ? 'index.html' : '.' + decodeURIComponent(pathname));
+    let decoded;
+    try { decoded = decodeURIComponent(pathname); } catch { throw httpError(400, 'invalid path'); }
+    const file = path.resolve(publicDir, pathname === '/' ? 'index.html' : '.' + decoded);
     if (!file.startsWith(publicDir + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('not found');
     }
@@ -107,8 +110,9 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     const started = process.hrtime.bigint();
     const incoming = req.headers['x-request-id'];
     const requestId = typeof incoming === 'string' && /^[\w.-]{1,64}$/.test(incoming) ? incoming : crypto.randomBytes(8).toString('hex');
-    const url = new URL(req.url, 'http://hub.local');
-    const ctx = { req, res, url, path: url.pathname, requestId, ip: clientIp(req), userId: undefined,
+    let url = null;
+    try { url = new URL(req.url, 'http://hub.local'); } catch {} // e.g. "//[": answered with 400 below
+    const ctx = { req, res, url, path: url?.pathname ?? '', requestId, ip: clientIp(req), userId: undefined,
       readBody: () => readBody(req), draining: () => draining };
 
     res.setHeader('x-request-id', requestId);
@@ -129,6 +133,7 @@ export function createApp({ config, repo, log, reporter, version, root }) {
 
     inflight++;
     try {
+      if (!url) throw httpError(400, 'invalid request target');
       const p = ctx.path;
       if (p === '/healthz') return send(res, 200, { ok: true, version });
       if (p === '/readyz') {

@@ -4,11 +4,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { startHub, query, prefix, delay, tempDir, ROOT } from './helpers.js';
+import { loadConfig } from '../server/config.js';
 
 // Opens an SSE stream; resolves with { res, events, ended } once the hello event arrived.
 function openStream(url) {
@@ -62,6 +64,16 @@ test('health, readiness, version, request ids and security headers', async (t) =
   assert.ok(!/script-src[^;]*unsafe-inline/.test(csp));
   assert.equal((await fetch(h.base + '/../package.json')).status, 404);
   assert.equal((await fetch(h.base + '/%2e%2e/package.json')).status, 404);
+  assert.equal((await fetch(h.base + '/%E0%A4%A')).status, 400);
+
+  // A request target the URL parser rejects gets a 400 and a closed exchange, not a hung socket.
+  const raw = await new Promise((resolve, reject) => {
+    const socket = net.connect(new URL(h.base).port, '127.0.0.1', () => socket.write('GET //[ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'));
+    let data = '';
+    socket.on('data', (d) => (data += d)).on('end', () => resolve(data)).on('error', reject);
+    setTimeout(() => { socket.destroy(); resolve(data || 'timeout'); }, 3000);
+  });
+  assert.match(raw, /^HTTP\/1\.1 400/);
 });
 
 test('JSON access logs carry request ids and never contain tokens or invite codes', async (t) => {
@@ -172,6 +184,18 @@ test('bad configuration fails fast with a clear message', () => {
   const r = run({ PORT: 'eighty', PUBLIC_URL: 'ftp://x', TRUST_PROXY: 'maybe', LOG_LEVEL: 'loud' });
   assert.equal(r.status, 1);
   for (const want of ['PORT must be', 'PUBLIC_URL must be', 'TRUST_PROXY must be', 'LOG_LEVEL must be']) assert.ok(r.stderr.includes(want), want);
+});
+
+test('Railway defaults: public URL from its domain, client IP from X-Forwarded-For', async (t) => {
+  const railway = loadConfig({ RAILWAY_ENVIRONMENT: 'production', RAILWAY_PUBLIC_DOMAIN: 'hub.up.railway.app' });
+  assert.equal(railway.publicUrl, 'https://hub.up.railway.app'); assert.equal(railway.trustProxy, 'railway');
+  const explicit = loadConfig({ RAILWAY_PUBLIC_DOMAIN: 'hub.up.railway.app', PUBLIC_URL: 'https://hub.example.com', TRUST_PROXY: '' });
+  assert.equal(explicit.publicUrl, 'https://hub.example.com'); assert.equal(explicit.trustProxy, null);
+  assert.equal(loadConfig({}).trustProxy, null);
+  const h = await startHub(t, null, { TRUST_PROXY: 'railway' });
+  await h.api('/api/me', null, 'GET', undefined, { 'x-forwarded-for': '198.51.100.7, 100.64.0.2', 'x-request-id': 'rw' });
+  await waitFor(() => h.logs().some((l) => l.requestId === 'rw'));
+  assert.equal(h.logs().find((l) => l.requestId === 'rw').ip, '198.51.100.7');
 });
 
 test('trusted proxy headers are used only when TRUST_PROXY says so', async (t) => {

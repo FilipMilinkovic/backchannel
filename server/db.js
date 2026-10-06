@@ -12,7 +12,8 @@ const MIGRATIONS = [
      token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
    CREATE TABLE sessions (
      hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-     label TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+     label TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'browser' CHECK (kind IN ('browser', 'cli')),
+     created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
    CREATE INDEX sessions_user ON sessions(user_id);
    CREATE TABLE login_codes (
      code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);

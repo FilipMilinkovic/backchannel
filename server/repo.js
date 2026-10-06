@@ -43,11 +43,13 @@ export function createRepo(db) {
       run('DELETE FROM sessions WHERE user_id = ?', userId);
       run('DELETE FROM login_codes WHERE user_id = ?', userId);
     }),
-    createSession: (userId, hash, label) => db.tx(() => {
+    // Browsers and computers (`backchannel login`) are capped separately, and the least recently used one goes first,
+    // so opening many browsers never signs out a computer that runs connectors.
+    createSession: (userId, hash, label, kind = 'browser') => db.tx(() => {
       const now = Date.now();
-      run('INSERT INTO sessions (hash, user_id, label, created_at, last_used_at) VALUES (?, ?, ?, ?, ?)', hash, userId, label, now, now);
-      run(`DELETE FROM sessions WHERE user_id = ? AND hash NOT IN
-             (SELECT hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ${MAX_SESSIONS})`, userId, userId);
+      run('INSERT INTO sessions (hash, user_id, label, kind, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?)', hash, userId, label, kind, now, now);
+      run(`DELETE FROM sessions WHERE user_id = ? AND kind = ? AND hash NOT IN
+             (SELECT hash FROM sessions WHERE user_id = ? AND kind = ? ORDER BY last_used_at DESC, rowid DESC LIMIT ${MAX_SESSIONS})`, userId, kind, userId, kind);
     }),
     touchSession: (hash, at) => run('UPDATE sessions SET last_used_at = ? WHERE hash = ?', at, hash),
     deleteSession: (hash) => run('DELETE FROM sessions WHERE hash = ?', hash),

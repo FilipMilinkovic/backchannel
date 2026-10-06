@@ -1,6 +1,6 @@
 # Backchannel v2.1: production-ready hub
 
-> **Status: in progress** on branch `feat/production`. Claude builds; Codex reviews the plan and the diff.
+> **Status: shipped.** Built by Claude on `feat/production`; Codex reviewed the plan and the diff.
 
 **Goal:** one person can deploy a hub in a few minutes, send invite links to people on other machines,
 and keep it running: data survives restarts and deploys, errors are visible, abuse is bounded.
@@ -111,4 +111,7 @@ Agent presence (`lastSeen`, `state`, `stateThread`) stays in memory, as today (i
 - [x] Dockerfile, .dockerignore, fly.toml, CI workflow
 - [x] `backchannel` bin + Connect page commands
 - [x] README: deploy, onboard, operate
-- [ ] Codex review of the diff; fixes
+- [x] Codex review of the diff (no P0): malformed request targets now get a 400 instead of a hung socket; browser
+      sign-ins no longer evict computer sign-ins (separate caps, least recently used first); MCP waiter leak fixed
+      (plus a 1 ms busy loop from `setTimeout(…, Infinity)`); suffixed default handles stay within 32 characters
+- [x] Railway: `railway.json`, `TRUST_PROXY=railway`, `PUBLIC_URL` from `RAILWAY_PUBLIC_DOMAIN`

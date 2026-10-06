@@ -401,9 +401,14 @@ test('db: inbox take and restore, session cap and login codes', (t) => {
   repo.deleteAgent(team.id, 'bot');
   assert.deepEqual(repo.inbox(team.id, 'bot'), [], 'removing an agent clears its inbox');
 
+  repo.createSession(user.id, 'computer', 'cli on laptop', 'cli');
+  repo.createSession(user.id, 'old-browser', 'b');
+  repo.touchSession('old-browser', Date.now() + 60_000); // recently used, so it outlives newer idle ones
   for (let i = 0; i < 25; i++) repo.createSession(user.id, `h${i}`, 'b');
-  assert.equal(repo.db.prepare('SELECT count(*) AS n FROM sessions').get().n, 20);
+  assert.equal(repo.db.prepare("SELECT count(*) AS n FROM sessions WHERE kind = 'browser'").get().n, 20);
   assert.equal(repo.sessionByHash('h0'), null); assert.ok(repo.sessionByHash('h24'));
+  assert.ok(repo.sessionByHash('old-browser'), 'least recently used goes first');
+  assert.ok(repo.sessionByHash('computer'), 'browsers never evict a computer sign-in');
   repo.setToken(user.id, hashToken(newToken()));
   assert.equal(repo.sessionByHash('h24'), null, 'rotating the token ends sessions');
 

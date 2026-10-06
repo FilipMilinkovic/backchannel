@@ -65,7 +65,7 @@ const commands = {
     const m = link.match(/(https?:\/\/[^#\s'"]+?)\/?#login\/([a-f0-9]+)/);
     if (!m) die(`That doesn't look like a sign-in link: ${link}`);
     const [, base, code] = m;
-    const res = await new Hub(base).req('POST', `/api/login/${code}`, { label: `cli on ${os.hostname()}`.slice(0, 60) });
+    const res = await new Hub(base).req('POST', `/api/login/${code}`, { label: `cli on ${os.hostname()}`.slice(0, 60), kind: 'cli' });
     const me = await new Hub(base, res.token).req('GET', '/api/me');
     const keepTeam = cfg.hub === base && me.teams.some((t) => t.id === cfg.team);
     const team = keepTeam ? cfg.team : me.teams.length === 1 ? me.teams[0].id : undefined;

@@ -20,13 +20,16 @@ export function loadConfig(env = process.env) {
 
   const port = int('PORT', 7777, 0, 65535);
   const host = env.HOST || '127.0.0.1';
+  // Railway sets RAILWAY_PUBLIC_DOMAIN once the service has a domain; use it unless PUBLIC_URL says otherwise.
+  const onRailway = !!(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PUBLIC_DOMAIN);
+  const rawPublicUrl = env.PUBLIC_URL || (env.RAILWAY_PUBLIC_DOMAIN ? `https://${env.RAILWAY_PUBLIC_DOMAIN}` : '');
   let publicUrl = null;
-  if (env.PUBLIC_URL) {
+  if (rawPublicUrl) {
     try {
-      const u = new URL(env.PUBLIC_URL);
+      const u = new URL(rawPublicUrl);
       if (!['http:', 'https:'].includes(u.protocol)) throw new Error();
       publicUrl = u.origin + u.pathname.replace(/\/$/, '');
-    } catch { problems.push(`PUBLIC_URL must be an http(s) URL (got "${env.PUBLIC_URL}")`); }
+    } catch { problems.push(`PUBLIC_URL must be an http(s) URL (got "${rawPublicUrl}")`); }
   }
   let sentry = null;
   if (env.SENTRY_DSN) {
@@ -46,11 +49,12 @@ export function loadConfig(env = process.env) {
     logFormat: oneOf('LOG_FORMAT', ['json', 'pretty'], env.NODE_ENV === 'production' || !process.stdout.isTTY ? 'json' : 'pretty'),
     // Where the real client IP comes from: the socket (default), Fly-Client-IP, CF-Connecting-IP,
     // or the last X-Forwarded-For entry (one generic reverse proxy in front). Only set it when that proxy is the sole way in.
+    // On Railway this defaults to "railway" (its edge replaces X-Forwarded-For; the first entry is the client).
     trustProxy: (() => {
-      const modes = { '': null, 0: null, false: null, fly: 'fly', cloudflare: 'cloudflare', 1: 'xff', true: 'xff', xff: 'xff' };
-      const raw = String(env.TRUST_PROXY || '').toLowerCase();
+      const modes = { '': null, 0: null, false: null, fly: 'fly', cloudflare: 'cloudflare', railway: 'railway', 1: 'xff', true: 'xff', xff: 'xff' };
+      const raw = String(env.TRUST_PROXY ?? (onRailway ? 'railway' : '')).toLowerCase();
       if (raw in modes) return modes[raw];
-      problems.push(`TRUST_PROXY must be one of fly, cloudflare, xff (got "${env.TRUST_PROXY}")`);
+      problems.push(`TRUST_PROXY must be one of fly, railway, cloudflare, xff (got "${env.TRUST_PROXY}")`);
       return null;
     })(),
     maxConnections: int('MAX_CONNECTIONS', 5000, 10, 1_000_000),

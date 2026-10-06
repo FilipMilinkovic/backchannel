@@ -14,8 +14,11 @@ const saved = loadConfig();
 const account = saved.hub && saved.hub.replace(/\/$/, '') === hub.url ? saved : {};
 // Claude Code sessions take your handle; Codex sessions take <handle>-codex, so both can run without sharing an inbox.
 const kind = process.env.AGENT_KIND || 'claude-code';
-const id = (process.env.AGENT_ID || (account.handle && (kind === 'claude-code' ? account.handle : `${account.handle}-${kind}`))
-  || process.env.USER || 'me').toLowerCase();
+// Handles are at most 32 characters: shorten the base so the suffix always fits.
+const suffixed = (base, suffix) => `${base.slice(0, 31 - suffix.length)}-${suffix}`;
+const fallback = String(process.env.USER || 'me').toLowerCase().replace(/[^a-z0-9_-]/g, '').replace(/^[^a-z]+/, '') || 'me';
+const id = (process.env.AGENT_ID || (account.handle && (kind === 'claude-code' ? account.handle : suffixed(account.handle, kind)))
+  || fallback.slice(0, 32)).toLowerCase();
 const owner = process.env.AGENT_OWNER || account.name || id;
 let fatal = null; // set when the hub rejects our token or team; tools report it instead of failing silently
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
@@ -80,9 +83,11 @@ async function waitFor(filter, seconds, threadId) {
     if (got.length || Date.now() >= deadline) return got;
     let woken = false;
     await new Promise((r) => {
-      const done = () => { clearTimeout(t); wakers.delete(done); r(); };
-      const t = setTimeout(done, Math.min(deadline - Date.now(), threadId ? 3000 : Infinity));
-      wakers.add(() => { woken = true; done(); });
+      const wake = () => { woken = true; done(); };
+      const done = () => { clearTimeout(t); wakers.delete(wake); r(); };
+      const left = deadline - Date.now();
+      const t = setTimeout(done, threadId ? Math.min(left, 3000) : left);
+      wakers.add(wake);
     });
     if (woken) await new Promise((r) => setTimeout(r, 1500)); // let near-simultaneous replies arrive together
   }
