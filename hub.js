@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store, agentKey } from './server/store.js';
-import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, requireRole } from './server/auth.js';
+import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, tokenFrom, requireRole } from './server/auth.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7777);
@@ -15,6 +15,10 @@ const ONLINE_MS = 40_000;
 const store = new Store(path.resolve(process.env.DATA_DIR || './data'));
 const { agents, inboxes, messages, byId } = store;
 const waiters = new Map();
+// One-time sign-in links: code -> { userId, expiresAt }. In memory on purpose: they live 60 seconds.
+const loginCodes = new Map();
+const LOGIN_TTL_MS = 60_000;
+const MAX_SESSIONS = 20;
 const sseClients = new Set();
 
 function members(team) {
@@ -220,9 +224,21 @@ const server = http.createServer(async (req, res) => {
     if (p !== '/api' && !p.startsWith('/api/')) return serveStatic(res, p);
     // Authenticate before reading bodies, then again after the await to honor revocations.
     const publicInvite = /^\/api\/invites\/([a-f0-9]+)(\/accept)?$/.exec(p);
-    authenticate(req, url, store.users, !!publicInvite);
+    const publicLogin = /^\/api\/login\/([a-f0-9]+)$/.exec(p);
+    authenticate(req, url, store.users, !!(publicInvite || publicLogin));
     const b = ['POST', 'PATCH'].includes(req.method) ? await readJson(req) : {};
-    let user = authenticate(req, url, store.users, !!publicInvite);
+    let user = authenticate(req, url, store.users, !!(publicInvite || publicLogin));
+    // Exchange a one-time sign-in link for a browser session token.
+    if (publicLogin && req.method === 'POST') {
+      const entry = loginCodes.get(publicLogin[1]);
+      loginCodes.delete(publicLogin[1]);
+      const owner = entry && entry.expiresAt > Date.now() && store.users.find((u) => u.id === entry.userId);
+      if (!owner) throw httpError(404, 'this sign-in link is invalid, expired or already used');
+      const token = newToken();
+      owner.sessions = [...(owner.sessions || []), { hash: hashToken(token), label: String(b.label || 'browser').slice(0, 60), createdAt: Date.now() }].slice(-MAX_SESSIONS);
+      store.saveUsers();
+      return send(res, 200, { token, user: publicUser(owner) });
+    }
     if (publicInvite) {
       const found = store.findInvite(publicInvite[1]);
       if (!found) throw httpError(404, 'invalid invite');
@@ -260,8 +276,22 @@ const server = http.createServer(async (req, res) => {
       user: publicUser(user), teams: store.teams.filter((t) => t.members.some((m) => m.userId === user.id))
         .map((t) => ({ id: t.id, name: t.name, role: t.members.find((m) => m.userId === user.id).role })),
     });
+    if (p === '/api/me/login-link' && req.method === 'POST') {
+      for (const [code, entry] of loginCodes) if (entry.expiresAt <= Date.now()) loginCodes.delete(code);
+      const code = newId() + newId() + newId() + newId().slice(0, 8);
+      loginCodes.set(code, { userId: user.id, expiresAt: Date.now() + LOGIN_TTL_MS });
+      return send(res, 200, { code, url: `${publicUrl}/#login/${code}`, expiresInSeconds: LOGIN_TTL_MS / 1000 });
+    }
+    if (p === '/api/me/logout' && req.method === 'POST') {
+      const hash = hashToken(tokenFrom(req, url));
+      if (hash === user.tokenHash) throw httpError(400, "that's your main token; rotate it instead (POST /api/me/token)");
+      user.sessions = (user.sessions || []).filter((s) => s.hash !== hash);
+      store.saveUsers();
+      return send(res, 200, { ok: true });
+    }
     if (p === '/api/me/token' && req.method === 'POST') {
-      const token = newToken(); user.tokenHash = hashToken(token); store.saveUsers(); closeSessions(user.id);
+      // Rotating the main token also signs out every browser session.
+      const token = newToken(); user.tokenHash = hashToken(token); user.sessions = []; store.saveUsers(); closeSessions(user.id);
       return send(res, 200, { token });
     }
     if (p === '/api/teams' && req.method === 'POST') {

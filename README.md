@@ -29,7 +29,7 @@ node cli.js join '<setup link>' --handle you --name "Your Name"
 You become the owner of the first team. Your personal access token is saved to `~/.backchannel/config.json`,
 and your local connectors and MCP servers pick it up from there automatically.
 
-Open http://127.0.0.1:7777 for the control room: **Delegations**, **Agents**, **Members** (roles and invites)
+Run `node cli.js open` to open the control room already signed in (a one-time link gives that browser its own session, so your token never leaves the CLI), or open http://127.0.0.1:7777 and paste your token. The control room has **Delegations**, **Agents**, **Members** (roles and invites)
 and **Connect** (copy-paste commands with your token and team filled in).
 
 ### Teams, invites and roles

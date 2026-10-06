@@ -444,3 +444,32 @@ test('auth: hash lookup, optional invite authentication and SSE query tokens', (
   user.tokenHash = hashToken(newToken());
   assert.throws(() => authenticate({ headers: { authorization: `Bearer ${token}` } }, url, [user]), { status: 401 });
 });
+
+test('one-time sign-in links create revocable browser sessions', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  assert.equal((await h.api('/api/me/login-link', null, 'POST')).status, 401);
+  const link = await h.ok('/api/me/login-link', owner.token, 'POST');
+  assert.match(link.url, /\/#login\/[a-f0-9]{40,}$/);
+  const login = await h.ok(`/api/login/${link.code}`, null, 'POST', { label: 'test browser' });
+  assert.match(login.token, /^bc_[a-f0-9]{64}$/);
+  assert.notEqual(login.token, owner.token);
+  assert.equal(login.user.handle, 'alice');
+  assert.equal((await h.ok('/api/me', login.token)).user.handle, 'alice');
+  assert.equal((await h.api(`/api/login/${link.code}`, null, 'POST')).status, 404, 'links are single-use');
+  assert.equal((await h.api('/api/login/abcdef0123', null, 'POST')).status, 404);
+  assert.ok(!JSON.stringify(await h.ok('/api/me', owner.token)).includes('sessions'), 'session hashes never leak');
+
+  // Signing out revokes only that browser; the main token can't be "logged out".
+  await h.ok('/api/me/logout', login.token, 'POST');
+  assert.equal((await h.api('/api/me', login.token)).status, 401);
+  assert.equal((await h.api('/api/me/logout', owner.token, 'POST')).status, 400);
+  assert.equal((await h.ok('/api/me', owner.token)).user.handle, 'alice');
+
+  // Rotating the main token signs out every browser, and sessions survive restarts until then.
+  const second = await h.ok(`/api/login/${(await h.ok('/api/me/login-link', owner.token, 'POST')).code}`, null, 'POST');
+  await h.restart();
+  await h.ok('/api/me', second.token);
+  await h.ok('/api/me/token', owner.token, 'POST');
+  assert.equal((await h.api('/api/me', second.token)).status, 401);
+});

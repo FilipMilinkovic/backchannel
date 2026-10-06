@@ -13,12 +13,19 @@ export function httpError(status, message) {
   return error;
 }
 
-export function authenticate(req, url, users, optional = false) {
+export function tokenFrom(req, url) {
   const header = req.headers.authorization;
-  const token = header ? /^Bearer (bc_[a-f0-9]{64})$/.exec(header)?.[1]
+  return header ? /^Bearer (bc_[a-f0-9]{64})$/.exec(header)?.[1]
     : url.pathname.endsWith('/events') ? url.searchParams.get('token') : null;
-  if (!header && !token && optional) return null;
-  const user = token && users.find((u) => u.tokenHash === hashToken(token));
+}
+
+// A user authenticates with their main token (CLI, connectors, MCP) or a browser session token
+// (from a one-time sign-in link), so browsers never need the main token.
+export function authenticate(req, url, users, optional = false) {
+  const token = tokenFrom(req, url);
+  if (!req.headers.authorization && !token && optional) return null;
+  const hash = token && hashToken(token);
+  const user = hash && users.find((u) => u.tokenHash === hash || u.sessions?.some((s) => s.hash === hash));
   if (!user) throw httpError(401, 'missing or invalid token');
   return user;
 }

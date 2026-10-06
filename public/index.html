@@ -1259,7 +1259,7 @@ function showGate(kind, note = '') {
   if (es) { es.close(); es = null; }
   if (kind === 'signin') {
     gate(`<h1>Sign in</h1>
-      <p>${note ? esc(note) : 'Paste the access token you got when you joined a team. New here? Open the invite link a teammate sent you.'}</p>
+      <p>${note ? esc(note) : 'Paste your access token. Easier: run <span class="mono">node cli.js open</span> on your computer and this page opens signed in. New here? Open the invite link a teammate sent you.'}</p>
       <form id="signinForm"><div><label class="label" for="tokenIn">Access token</label>
         <input class="input mono" id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="bc_…" required></div>
         <div class="form-error" id="gateError" role="alert"></div>
@@ -1347,6 +1347,8 @@ async function showJoin(code) {
 }
 
 function signOut(note) {
+  // Revoke this browser's session on the hub (a main token is left alone; rotate it from Connect).
+  if (S.token) fetch('/api/me/logout', { method: 'POST', headers: { authorization: `Bearer ${S.token}` } }).catch(() => {});
   S.token = ''; S.me = null; store.set('bc.token', '');
   showGate('signin', note);
 }
@@ -1378,6 +1380,17 @@ async function switchTeam(teamId) {
 async function boot() {
   const join = location.hash.match(/^#join\/([\w-]+)/);
   if (join) return showJoin(join[1]);
+  // One-time sign-in link from `cli.js open`: trade it for this browser's own session token.
+  const login = location.hash.match(/^#login\/([a-f0-9]+)(?:&view=(\w+))?/);
+  if (login) {
+    history.replaceState(null, '', '#' + (login[2] || 'delegations'));
+    try {
+      const res = await api(`/api/login/${login[1]}`, { method: 'POST', body: JSON.stringify({ label: navigator.platform ? `browser on ${navigator.platform}` : 'browser' }) });
+      S.token = res.token; store.set('bc.token', res.token);
+    } catch (err) {
+      return showGate('signin', err.status === 404 ? 'That sign-in link expired or was already used. Run node cli.js open again.' : `Couldn't sign in: ${err.message}`);
+    }
+  }
   if (!S.token) return showGate('signin');
   try { await refreshAccount(); }
   catch (err) {
@@ -1395,7 +1408,7 @@ async function boot() {
   } catch {}
   window.addEventListener('hashchange', () => {
     const h = location.hash.slice(1);
-    if (h.startsWith('join/')) return boot();
+    if (h.startsWith('join/') || h.startsWith('login/')) return boot();
     if (h !== S.view && ['delegations', 'agents', 'members', 'connect'].includes(h) && !$('app').hidden) setView(h);
   });
   boot();

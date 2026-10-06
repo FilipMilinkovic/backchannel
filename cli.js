@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { spawn } from 'node:child_process';
 import { Hub, CONFIG_FILE as CONFIG, loadConfig } from './client.js';
 function saveConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
@@ -19,6 +20,7 @@ const { values: opt, positionals: [cmd, ...args] } = parseArgs({
     hub: { type: 'string' }, team: { type: 'string' }, handle: { type: 'string' }, name: { type: 'string' },
     as: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
+    print: { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -129,6 +131,24 @@ const commands = {
     if (opt['show-token']) console.log(`\n  ${token}`);
   },
 
+  // Opens the UI already signed in, through a one-time link (60 seconds, single use).
+  // The browser gets its own session; your main token never leaves this machine.
+  async open() {
+    if (!hub.token) die('No saved token for this hub. Join a team first: node cli.js join <invite-link>');
+    const me = await hub.req('GET', '/api/me');
+    const { url, expiresInSeconds } = await hub.req('POST', '/api/me/login-link');
+    const view = args[0] ? `&view=${encodeURIComponent(args[0])}` : '';
+    const link = url + view;
+    if (opt.print) return console.log(`Sign-in link for @${me.user.handle} (works once, for ${expiresInSeconds}s):\n  ${link}`);
+    const [cmd, ...argv] = process.platform === 'darwin' ? ['open', link]
+      : process.platform === 'win32' ? ['cmd', '/c', 'start', '', link] : ['xdg-open', link];
+    await new Promise((resolve) => {
+      const child = spawn(cmd, argv, { stdio: 'ignore', detached: true });
+      child.on('error', () => { console.log(`Couldn't open a browser. Open this within ${expiresInSeconds}s:\n  ${link}`); resolve(); });
+      child.on('spawn', () => { child.unref(); console.log(`Opened Backchannel in your browser, signed in as @${me.user.handle}.`); resolve(); });
+    });
+  },
+
   // Explicit way to see the token, e.g. to set HUB_TOKEN on another machine.
   async token() {
     if (!hub.token) die('No saved token. Join a team first.');
@@ -146,7 +166,8 @@ if (!cmd || opt.help || !commands[cmd]) {
   ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent)
   reply <messageId> "text"    Reply to a message
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
-  rotate-token                Replace your personal token (--show-token to print it)
+  open [view]                 Open the UI signed in (one-time link; --print to show it instead)
+  rotate-token                Replace your personal token and sign out browsers (--show-token)
   token                       Print your saved token (for HUB_TOKEN on another machine)
 
 Config: ${CONFIG} (HUB_URL, HUB_TOKEN, HUB_TEAM override it)`);
