@@ -208,9 +208,12 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
 
     if (p === '/api/me' && req.method === 'GET') return send(res, 200, { user: publicUser(user), teams: repo.teamsForUser(user.id) });
     if (p === '/api/me/login-link' && req.method === 'POST') {
+      // 60 seconds by default (`backchannel open`); up to 10 minutes for setting up another computer.
+      const ttl = b.expiresInSeconds === undefined ? LOGIN_TTL_MS / 1000 : b.expiresInSeconds;
+      if (!Number.isInteger(ttl) || ttl < 10 || ttl > 600) throw httpError(400, 'expiresInSeconds must be a whole number from 10 to 600');
       const code = newId() + newId() + newId() + newId().slice(0, 8);
-      repo.createLoginCode(hashToken(code), user.id, Date.now() + LOGIN_TTL_MS);
-      return send(res, 200, { code, url: `${publicUrl()}/#login/${code}`, expiresInSeconds: LOGIN_TTL_MS / 1000 });
+      repo.createLoginCode(hashToken(code), user.id, Date.now() + ttl * 1000);
+      return send(res, 200, { code, url: `${publicUrl()}/#login/${code}`, expiresInSeconds: ttl });
     }
     if (p === '/api/me/logout' && req.method === 'POST') {
       if (!auth.sessionHash) throw httpError(400, "that's your main token; rotate it instead (POST /api/me/token)");

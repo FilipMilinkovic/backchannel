@@ -474,19 +474,20 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
           </dl>
         </section>
 
-        <section class="block" aria-labelledby="tokenH">
-          <h2 id="tokenH">Your access token</h2>
-          <p>Your connectors, MCP servers and the CLI use it to act as you. Anyone with it can too, so keep it private. The commands below include it when you copy them.</p>
-          <div class="token-box"><code id="tokenShown"></code>
-            <button class="btn ghost" type="button" data-action="reveal" id="revealBtn">Show</button>
-            <button class="btn" type="button" data-action="copy-token">Copy</button>
-            <button class="btn ghost danger" type="button" data-action="rotate" id="rotateBtn">Rotate</button></div>
-          <div class="help" id="tokenMsg" role="status"></div>
+        <section class="block" aria-labelledby="setupH">
+          <h2 id="setupH">Set up a computer</h2>
+          <p>Once on each computer that runs an agent or a coding session. Needs Node.js 22.13 or newer. Nothing to clone: the hub serves the client.</p>
+          <div class="code-label"><span>1. Install the <span class="mono">backchannel</span> command</span></div>
+          <div class="code"><pre id="installCmd"></pre><button class="btn" type="button" data-copy="installCmd">Copy</button></div>
+          <div class="code-label"><span>2. Sign it in as you</span></div>
+          <div class="code" id="loginBox" hidden><pre id="loginCmd"></pre><button class="btn" type="button" data-copy="loginCmd">Copy</button></div>
+          <button class="btn" type="button" data-action="login-link" id="loginLinkBtn">Create sign-in command</button>
+          <div class="help" id="loginMsg" role="status">The command works once, within 10 minutes. Each computer gets its own sign-in, and the commands below need no token.</div>
         </section>
 
         <section class="block" aria-labelledby="reachH">
           <h2 id="reachH">Make an agent reachable</h2>
-          <p>Run this next to your agent, on any machine that can reach this hub. It joins this team as yours and handles requests from teammates' agents. First clone the repo there: <span class="mono">git clone https://github.com/FilipMilinkovic/backchannel ~/backchannel</span></p>
+          <p>Run this next to your agent, on a computer you've set up. It joins this team as yours and handles requests from teammates' agents.</p>
           <div class="grid-form">
             <div><label class="label" for="cHandle">Handle</label><input class="input mono" id="cHandle" placeholder="maya" autocomplete="off" spellcheck="false"><div class="help" id="cHandleHelp">Lowercase letters, numbers and dashes.</div></div>
             <div><label class="label" for="cOwner">Owner</label><input class="input" id="cOwner" placeholder="Maya Chen" autocomplete="off"></div>
@@ -523,6 +524,16 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
           <div class="code"><pre id="mCmd"></pre><button class="btn" type="button" data-copy="mCmd">Copy</button></div>
           <div class="callout" id="mNote"></div>
         </section>
+
+        <section class="block" aria-labelledby="tokenH">
+          <h2 id="tokenH">Access token</h2>
+          <p>For scripts and CI that can't run <span class="mono">backchannel login</span>: set <span class="mono">HUB_TOKEN</span> to it. Anyone with it can act as you, so keep it private. Rotating it signs out every browser and computer, except this browser.</p>
+          <div class="token-box"><code id="tokenShown"></code>
+            <button class="btn ghost" type="button" data-action="reveal" id="revealBtn">Show</button>
+            <button class="btn" type="button" data-action="copy-token">Copy</button>
+            <button class="btn ghost danger" type="button" data-action="rotate" id="rotateBtn">Rotate</button></div>
+          <div class="help" id="tokenMsg" role="status"></div>
+        </section>
       </div></div>
     </section>
   </main>
@@ -531,6 +542,17 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
 <script>
 (() => {
 'use strict';
+// Unexpected errors go to the hub's log (and Sentry, if it's set up). At most five per page load; codes are stripped from the URL.
+let errorsSent = 0;
+function reportError(e) {
+  if (errorsSent++ >= 5) return;
+  const err = e.reason || e.error || {};
+  fetch('/api/client-errors', { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message: String(err.message || e.message || err).slice(0, 1000), name: err.name, stack: String(err.stack || '').slice(0, 8000),
+      url: location.origin + location.pathname + location.hash.replace(/(join|login)\/[\w-]+/, '$1/…') }) }).catch(() => {});
+}
+addEventListener('error', reportError);
+addEventListener('unhandledrejection', reportError);
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
@@ -873,13 +895,22 @@ async function removeAgent(btn) {
 
 // ---------- render: connect ----------
 const shq = (s) => /^[\w@%+=:,./~-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`;
-const ROOT = '~/backchannel';
 const masked = () => (S.token ? `${S.token.slice(0, 7)}…${S.token.slice(-4)}` : '');
 let tokenRevealed = false;
-// Commands are shown with a masked token and copied with the real one.
-function setCmd(id, build) {
-  $(id).textContent = build(masked());
-  $(id).dataset.copyText = build(S.token);
+const setCmd = (id, text) => { $(id).textContent = text; };
+// Only needed when you're in several teams; otherwise the CLI picks your one team.
+const teamArg = (flag) => (S.teams.length > 1 ? flag(S.team) : '');
+
+async function createLoginCommand(btn) {
+  btn.disabled = true;
+  try {
+    const { url, expiresInSeconds } = await api('/api/me/login-link', { method: 'POST', body: JSON.stringify({ expiresInSeconds: 600 }) });
+    setCmd('loginCmd', `backchannel login '${url}'`);
+    $('loginBox').hidden = false;
+    btn.textContent = 'Create another';
+    $('loginMsg').textContent = `Works once, until ${new Date(Date.now() + expiresInSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Each computer gets its own sign-in.`;
+  } catch (err) { $('loginMsg').textContent = `Couldn't create it: ${err.message}`; }
+  finally { btn.disabled = false; }
 }
 function renderConnect() {
   const c = S.config;
@@ -891,11 +922,11 @@ function renderConnect() {
   $('hopsInput').disabled = !isOwner(); $('hopsSave').hidden = !isOwner(); $('hopsOwnerOnly').hidden = isOwner();
   $('tokenShown').textContent = tokenRevealed ? S.token : masked();
   $('revealBtn').textContent = tokenRevealed ? 'Hide' : 'Show';
+  setCmd('installCmd', `npm install -g ${location.origin}/install/backchannel.tgz`);
   buildConnector(); buildMcp();
 }
 
 function buildConnector() {
-  const root = ROOT;
   const backend = $('cBackend').value;
   const coder = backend === 'claude-code' || backend === 'codex';
   $('cFolderWrap').hidden = !coder;
@@ -910,15 +941,14 @@ function buildConnector() {
   const env = [];
   if (backend === 'openai') env.push('OPENAI_API_KEY=sk-…');
   if (backend === 'grok') env.push('XAI_API_KEY=xai-…');
-  env.push(`HUB_URL=${location.origin}`, 'HUB_TOKEN=%TOKEN%', `HUB_TEAM=${S.team}`);
   const args = [`--id ${shq(handle)}`, `--backend ${backend}`];
+  if (S.teams.length > 1) args.push(`--team ${S.team}`);
   const owner = $('cOwner').value.trim();
   if (owner) args.push(`--owner ${shq(owner)}`);
   if (coder) args.push(`--cwd ${shq($('cFolder').value.trim() || '~/code/your-repo')}`);
   if (coder && $('cWrite').checked) args.push('--write');
   if ($('cApprove').checked) args.push('--approve');
-  const cmd = `${env.join(' ')} \\\n  node ${root}/agent.js \\\n  ${args.join(' ')}`;
-  setCmd('cCmd', (tok) => cmd.replace('%TOKEN%', tok));
+  setCmd('cCmd', `${env.length ? env.join(' ') + ' ' : ''}backchannel connect \\\n  ${args.join(' ')}`);
   const notes = {
     'claude-code': 'Uses the <b>claude</b> CLI and the account it’s signed in to. Requests run headless in the folder.',
     codex: 'Uses the <b>codex</b> CLI and the account it’s signed in to. Runs in Codex’s sandbox.',
@@ -932,19 +962,19 @@ function buildConnector() {
 
 let mcpTool = store.get('bc.tool', 'claude');
 function buildMcp() {
-  const root = ROOT;
   if (S.me) { $('mHandle').placeholder = S.me.user.handle; $('mOwner').placeholder = S.me.user.name || S.me.user.handle; }
   const handle = ($('mHandle').value.trim() || S.me?.user.handle || 'you').toLowerCase();
   const owner = $('mOwner').value.trim() || S.me?.user.name || handle;
   document.querySelectorAll('#mTabs button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.tool === mcpTool)));
   if (mcpTool === 'claude') {
     $('mWhere').textContent = 'Run once in your terminal';
-    setCmd('mCmd', (tok) => `claude mcp add backchannel --scope user \\\n  -e HUB_URL=${location.origin} -e HUB_TOKEN=${tok} -e HUB_TEAM=${S.team} \\\n  -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)} \\\n  -- node ${root}/mcp.js`);
+    setCmd('mCmd', `claude mcp add backchannel --scope user \\\n  -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)}${teamArg((t) => ` -e HUB_TEAM=${t}`)} \\\n  -- backchannel mcp`);
     $('mNote').innerHTML = '<span>Then just work. Your agent asks teammates’ agents when it needs something from them.</span>';
   } else {
     $('mWhere').textContent = 'Add to ~/.codex/config.toml';
-    setCmd('mCmd', (tok) => `[mcp_servers.backchannel]\ncommand = "node"\nargs = ["${root.replace('~', '/Users/you')}/mcp.js"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nHUB_URL = "${location.origin}"\nHUB_TOKEN = "${tok}"\nHUB_TEAM = "${S.team}"\nAGENT_ID = "${handle}"\nAGENT_OWNER = "${owner}"`);
-    $('mNote').innerHTML = '<span>Codex needs an absolute path in <b>args</b>. <b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
+    const toml = (s) => JSON.stringify(String(s));
+    setCmd('mCmd', `[mcp_servers.backchannel]\ncommand = "backchannel"\nargs = ["mcp"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nAGENT_ID = ${toml(handle)}\nAGENT_OWNER = ${toml(owner)}${teamArg((t) => `\nHUB_TEAM = "${t}"`)}`);
+    $('mNote').innerHTML = '<span><b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
   }
   store.set('bc.mcp', JSON.stringify({ h: $('mHandle').value, o: $('mOwner').value }));
 }
@@ -1037,9 +1067,20 @@ function startNew(to) {
 
 // ---------- events ----------
 let es = null;
+async function refreshMessages(team) {
+  try {
+    const messages = await tapi('/messages');
+    if (team !== S.team) return;
+    const known = new Set(S.messages.map((m) => m.id));
+    for (const m of messages) if (!known.has(m.id)) { S.messages.push(m); S.fresh.add(m.threadId); }
+    S.messages.sort((a, b) => a.ts - b.ts);
+    renderAll();
+  } catch {}
+}
 function connect() {
   if (es) es.close();
   const team = S.team;
+  let helloSeen = false;
   es = new EventSource(`/api/teams/${encodeURIComponent(team)}/events?token=${encodeURIComponent(S.token)}`);
   es.onopen = () => { S.connected = true; renderRail(); };
   es.onerror = () => { S.connected = false; renderRail(); };
@@ -1047,6 +1088,9 @@ function connect() {
     const ev = JSON.parse(e.data);
     if (team !== S.team) return;
     if (ev.type === 'hello') {
+      // After a reconnect (network blip, hub restart), catch up on messages posted while we were away.
+      if (helloSeen) refreshMessages(team);
+      helloSeen = true;
       if (ev.agents) S.agents = ev.agents;
       if (ev.config) S.config = { ...S.config, ...ev.config };
       if (ev.members) S.members = ev.members;
@@ -1087,6 +1131,7 @@ document.addEventListener('click', async (e) => {
   if (t.dataset.action === 'reveal') { tokenRevealed = !tokenRevealed; return renderConnect(); }
   if (t.dataset.action === 'copy-token') return copy(t, S.token);
   if (t.dataset.action === 'rotate') return rotateToken(t);
+  if (t.dataset.action === 'login-link') return createLoginCommand(t);
   if (t.dataset.card) return showCard(t.dataset.card);
   if (t.dataset.copyInvite) return copy(t, t.dataset.copyInvite);
   if (t.dataset.revoke) {
@@ -1132,7 +1177,7 @@ async function rotateToken(btn) {
   try {
     const { token } = await api('/api/me/token', { method: 'POST' });
     S.token = token; store.set('bc.token', token); tokenRevealed = true;
-    $('tokenMsg').textContent = 'New token active. Update HUB_TOKEN in your connectors, MCP configs and CLI.';
+    $('tokenMsg').textContent = 'New token active. Other browsers and computers are signed out: sign them in again, and update HUB_TOKEN where you set it.';
     connect(); renderConnect();
   } catch (err) { $('tokenMsg').textContent = `Couldn't rotate: ${err.message}`; }
   finally { btn.disabled = false; btn.dataset.armed = ''; btn.textContent = 'Rotate'; }
@@ -1259,7 +1304,7 @@ function showGate(kind, note = '') {
   if (es) { es.close(); es = null; }
   if (kind === 'signin') {
     gate(`<h1>Sign in</h1>
-      <p>${note ? esc(note) : 'Paste your access token. Easier: run <span class="mono">node cli.js open</span> on your computer and this page opens signed in. New here? Open the invite link a teammate sent you.'}</p>
+      <p>${note ? esc(note) : 'Paste your access token. Easier: run <span class="mono">backchannel open</span> on your computer and this page opens signed in. New here? Open the invite link a teammate sent you.'}</p>
       <form id="signinForm"><div><label class="label" for="tokenIn">Access token</label>
         <input class="input mono" id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="bc_…" required></div>
         <div class="form-error" id="gateError" role="alert"></div>
@@ -1310,7 +1355,7 @@ async function showJoin(code) {
   } else {
     gate(`${head}<form id="joinForm">
       <div><label class="label" for="jName">Your name</label><input class="input" id="jName" required maxlength="60" autocomplete="name" placeholder="Maya Chen"></div>
-      <div><label class="label" for="jHandle">Handle</label><input class="input mono" id="jHandle" required maxlength="32" pattern="[a-z][a-z0-9_\-]{0,31}" autocomplete="username" spellcheck="false" placeholder="maya">
+      <div><label class="label" for="jHandle">Handle</label><input class="input mono" id="jHandle" required maxlength="32" pattern="[a-z][a-z0-9_\\-]{0,31}" autocomplete="username" spellcheck="false" placeholder="maya">
         <div class="help">How teammates mention you. Lowercase letters, numbers, - and _.</div></div>
       <div class="form-error" id="gateError" role="alert"></div>
       <button class="btn primary" type="submit">Create account and join</button></form>
@@ -1331,7 +1376,7 @@ async function showJoin(code) {
       if (res.token) {
         S.token = res.token; store.set('bc.token', res.token);
         gate(`<h1>You're in, @${esc(res.user.handle)}</h1>
-          <p>This is your personal access token. Your connectors, MCP servers and the CLI use it to act as you. Save it in your password manager. You can see it again later under Connect, in this browser.</p>
+          <p>This is your personal access token. You won't need to paste it anywhere: under <b>Connect</b>, set up each computer with a one-time sign-in command. Keep a copy in your password manager for scripts and CI; you can see it again under Connect, in this browser.</p>
           <div class="token-box"><code id="newToken">${esc(res.token)}</code><button class="btn" type="button" id="copyNew">Copy</button></div>
           <div style="margin-top:18px"><button class="btn primary" type="button" id="toApp" style="width:100%;justify-content:center">Continue to ${esc(res.team.name)}</button></div>`);
         $('copyNew').onclick = (ev) => copy(ev.currentTarget, res.token);
@@ -1380,7 +1425,7 @@ async function switchTeam(teamId) {
 async function boot() {
   const join = location.hash.match(/^#join\/([\w-]+)/);
   if (join) return showJoin(join[1]);
-  // One-time sign-in link from `cli.js open`: trade it for this browser's own session token.
+  // One-time sign-in link from `backchannel open`: trade it for this browser's own session token.
   const login = location.hash.match(/^#login\/([a-f0-9]+)(?:&view=(\w+))?/);
   if (login) {
     history.replaceState(null, '', '#' + (login[2] || 'delegations'));
@@ -1388,7 +1433,7 @@ async function boot() {
       const res = await api(`/api/login/${login[1]}`, { method: 'POST', body: JSON.stringify({ label: navigator.platform ? `browser on ${navigator.platform}` : 'browser' }) });
       S.token = res.token; store.set('bc.token', res.token);
     } catch (err) {
-      return showGate('signin', err.status === 404 ? 'That sign-in link expired or was already used. Run node cli.js open again.' : `Couldn't sign in: ${err.message}`);
+      return showGate('signin', err.status === 404 ? 'That sign-in link expired or was already used. Run backchannel open again.' : `Couldn't sign in: ${err.message}`);
     }
   }
   if (!S.token) return showGate('signin');

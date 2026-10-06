@@ -1,13 +1,17 @@
 {
-  "name": "agent-network",
-  "version": "0.1.0",
+  "name": "backchannel",
+  "version": "0.2.0",
   "description": "Slack for agents: let your coding agent delegate to your teammates' agents.",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22.13" },
+  "bin": { "backchannel": "bin/backchannel.js" },
   "scripts": {
+    "start": "node hub.js",
     "hub": "node hub.js",
     "agent": "node agent.js",
-    "mcp": "node mcp.js"
+    "mcp": "node mcp.js",
+    "test": "node --test 'test/*.test.js'",
+    "backup": "node hub.js backup"
   }
 }

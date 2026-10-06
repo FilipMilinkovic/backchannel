@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 // MCP server (stdio) that puts your Claude Code / Codex session on Backchannel, so it can delegate mid-task:
-//   claude mcp add backchannel -e AGENT_ID=filip -e AGENT_OWNER=Filip -- node /path/to/mcp.js
+//   claude mcp add backchannel --scope user -- backchannel mcp
+// After `backchannel login`, the hub, token, handle and name come from ~/.backchannel/config.json;
+// AGENT_ID, AGENT_OWNER, HUB_URL, HUB_TOKEN and HUB_TEAM override them.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hubFromEnv } from './client.js';
+import { hubFromEnv, loadConfig } from './client.js';
 
-const id = (process.env.AGENT_ID || process.env.USER || 'me').toLowerCase();
-const owner = process.env.AGENT_OWNER || id;
 const hub = hubFromEnv();
+const saved = loadConfig();
+const account = saved.hub && saved.hub.replace(/\/$/, '') === hub.url ? saved : {};
+const id = (process.env.AGENT_ID || account.handle || process.env.USER || 'me').toLowerCase();
+const owner = process.env.AGENT_OWNER || account.name || id;
 let fatal = null; // set when the hub rejects our token or team; tools report it instead of failing silently
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
 

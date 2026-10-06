@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { startHub, query, prefix, delay, tempDir, ROOT } from './helpers.js';
@@ -182,6 +183,31 @@ test('trusted proxy headers are used only when TRUST_PROXY says so', async (t) =
   await fly.api('/api/me', null, 'GET', undefined, { 'fly-client-ip': '203.0.113.9', 'x-forwarded-for': '1.1.1.1', 'x-request-id': 'p2' });
   await waitFor(() => fly.logs().some((l) => l.requestId === 'p2'));
   assert.equal(fly.logs().find((l) => l.requestId === 'p2').ip, '203.0.113.9');
+});
+
+test('the hub serves an installable client package and longer-lived sign-in links for it', async (t) => {
+  const h = await startHub(t);
+  const res = await fetch(h.base + '/install/backchannel.tgz');
+  assert.equal(res.status, 200); assert.equal(res.headers.get('content-type'), 'application/gzip');
+  const tar = zlib.gunzipSync(Buffer.from(await res.arrayBuffer()));
+  const files = {};
+  for (let at = 0; at + 512 <= tar.length;) {
+    const name = tar.subarray(at, at + 100).toString().replace(/\0.*$/s, '');
+    if (!name) break;
+    const size = parseInt(tar.subarray(at + 124, at + 136).toString(), 8);
+    files[name] = tar.subarray(at + 512, at + 512 + size).toString();
+    at += 512 + Math.ceil(size / 512) * 512;
+  }
+  const manifest = JSON.parse(files['package/package.json']);
+  assert.equal(manifest.bin.backchannel, 'bin/backchannel.js');
+  assert.equal(manifest.version, JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version);
+  for (const f of ['bin/backchannel.js', 'cli.js', 'client.js', 'agent.js', 'backends.js', 'mcp.js']) assert.ok(files[`package/${f}`], f);
+  assert.ok(!Object.keys(files).some((f) => f.includes('server/') || f.endsWith('hub.js')), 'server code is not shipped to clients');
+
+  const owner = await h.bootstrap();
+  assert.equal((await h.ok('/api/me/login-link', owner.token, 'POST')).expiresInSeconds, 60);
+  assert.equal((await h.ok('/api/me/login-link', owner.token, 'POST', { expiresInSeconds: 600 })).expiresInSeconds, 600);
+  for (const bad of [601, 5, 1.5, '600']) assert.equal((await h.api('/api/me/login-link', owner.token, 'POST', { expiresInSeconds: bad })).status, 400);
 });
 
 test('setup-link and backup commands; a backup restores as a working hub', async (t) => {

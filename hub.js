@@ -62,7 +62,7 @@ try {
   process.exit(1);
 }
 const repo = createRepo(db);
-app = createApp({ config, repo, log, reporter, version, publicDir: path.join(ROOT, 'public') });
+app = createApp({ config, repo, log, reporter, version, root: ROOT });
 
 app.server.on('error', async (err) => {
   reporter.error(err, { message: err.code === 'EADDRINUSE' ? `port ${config.port} is already in use` : 'server error' });

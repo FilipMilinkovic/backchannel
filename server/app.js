@@ -8,15 +8,27 @@ import { createRealtime } from './realtime.js';
 import { RateLimiter, StreamCap } from './limits.js';
 import { httpError } from './auth.js';
 import { redact } from './log.js';
+import { buildClientTarball } from './bundle.js';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8' };
 const MAX_BODY = 2_000_000;
 
 // CSP that allows exactly the inline scripts in the UI (by hash) and nothing else inline.
-function contentSecurityPolicy(publicDir) {
+// Recomputed when index.html changes, so editing the UI never needs a hub restart.
+function cspFor(publicDir) {
+  const file = path.join(publicDir, 'index.html');
+  let cached = { mtime: -1, value: '' };
+  return () => {
+    let mtime = 0;
+    try { mtime = fs.statSync(file).mtimeMs; } catch {}
+    if (mtime !== cached.mtime) cached = { mtime, value: contentSecurityPolicy(file) };
+    return cached.value;
+  };
+}
+function contentSecurityPolicy(file) {
   let html = '';
-  try { html = fs.readFileSync(path.join(publicDir, 'index.html'), 'utf8'); } catch {}
+  try { html = fs.readFileSync(file, 'utf8'); } catch {}
   const hashes = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
     .map((m) => `'sha256-${crypto.createHash('sha256').update(m[1]).digest('base64')}'`);
   return ["default-src 'self'", `script-src 'self' ${hashes.join(' ')}`.trim(),
@@ -24,7 +36,9 @@ function contentSecurityPolicy(publicDir) {
     "img-src 'self' data:", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'", "object-src 'none'"].join('; ');
 }
 
-export function createApp({ config, repo, log, reporter, version, publicDir }) {
+export function createApp({ config, repo, log, reporter, version, root }) {
+  const publicDir = path.join(root, 'public');
+  let tarball = null;
   const rt = createRealtime();
   const limits = {
     public: new RateLimiter(config.limits.publicPerMinute),
@@ -36,7 +50,7 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
   let publicUrl = config.publicUrl;
   let draining = false;
   const api = createApi({ repo, rt, config, publicUrl: () => publicUrl, limits });
-  const csp = contentSecurityPolicy(publicDir);
+  const csp = cspFor(publicDir);
   const hsts = config.publicUrl?.startsWith('https://');
 
   function clientIp(req) {
@@ -103,7 +117,7 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
     res.setHeader('x-frame-options', 'DENY');
     res.setHeader('cross-origin-opener-policy', 'same-origin');
     res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=()');
-    res.setHeader('content-security-policy', csp);
+    res.setHeader('content-security-policy', csp());
     if (hsts) res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
 
     res.on('close', () => {
@@ -123,6 +137,13 @@ export function createApp({ config, repo, log, reporter, version, publicDir }) {
         return send(res, ok ? 200 : 503, { ok, version, ...(draining ? { draining: true } : {}) });
       }
       if (draining) { res.setHeader('connection', 'close'); throw httpError(503, 'hub is restarting, retry in a moment'); }
+      if (p === '/install/backchannel.tgz' && ['GET', 'HEAD'].includes(req.method)) {
+        limits.public.take(`ip:${ctx.ip}`);
+        tarball ||= buildClientTarball(root, version);
+        res.writeHead(200, { 'content-type': 'application/gzip', 'content-length': tarball.length, 'cache-control': 'no-cache',
+          'content-disposition': `attachment; filename="backchannel-${version}.tgz"` });
+        return res.end(req.method === 'HEAD' ? undefined : tarball);
+      }
       if (p !== '/api' && !p.startsWith('/api/')) return serveStatic(req, res, p);
       if (p === '/api/client-errors' && req.method === 'POST') return await clientError(ctx);
       if (p === '/api/version' && req.method === 'GET') return send(res, 200, { version });
