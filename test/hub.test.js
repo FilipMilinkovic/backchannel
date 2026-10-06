@@ -7,11 +7,23 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { Store } from '../server/store.js';
+import { DatabaseSync } from 'node:sqlite';
+import { openDb } from '../server/db.js';
+import { createRepo } from '../server/repo.js';
 import { authenticate, hashToken, newToken } from '../server/auth.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Reads the hub's database directly (only while the hub is stopped, or for read-only checks).
+function query(dir, sql, ...params) {
+  const db = new DatabaseSync(path.join(dir, 'backchannel.db'));
+  try { return db.prepare(sql).all(...params).map((r) => ({ ...r })); } finally { db.close(); }
+}
+function userCount(dir) {
+  if (fs.existsSync(path.join(dir, 'backchannel.db'))) return query(dir, 'SELECT count(*) AS n FROM users')[0].n;
+  const usersFile = path.join(dir, 'users.json');
+  return fs.existsSync(usersFile) ? JSON.parse(fs.readFileSync(usersFile, 'utf8')).length : 0;
+}
 
 async function startHub(t, seed) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-hub-test-'));
@@ -28,16 +40,15 @@ async function startHub(t, seed) {
   }
   async function start() {
     output = '';
-    const usersFile = path.join(dir, 'users.json');
-    const needsSetup = !fs.existsSync(usersFile) || JSON.parse(fs.readFileSync(usersFile, 'utf8')).length === 0;
+    const needsSetup = userCount(dir) === 0;
     child = spawn(process.execPath, ['hub.js'], { cwd: ROOT,
       env: { ...process.env, DATA_DIR: dir, HOST: '127.0.0.1', PORT: '0', PUBLIC_URL: '', HUB_TOKEN: '', MAX_HOPS: '' },
       stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', (data) => { output += data; });
     child.stderr.on('data', (data) => { output += data; });
     const deadline = Date.now() + 5000;
-    while (!/Backchannel hub on http:\/\/127\.0\.0\.1:\d+\r?\n/.test(output)
-      || (needsSetup && !/Setup link: .*\/#join\/[a-f0-9]+\r?\n/.test(output))) {
+    while (!/Backchannel hub on http:\/\/127\.0\.0\.1:\d+\D/.test(output)
+      || (needsSetup && !/Setup link: \S*\/#join\/[a-f0-9]{24}\b/.test(output))) {
       if (child.exitCode !== null || Date.now() > deadline) throw new Error(`Hub failed to start: ${output}`);
       await delay(10);
     }
@@ -70,25 +81,22 @@ async function startHub(t, seed) {
 }
 const prefix = (account) => `/api/teams/${account.team.id}`;
 
-test('messages append one log line each and validate optional titles', async (t) => {
+test('messages persist one row each and validate optional titles', async (t) => {
   const h = await startHub(t);
   const owner = await h.bootstrap();
   const p = prefix(owner);
-  const log = path.join(h.dir, 'messages.jsonl');
+  const rows = () => query(h.dir, 'SELECT body FROM messages ORDER BY seq').map((r) => JSON.parse(r.body));
   const posted = [];
-  let contents = '';
   for (const title of [undefined, '  Delegation title  ', 'x'.repeat(120), '   ']) {
     const message = await h.ok(p + '/messages', owner.token, 'POST', { text: 'hello\nworld', title });
     if (title === undefined) assert.ok(!Object.hasOwn(message, 'title'));
     else assert.equal(message.title, title.trim());
     posted.push(message);
-    contents += JSON.stringify(message) + '\n';
-    assert.equal(fs.readFileSync(log, 'utf8'), contents);
-    assert.equal(contents.trimEnd().split('\n').length, posted.length);
+    assert.deepEqual(rows(), posted);
   }
   for (const title of ['x'.repeat(121), null, 42, {}, []]) {
     assert.equal((await h.api(p + '/messages', owner.token, 'POST', { text: 'invalid', title })).status, 400);
-    assert.equal(fs.readFileSync(log, 'utf8'), contents);
+    assert.equal(rows().length, posted.length);
   }
   await h.restart();
   assert.deepEqual(await h.ok(p + '/messages', owner.token), posted);
@@ -108,9 +116,8 @@ test('bootstrap, authentication, public views and token rotation persist', async
   assert.equal((await h.ok('/api/me', owner.token)).teams[0].id, owner.team.id);
   assert.equal((await h.api('/api/agents', owner.token)).status, 404);
   assert.equal((await h.api(`/api/me?token=${owner.token}`)).status, 401);
-  const users = fs.readFileSync(path.join(h.dir, 'users.json'), 'utf8');
-  assert.ok(!users.includes(owner.token));
-  assert.match(JSON.parse(users)[0].tokenHash, /^[a-f0-9]{64}$/);
+  for (const file of fs.readdirSync(h.dir)) assert.ok(!fs.readFileSync(path.join(h.dir, file)).includes(owner.token), `token stored in ${file}`);
+  assert.equal(query(h.dir, 'SELECT token_hash FROM users')[0].token_hash, hashToken(owner.token));
   const rotated = await h.ok('/api/me/token', owner.token, 'POST');
   assert.equal((await h.api('/api/me', owner.token)).status, 401);
   assert.equal((await h.ok('/api/me', rotated.token)).user.id, owner.user.id);
@@ -378,71 +385,124 @@ test('v1 migration preserves messages, agents, inboxes and configured hop limit'
   assert.equal((await h.ok(p + '/messages', owner.token)).length, 1);
 });
 
-test('store: appending messages preserves existing log bytes and adds one line', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-store-test-'));
+function tempDir(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-db-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const store = new Store(dir);
-  const log = path.join(dir, 'messages.jsonl');
-  // Existing formatting must survive: rewriting parsed messages would normalize it.
-  let contents = `{ "id": "old", "teamId": "${store.teams[0].id}", "text": "existing" }\n`;
-  fs.writeFileSync(log, contents);
-  const restored = new Store(dir);
-  for (const id of ['new1', 'new2']) {
-    const message = { id, teamId: store.teams[0].id, text: 'new\nmessage' };
-    restored.persistMessage(message);
-    contents += JSON.stringify(message) + '\n';
-    assert.equal(fs.readFileSync(log, 'utf8'), contents);
-    assert.equal(contents.trimEnd().split('\n').length, restored.messages.length);
-    assert.equal(restored.byId.get(id), message);
-  }
-  assert.equal(new Store(dir).messages.length, 3);
+  return dir;
+}
+
+test('db: schema migrations, setup invite reuse and expiry', (t) => {
+  const dir = tempDir(t);
+  const db = openDb(dir);
+  const repo = createRepo(db);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+  const setup = repo.setupInvite();
+  assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);
+  assert.equal(repo.setupInvite().code, setup.code, 'reused until claimed');
+  assert.equal(repo.findInvite(setup.code).team.name, 'Backchannel');
+  db.prepare('UPDATE invites SET expires_at = ?').run(Date.now() - 1);
+  assert.equal(repo.findInvite(setup.code), null);
+  assert.notEqual(repo.setupInvite().code, setup.code, 'an expired setup invite is replaced');
+  db.close();
+  // Reopening is idempotent, and a database from a newer hub is refused.
+  const again = openDb(dir);
+  const repo2 = createRepo(again);
+  assert.equal(repo2.activeInvites(repo2.firstTeam().id).length, 1);
+  again.exec('PRAGMA user_version = 99'); again.close();
+  assert.throws(() => openDb(dir), { code: 'DB_TOO_NEW' });
 });
 
-test('store: atomic snapshots, bootstrap reuse, migration and registry restoration', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backchannel-store-test-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(dir, 'agents.json'), JSON.stringify({ agents: [{ id: 'oldbot' }], inboxes: { oldbot: ['m1'] } }));
-  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ maxHops: 4 }));
-  fs.writeFileSync(path.join(dir, 'messages.jsonl'), JSON.stringify({ id: 'm1', threadId: 'm1', from: 'oldbot', text: 'legacy', to: ['oldbot'] }) + '\n');
-  const first = new Store(dir);
-  assert.equal(first.teams.length, 1);
-  const team = first.teams[0];
-  assert.equal(team.name, 'Backchannel'); assert.equal(team.maxHops, 4);
-  assert.equal(first.messages[0].fromKind, 'agent'); assert.equal(first.messages[0].by, null);
-  const key = `${team.id}/oldbot`;
-  assert.equal(first.inboxes.get(key)[0].id, 'm1');
-  first.users.push({ id: 'u1', handle: 'owner', tokenHash: hashToken(newToken()) });
-  first.saveUsers();
-  first.persistMessage({ id: 'm2', teamId: team.id, text: 'new' });
-  const restored = new Store(dir);
-  assert.equal(restored.teams.length, 1); assert.equal(restored.setupInvite, undefined);
-  assert.equal(restored.messages.length, 2); assert.equal(restored.agents.get(key).state, 'idle');
-  assert.equal(restored.agents.get(key).lastSeen, 0);
-  assert.equal(restored.inboxes.get(key)[0].id, 'm1');
-  assert.ok(!fs.readdirSync(dir).some((name) => name.endsWith('.tmp')));
-  const freshDir = path.join(dir, 'fresh');
-  const fresh = new Store(freshDir);
-  assert.equal(new Store(freshDir).setupInvite.code, fresh.setupInvite.code);
-  assert.equal(fresh.findInvite(fresh.setupInvite.code).team.id, fresh.teams[0].id);
-  fresh.setupInvite.expiresAt = Date.now() - 1;
-  assert.equal(fresh.findInvite(fresh.setupInvite.code), null);
-  fresh.setupInvite.expiresAt = Date.now() + 1000; fresh.setupInvite.usesLeft = 0;
-  assert.equal(fresh.findInvite(fresh.setupInvite.code), null);
+test('db: imports v2 JSON data once, including sessions, inboxes and invites', (t) => {
+  const dir = tempDir(t);
+  const token = newToken(), session = newToken();
+  const team = { id: 'aaaa11112222', name: 'Payments', createdAt: 1, maxHops: 6,
+    members: [{ userId: 'u1', role: 'owner', joinedAt: 2 }, { userId: 'u2', role: 'viewer', joinedAt: 3 }, { userId: 'ghost', role: 'member', joinedAt: 4 }],
+    invites: [{ code: 'abcdef012345abcdef012345', role: 'member', createdBy: 'u1', createdAt: 5, expiresAt: Date.now() + 60_000, usesLeft: 2 }] };
+  fs.writeFileSync(path.join(dir, 'users.json'), JSON.stringify([
+    { id: 'u1', handle: 'maya', name: 'Maya', tokenHash: hashToken(token), createdAt: 1, sessions: [{ hash: hashToken(session), label: 'laptop', createdAt: Date.now() }] },
+    { id: 'u2', handle: 'sam', name: 'Sam', tokenHash: hashToken(newToken()), createdAt: 2 }]));
+  fs.writeFileSync(path.join(dir, 'teams.json'), JSON.stringify([team]));
+  fs.writeFileSync(path.join(dir, 'agents.json'), JSON.stringify({
+    agents: [{ id: 'bot', teamId: team.id, ownerUserId: 'u1', name: 'Bot', backend: 'echo', skills: [], registeredAt: 7, lastSeen: 9, state: 'working' }],
+    inboxes: { [`${team.id}/bot`]: ['m2', 'missing'] } }));
+  const msgs = [
+    { id: 'm1', teamId: team.id, threadId: 'm1', inReplyTo: null, from: 'maya', fromKind: 'user', by: 'u1', text: 'first', ts: 10, hop: 0, to: [] },
+    { id: 'm2', teamId: team.id, threadId: 'm1', inReplyTo: 'm1', from: 'maya', fromKind: 'user', by: 'u1', text: '@bot hi', ts: 11, hop: 0, to: ['bot'], title: 'T' }];
+  fs.writeFileSync(path.join(dir, 'messages.jsonl'), msgs.map((m) => JSON.stringify(m)).join('\n') + '\n{not json\n');
+
+  const repo = createRepo(openDb(dir));
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.imported')).sort(),
+    ['agents.json.imported', 'messages.jsonl.imported', 'teams.json.imported', 'users.json.imported']);
+  assert.equal(repo.userByTokenHash(hashToken(token)).handle, 'maya');
+  assert.equal(repo.sessionByHash(hashToken(session)).label, 'laptop');
+  assert.deepEqual(repo.members(team.id).map((m) => [m.handle, m.role]), [['maya', 'owner'], ['sam', 'viewer']]);
+  assert.equal(repo.teamById(team.id).maxHops, 6);
+  assert.equal(repo.findInvite(team.invites[0].code).invite.usesLeft, 2);
+  const bot = repo.agent(team.id, 'bot');
+  assert.equal(bot.name, 'Bot'); assert.equal(bot.ownerUserId, 'u1'); assert.equal(bot.registeredAt, 7);
+  assert.ok(!('state' in bot) && !('lastSeen' in bot), 'presence is not persisted');
+  assert.deepEqual(repo.recentMessages(team.id, 10), msgs);
+  assert.deepEqual(repo.inbox(team.id, 'bot').map((m) => m.id), ['m2']);
+
+  // A second start doesn't import again, even if old files reappear.
+  fs.writeFileSync(path.join(dir, 'users.json'), '[]');
+  const reopened = createRepo(openDb(dir));
+  assert.equal(reopened.countUsers(), 2);
+  assert.ok(fs.existsSync(path.join(dir, 'users.json')), 'files next to a non-empty database are left alone');
 });
 
-test('auth: hash lookup, optional invite authentication and SSE query tokens', () => {
+test('db: inbox take and restore, session cap and login codes', (t) => {
+  const repo = createRepo(openDb(tempDir(t)));
+  const user = repo.createUser({ handle: 'a', name: 'A', tokenHash: hashToken(newToken()) });
+  const team = repo.createTeam('T', user.id);
+  repo.saveAgent({ teamId: team.id, id: 'bot', ownerUserId: user.id, name: 'bot', registeredAt: 1 });
+  for (const id of ['x1', 'x2', 'x3']) repo.insertMessage({ id, teamId: team.id, threadId: 'x1', text: id, ts: 1 });
+  repo.enqueue(team.id, 'bot', 'x3'); repo.enqueue(team.id, 'bot', 'x1');
+  assert.deepEqual(repo.takeInbox(team.id, 'bot').map((m) => m.id), ['x1', 'x3'], 'inbox is in message order');
+  assert.deepEqual(repo.takeInbox(team.id, 'bot'), []);
+  repo.enqueue(team.id, 'bot', 'x2'); repo.enqueue(team.id, 'bot', 'x1');
+  assert.deepEqual(repo.inbox(team.id, 'bot').map((m) => m.id), ['x1', 'x2'], 'restored messages go back in front');
+  repo.deleteAgent(team.id, 'bot');
+  assert.deepEqual(repo.inbox(team.id, 'bot'), [], 'removing an agent clears its inbox');
+
+  for (let i = 0; i < 25; i++) repo.createSession(user.id, `h${i}`, 'b');
+  assert.equal(repo.db.prepare('SELECT count(*) AS n FROM sessions').get().n, 20);
+  assert.equal(repo.sessionByHash('h0'), null); assert.ok(repo.sessionByHash('h24'));
+  repo.setToken(user.id, hashToken(newToken()));
+  assert.equal(repo.sessionByHash('h24'), null, 'rotating the token ends sessions');
+
+  repo.createLoginCode('c1', user.id, Date.now() + 1000);
+  repo.createLoginCode('c2', user.id, Date.now() - 1);
+  assert.equal(repo.takeLoginCode('c1'), user.id);
+  assert.equal(repo.takeLoginCode('c1'), null, 'single use');
+  assert.equal(repo.takeLoginCode('c2'), null, 'expired');
+});
+
+test('auth: main tokens, sessions with expiry, optional auth and SSE query tokens', (t) => {
+  const repo = createRepo(openDb(tempDir(t)));
   const token = newToken();
   assert.match(token, /^bc_[a-f0-9]{64}$/);
-  const user = { id: 'u1', tokenHash: hashToken(token) };
+  const user = repo.createUser({ handle: 'u', name: 'U', tokenHash: hashToken(token) });
   const url = new URL('http://localhost/api/me');
-  assert.equal(authenticate({ headers: { authorization: `Bearer ${token}` } }, url, [user]), user);
-  assert.equal(authenticate({ headers: {} }, url, [user], true), null);
-  assert.throws(() => authenticate({ headers: {} }, url, [user]), { status: 401 });
-  assert.throws(() => authenticate({ headers: { authorization: 'Bearer bad' } }, url, [user], true), { status: 401 });
-  assert.throws(() => authenticate({ headers: {} }, new URL(`${url}?token=${token}`), [user]), { status: 401 });
-  assert.equal(authenticate({ headers: {} }, new URL(`http://localhost/api/teams/a/events?token=${token}`), [user]), user);
-  user.tokenHash = hashToken(newToken());
-  assert.throws(() => authenticate({ headers: { authorization: `Bearer ${token}` } }, url, [user]), { status: 401 });
+  const bearer = (tok) => ({ headers: { authorization: `Bearer ${tok}` } });
+  assert.equal(authenticate(bearer(token), url, repo).user.id, user.id);
+  assert.equal(authenticate(bearer(token), url, repo).sessionHash, null);
+  assert.equal(authenticate({ headers: {} }, url, repo, { optional: true }), null);
+  assert.throws(() => authenticate({ headers: {} }, url, repo), { status: 401 });
+  assert.throws(() => authenticate(bearer('bad'), url, repo, { optional: true }), { status: 401 });
+  assert.throws(() => authenticate({ headers: {} }, new URL(`${url}?token=${token}`), repo), { status: 401 });
+  assert.equal(authenticate({ headers: {} }, new URL(`http://localhost/api/teams/a/events?token=${token}`), repo).user.id, user.id);
+
+  const session = newToken();
+  repo.createSession(user.id, hashToken(session), 'browser');
+  assert.equal(authenticate(bearer(session), url, repo).sessionHash, hashToken(session));
+  repo.db.prepare('UPDATE sessions SET last_used_at = ?').run(Date.now() - 31 * 86_400_000);
+  assert.throws(() => authenticate(bearer(session), url, repo, { sessionDays: 30 }), { status: 401 });
+  assert.equal(repo.sessionByHash(hashToken(session)), null, 'expired sessions are deleted');
+
+  repo.setToken(user.id, hashToken(newToken()));
+  assert.throws(() => authenticate(bearer(token), url, repo), { status: 401 });
 });
 
 test('one-time sign-in links create revocable browser sessions', async (t) => {

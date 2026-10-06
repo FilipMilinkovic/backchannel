@@ -19,15 +19,34 @@ export function tokenFrom(req, url) {
     : url.pathname.endsWith('/events') ? url.searchParams.get('token') : null;
 }
 
+const TOUCH_EVERY_MS = 60_000;
+
 // A user authenticates with their main token (CLI, connectors, MCP) or a browser session token
-// (from a one-time sign-in link), so browsers never need the main token.
-export function authenticate(req, url, users, optional = false) {
+// (from a one-time sign-in link), so browsers never need the main token. Sessions expire after
+// `sessionDays` without use. Returns { user, sessionHash } or null when optional and no token was sent.
+export function authenticate(req, url, repo, { optional = false, sessionDays = 30 } = {}) {
   const token = tokenFrom(req, url);
   if (!req.headers.authorization && !token && optional) return null;
   const hash = token && hashToken(token);
-  const user = hash && users.find((u) => u.tokenHash === hash || u.sessions?.some((s) => s.hash === hash));
-  if (!user) throw httpError(401, 'missing or invalid token');
-  return user;
+  let user = hash && repo.userByTokenHash(hash);
+  if (user) return { user, sessionHash: null };
+  const session = hash && repo.sessionByHash(hash);
+  if (session) {
+    const now = Date.now();
+    if (now - session.lastUsedAt > sessionDays * 86_400_000) repo.deleteSession(hash);
+    else {
+      if (now - session.lastUsedAt > TOUCH_EVERY_MS) repo.touchSession(hash, now);
+      user = repo.userById(session.userId);
+      if (user) return { user, sessionHash: hash };
+    }
+  }
+  throw httpError(401, 'missing or invalid token');
+}
+
+// True while the credential used for a long-lived request (long poll) still works.
+export function stillValid(repo, auth) {
+  if (auth.sessionHash) return !!repo.sessionByHash(auth.sessionHash);
+  return repo.userById(auth.user.id)?.tokenHash === auth.user.tokenHash;
 }
 
 export function requireRole(member, roles) {
