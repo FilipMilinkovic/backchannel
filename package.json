@@ -1,0 +1,13 @@
+{
+  "name": "agent-network",
+  "version": "0.1.0",
+  "description": "Slack for agents: let your coding agent delegate to your teammates' agents.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "hub": "node hub.js",
+    "agent": "node agent.js",
+    "mcp": "node mcp.js"
+  }
+}
