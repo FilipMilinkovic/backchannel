@@ -17,7 +17,7 @@ const { values: opt, positionals: [cmd, ...args] } = parseArgs({
   allowPositionals: true,
   options: {
     hub: { type: 'string' }, team: { type: 'string' }, handle: { type: 'string' }, name: { type: 'string' },
-    as: { type: 'string' }, wait: { type: 'string', default: '300' },
+    as: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
     help: { type: 'boolean', short: 'h' },
   },
@@ -48,8 +48,9 @@ const commands = {
     saveConfig({ ...cfg, hub: base, token: res.token || joiner.token, team: res.team.id });
     console.log(`Joined "${res.team.name}" as @${res.user.handle}. Saved to ${CONFIG}.`);
     if (res.token) {
-      console.log(`\nYour personal token (keep it secret; it's also saved in the config file):\n  ${res.token}`);
-      console.log(`\nUse it for connectors and MCP servers:\n  HUB_URL=${base} HUB_TOKEN=${res.token} HUB_TEAM=${res.team.id}`);
+      // Tokens stay out of terminal output (and logs, transcripts) unless asked for.
+      console.log(`Your personal token is saved there; connectors and MCP servers on this machine use it automatically.`);
+      console.log(opt['show-token'] ? `\n  ${res.token}` : `For another machine, print it with: node cli.js token`);
     }
   },
 
@@ -123,21 +124,30 @@ const commands = {
   async 'rotate-token'() {
     const { token } = await hub.req('POST', '/api/me/token');
     saveConfig({ ...cfg, token });
-    console.log(`New token saved to ${CONFIG}. Update HUB_TOKEN in your connectors and MCP configs:\n  ${token}`);
+    console.log(`New token saved to ${CONFIG}. The old one no longer works.`);
+    console.log('Restart running connectors and MCP sessions; ones that read the saved token need no other change.');
+    if (opt['show-token']) console.log(`\n  ${token}`);
+  },
+
+  // Explicit way to see the token, e.g. to set HUB_TOKEN on another machine.
+  async token() {
+    if (!hub.token) die('No saved token. Join a team first.');
+    console.log(hub.token);
   },
 };
 
 if (!cmd || opt.help || !commands[cmd]) {
   console.log(`Backchannel CLI
 
-  join <invite-link>          Join a team (creates your account on first use)
+  join <invite-link>          Join a team (creates your account on first use; --show-token)
   whoami / teams              Show your account and teams
   use <team>                  Set your default team
   agents                      List agents in the team
   ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent)
   reply <messageId> "text"    Reply to a message
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
-  rotate-token                Replace your personal token
+  rotate-token                Replace your personal token (--show-token to print it)
+  token                       Print your saved token (for HUB_TOKEN on another machine)
 
 Config: ${CONFIG} (HUB_URL, HUB_TOKEN, HUB_TEAM override it)`);
   process.exit(cmd && !commands[cmd] ? 1 : 0);
