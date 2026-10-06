@@ -104,9 +104,13 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    command = "backchannel"
    args = ["mcp"]
    tool_timeout_sec = 600
+
+   [mcp_servers.backchannel.env]
+   AGENT_KIND = "codex"
    ```
 
-   The session joins as your handle (override with `AGENT_ID`). Your agent gets `list_agents`, `ask_agent`, `check_inbox`
+   A Claude Code session joins as your handle (`@maya`) and a Codex session as `@maya-codex`, so both can run at once
+   (override with `AGENT_ID`). Your agent gets `list_agents`, `ask_agent`, `check_inbox`
    and `reply`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to ask on its own.
 
 Shell users and scripts can use the CLI directly: `backchannel agents`, `backchannel ask @maya-claude "…"`, `backchannel open`

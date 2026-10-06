@@ -962,8 +962,11 @@ function buildConnector() {
 
 let mcpTool = store.get('bc.tool', 'claude');
 function buildMcp() {
-  if (S.me) { $('mHandle').placeholder = S.me.user.handle; $('mOwner').placeholder = S.me.user.name || S.me.user.handle; }
-  const handle = ($('mHandle').value.trim() || S.me?.user.handle || 'you').toLowerCase();
+  // Codex sessions default to <handle>-codex so a Claude Code session and a Codex session never share an inbox.
+  const base = S.me?.user.handle || 'you';
+  const defaultHandle = mcpTool === 'codex' ? `${base}-codex` : base;
+  if (S.me) { $('mHandle').placeholder = defaultHandle; $('mOwner').placeholder = S.me.user.name || S.me.user.handle; }
+  const handle = ($('mHandle').value.trim() || defaultHandle).toLowerCase();
   const owner = $('mOwner').value.trim() || S.me?.user.name || handle;
   document.querySelectorAll('#mTabs button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.tool === mcpTool)));
   if (mcpTool === 'claude') {
@@ -973,7 +976,7 @@ function buildMcp() {
   } else {
     $('mWhere').textContent = 'Add to ~/.codex/config.toml';
     const toml = (s) => JSON.stringify(String(s));
-    setCmd('mCmd', `[mcp_servers.backchannel]\ncommand = "backchannel"\nargs = ["mcp"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nAGENT_ID = ${toml(handle)}\nAGENT_OWNER = ${toml(owner)}${teamArg((t) => `\nHUB_TEAM = "${t}"`)}`);
+    setCmd('mCmd', `[mcp_servers.backchannel]\ncommand = "backchannel"\nargs = ["mcp"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nAGENT_KIND = "codex"\nAGENT_ID = ${toml(handle)}\nAGENT_OWNER = ${toml(owner)}${teamArg((t) => `\nHUB_TEAM = "${t}"`)}`);
     $('mNote').innerHTML = '<span><b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
   }
   store.set('bc.mcp', JSON.stringify({ h: $('mHandle').value, o: $('mOwner').value }));

@@ -12,7 +12,10 @@ import { hubFromEnv, loadConfig } from './client.js';
 const hub = hubFromEnv();
 const saved = loadConfig();
 const account = saved.hub && saved.hub.replace(/\/$/, '') === hub.url ? saved : {};
-const id = (process.env.AGENT_ID || account.handle || process.env.USER || 'me').toLowerCase();
+// Claude Code sessions take your handle; Codex sessions take <handle>-codex, so both can run without sharing an inbox.
+const kind = process.env.AGENT_KIND || 'claude-code';
+const id = (process.env.AGENT_ID || (account.handle && (kind === 'claude-code' ? account.handle : `${account.handle}-${kind}`))
+  || process.env.USER || 'me').toLowerCase();
 const owner = process.env.AGENT_OWNER || account.name || id;
 let fatal = null; // set when the hub rejects our token or team; tools report it instead of failing silently
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
@@ -44,24 +47,44 @@ async function ensureTeam() {
   if (!hub.team) await hub.resolveTeam();
 }
 
+// Threads this session asked in (threadId -> time of the latest ask), and messages already handed to the agent.
+// Replies are also read from the thread itself: another live session with the same handle (Claude Code and Codex
+// on one account, two terminals) shares the inbox and may have taken them from it.
+const asked = new Map();
+const returned = new Set();
+
 function take(filter) {
   const out = [];
   for (let i = buffer.length - 1; i >= 0; i--) if (filter(buffer[i])) out.unshift(...buffer.splice(i, 1));
   if (out.length) writeState();
-  return out;
+  return out.filter((m) => !returned.has(m.id));
 }
 
-async function waitFor(filter, seconds) {
+async function threadReplies(threadId) {
+  const since = asked.get(threadId);
+  if (since === undefined) return [];
+  try {
+    const got = (await hub.thread(threadId)).filter((m) => m.from !== id && m.ts >= since && !returned.has(m.id));
+    if (got.length) take((m) => got.some((g) => g.id === m.id));
+    return got;
+  } catch { return []; }
+}
+
+// Waits for buffered messages matching `filter`; for a thread we asked in, also checks the thread every few seconds.
+async function waitFor(filter, seconds, threadId) {
   const deadline = Date.now() + seconds * 1000;
   for (;;) {
-    const got = take(filter);
+    let got = take(filter);
+    if (!got.length && threadId) got = await threadReplies(threadId);
+    for (const m of got) returned.add(m.id);
     if (got.length || Date.now() >= deadline) return got;
+    let woken = false;
     await new Promise((r) => {
       const done = () => { clearTimeout(t); wakers.delete(done); r(); };
-      const t = setTimeout(done, deadline - Date.now());
-      wakers.add(done);
+      const t = setTimeout(done, Math.min(deadline - Date.now(), threadId ? 3000 : Infinity));
+      wakers.add(() => { woken = true; done(); });
     });
-    await new Promise((r) => setTimeout(r, 1500)); // let near-simultaneous replies arrive together
+    if (woken) await new Promise((r) => setTimeout(r, 1500)); // let near-simultaneous replies arrive together
   }
 }
 
@@ -103,7 +126,8 @@ const tools = [
       const sent = await hub.post({ from: id, text: `@${handle} ${message}`, threadId: thread_id });
       if (sent.note) return `Not delivered: ${sent.note}`;
       if (!sent.to.length) return `@${handle} is not on the network. Call list_agents to see who is.`;
-      const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900));
+      asked.set(sent.threadId, sent.ts);
+      const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900), sent.threadId);
       if (!replies.length) return `Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Call check_inbox with thread_id "${sent.threadId}" later.`;
       return `thread_id: ${sent.threadId}\n\n${fmt(replies)}`;
     },
@@ -119,7 +143,7 @@ const tools = [
       },
     },
     run: async ({ thread_id, wait_seconds = 0 }) => {
-      const msgs = await waitFor((m) => !thread_id || m.threadId === thread_id, Math.min(wait_seconds, 900));
+      const msgs = await waitFor((m) => !thread_id || m.threadId === thread_id, Math.min(wait_seconds, 900), thread_id);
       return msgs.length ? fmt(msgs) : 'Inbox is empty.';
     },
   },
