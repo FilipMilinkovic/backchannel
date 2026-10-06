@@ -1,0 +1,11 @@
+.git
+.claude
+node_modules
+data
+data-v1-backup
+test
+docs
+*.db
+*.db-*
+*.log
+.DS_Store

@@ -12,111 +12,192 @@ your Claude Code ──ask_agent──▶ hub ──▶ teammate's connector ─
         └───────────────────────── reply (tool result) ◀───────────────────────┘
 ```
 
-Zero dependencies. Node 20+.
+One person runs a **hub** (a small server). Everyone else installs the `backchannel` command from it and connects
+their agents. No runtime dependencies: Node.js 22.13+ (24 recommended) and one SQLite file.
 
-## 1. Start the hub and claim it
+- [Run a hub](#run-a-hub): locally, with Docker, or on Fly.io
+- [Invite people and set up their computers](#invite-people-and-set-up-their-computers)
+- [Configuration](#configuration) · [Operating the hub](#operating-the-hub) · [Security model](#security-model)
+
+## Run a hub
+
+### Locally (try it in a minute)
 
 ```bash
 node hub.js
 ```
 
-On first start the hub prints a one-time **setup link**. Open it, or claim it from the terminal:
+The first start prints a one-time **setup link**. Open it, pick a handle, and you're the owner of the first team.
+The UI is at http://127.0.0.1:7777. Data lives in `./data/backchannel.db`.
+
+### Deploy to Fly.io
+
+The repo has a `Dockerfile` and a `fly.toml` (one machine, one volume, health checks, graceful deploys).
 
 ```bash
-node cli.js join '<setup link>' --handle you --name "Your Name"
+fly launch --no-deploy --copy-config --name your-hub     # creates the app
+fly volumes create backchannel_data --size 1             # 1 GB holds a lot of messages
+# in fly.toml, set PUBLIC_URL = "https://your-hub.fly.dev" (or your own domain)
+fly deploy
+fly logs | grep 'Setup link'                             # or: fly ssh console -C "node hub.js setup-link"
 ```
 
-You become the owner of the first team. Your personal access token is saved to `~/.backchannel/config.json`,
-and your local connectors and MCP servers pick it up from there automatically.
+Optional error reporting: `fly secrets set SENTRY_DSN=https://...@sentry.io/123`.
 
-Run `node cli.js open` to open the control room already signed in (a one-time link gives that browser its own session, so your token never leaves the CLI), or open http://127.0.0.1:7777 and paste your token. The control room has **Delegations**, **Agents**, **Members** (roles and invites)
-and **Connect** (copy-paste commands with your token and team filled in).
+### Anywhere with Docker
 
-### Teams, invites and roles
+```bash
+docker build -t backchannel-hub .
+docker run -d --name backchannel -p 8080:8080 -v backchannel-data:/data \
+  -e PUBLIC_URL=https://hub.example.com --restart unless-stopped backchannel-hub
+docker logs backchannel | grep 'Setup link'
+```
 
-- **One team = one project.** It has its own agents, delegations, members and hop limit. Anyone can create more teams.
-- **Invite people** from Members, or with `node cli.js invite --role member`. They open the link, pick a handle,
-  and get their own token. Roles: **owner** (manages members, invites and settings), **member** (delegates and connects
-  their own agents), **viewer** (watches).
-- **Agents belong to the person who connected them.** Nobody else can run, impersonate or remove them (except team owners, who can remove).
+Put it behind HTTPS (Caddy, nginx, a Cloudflare Tunnel, Render, Railway). Render and Railway build the
+`Dockerfile` as is: give the service a persistent disk mounted at `/data`, set `PUBLIC_URL`, and use `/readyz` as the health check.
+Run **one** instance: live connections are held in memory.
 
-### Let teammates on other machines connect
-
-Agents only make outbound HTTP requests, so the hub is the only thing that has to be reachable.
-Every API call needs a token, so it's safe to expose. Put it behind HTTPS, for example:
+### On a tailnet
 
 ```bash
 HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # then: tailscale serve 7777
 ```
 
-`PUBLIC_URL` is what invite links point at. Cloudflare Tunnel or any reverse proxy works the same way.
+## Invite people and set up their computers
 
-## 2. Make an agent reachable (the person being asked)
+1. **Invite.** On **Members**, create an invite link (or `backchannel invite --role member`) and send it.
+   Roles: **owner** (manages members, invites and settings), **member** (delegates and connects agents), **viewer** (watches).
+2. **Join.** They open the link, pick a handle, and land in the UI.
+3. **Set up a computer.** The **Connect** page shows two commands to run in a terminal on each computer:
 
-```bash
-HUB_URL=https://hub.example node agent.js --id maya-claude --backend claude-code --cwd ~/code/payments --approve
-```
+   ```bash
+   npm install -g https://your-hub.example/install/backchannel.tgz   # the hub serves its own client
+   backchannel login 'https://your-hub.example/#login/…'              # one-time link, works once, for 10 minutes
+   ```
 
-| Flag | Meaning |
-|---|---|
-| `--backend` | `claude-code`, `codex`, `openai` (`OPENAI_API_KEY`, `OPENAI_MODEL`), `grok` (`XAI_API_KEY`, `XAI_MODEL`), `echo` (testing) |
-| `--cwd` | The repo the coding agent works in |
-| `--approve` | Shows each request in your terminal and waits for your yes |
-| `--write` | Lets Claude Code or Codex edit files. Read-only by default |
-| `--team` | Which team, if you're in several (or `HUB_TEAM`) |
+   Each computer gets its own sign-in, saved in `~/.backchannel/config.json`. No token to copy around.
 
-The connector uses your saved token for that hub, or `HUB_TOKEN` if set.
+4. **Make an agent reachable** (the person being asked):
 
-## 3. Delegate from your coding agent (the person asking)
+   ```bash
+   backchannel connect --id maya-claude --backend claude-code --cwd ~/code/payments --approve
+   ```
 
-**Claude Code:**
+   | Flag | Meaning |
+   |---|---|
+   | `--backend` | `claude-code`, `codex`, `openai` (`OPENAI_API_KEY`, `OPENAI_MODEL`), `grok` (`XAI_API_KEY`, `XAI_MODEL`), `echo` (testing) |
+   | `--cwd` | The repo the coding agent works in |
+   | `--approve` | Shows each request in your terminal and waits for your yes |
+   | `--write` | Lets Claude Code or Codex edit files. Read-only by default |
+   | `--team` | Which team, if you're in several |
 
-```bash
-claude mcp add backchannel --scope user -e HUB_URL=https://hub.example -e AGENT_ID=you -e AGENT_OWNER="Your Name" -- node /path/to/mcp.js
-```
+5. **Delegate from your coding agent** (the person asking):
 
-**Codex:** add this to `~/.codex/config.toml`:
+   ```bash
+   claude mcp add backchannel --scope user -- backchannel mcp
+   ```
 
-```toml
-[mcp_servers.backchannel]
-command = "node"
-args = ["/path/to/mcp.js"]
-tool_timeout_sec = 600
+   For Codex, add to `~/.codex/config.toml`:
 
-[mcp_servers.backchannel.env]
-HUB_URL = "https://hub.example"
-AGENT_ID = "filip"
-```
+   ```toml
+   [mcp_servers.backchannel]
+   command = "backchannel"
+   args = ["mcp"]
+   tool_timeout_sec = 600
+   ```
 
-Your agent gets four tools: `list_agents`, `ask_agent` (send a request and wait for the reply), `check_inbox` and `reply`.
-Then just work. Say *"ask @maya's agent how partial refunds work"* or let the agent decide to ask on its own.
+   The session joins as your handle (override with `AGENT_ID`). Your agent gets `list_agents`, `ask_agent`, `check_inbox`
+   and `reply`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to ask on its own.
 
-## Make agents use it without being told
+Shell users and scripts can use the CLI directly: `backchannel agents`, `backchannel ask @maya-claude "…"`, `backchannel open`
+(opens the UI signed in). `backchannel --help` lists everything.
+
+### Make agents use it without being told
 
 1. **Instructions.** Add [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) to `~/.claude/CLAUDE.md` (Claude Code) and `~/.codex/AGENTS.md` (Codex). The MCP server also sends the same guidance as its server instructions.
 2. **Unread nudges.** Every Backchannel tool result ends with a 📬 line when messages are waiting. Unread messages are mirrored to `~/.backchannel/inbox-<id>.json`, and handed back to the hub if the session closes before reading them.
-3. **Optional Claude Code hook.** To mention unread messages on every turn, even when the agent hasn't touched Backchannel, add to `~/.claude/settings.json`:
+3. **Optional Claude Code hook.** To mention unread messages on every turn, add to `~/.claude/settings.json`:
    ```json
-   "hooks": { "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node /path/to/hooks/inbox-hook.js filip" }] }] }
+   "hooks": { "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "backchannel inbox-hook your-handle" }] }] }
    ```
+
+## Configuration
+
+The hub reads environment variables only, and refuses to start with a clear message if one is invalid.
+
+| Variable | Default | |
+|---|---|---|
+| `PUBLIC_URL` | `http://HOST:PORT` | The address people use. Invite, sign-in and install links point here. HTTPS enables HSTS |
+| `PORT`, `HOST` | `7777`, `127.0.0.1` | Use `HOST=0.0.0.0` to accept outside connections (the Docker image does) |
+| `DATA_DIR` | `./data` | Where `backchannel.db` lives. Must be persistent |
+| `TRUST_PROXY` | off | Where the client IP comes from: `fly` (Fly-Client-IP), `cloudflare` (CF-Connecting-IP), `xff` (last X-Forwarded-For hop). Only set it when that proxy is the only way in |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_FORMAT` | `json` (pretty in a terminal) | `json` or `pretty` |
+| `SENTRY_DSN` | off | Send server and browser errors to Sentry. `SENTRY_ENVIRONMENT` labels them |
+| `RATE_PUBLIC_PER_MIN` | `20` | Per IP: invite lookups and accepts, sign-in link exchanges, client downloads |
+| `RATE_WRITES_PER_MIN` | `240` | Per user: messages, invites, agent registrations, other changes |
+| `RATE_READS_PER_MIN` | `1200` | Per user |
+| `MAX_STREAMS_PER_USER` | `50` | Open live streams and long polls per user |
+| `MAX_CONNECTIONS` | `5000` | Open sockets for the whole hub |
+| `SESSION_DAYS` | `30` | Browser and computer sign-ins expire after this many days unused |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | How long a deploy or restart waits for requests to finish |
+
+Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/config.json`, and `HUB_URL`, `HUB_TOKEN`, `HUB_TEAM` override it.
+
+## Operating the hub
+
+- **Health.** `GET /healthz` (the process is up) and `GET /readyz` (the database answers and the hub isn't draining). `GET /api/version`.
+- **Logs.** One JSON object per line on stdout: an access line per request (method, path, status, duration, IP, user, `requestId`),
+  plus warnings and errors with stacks. Tokens, `?token=` values and invite/sign-in codes are redacted. Every response has an
+  `x-request-id` header, and a 500 includes it in the body, so a user's report leads straight to the log line.
+- **Errors.** Unexpected server errors, unhandled rejections and errors in people's browsers are logged at `error` and, with
+  `SENTRY_DSN`, sent to Sentry (capped at 30 a minute). An uncaught exception shuts the hub down cleanly and exits non-zero, so
+  Docker or Fly restarts it.
+- **Backups.** `node hub.js backup /data/backup.db` writes a consistent copy while the hub runs (don't copy `backchannel.db`
+  alone: recent writes may still be in `backchannel.db-wal`). On Fly, volume snapshots are daily as well.
+  To restore, stop the hub and put the backup in place as `backchannel.db`.
+- **Upgrades.** Deploy the new version. Schema migrations run at startup, in a transaction. Take a backup first; to roll back,
+  restore that backup with the older version (a hub refuses a database newer than itself).
+- **Restarts.** SIGTERM drains: readiness fails, long polls return early without losing messages, streams close, and the
+  connectors, MCP servers and browsers reconnect by themselves.
+- **Lost the setup link?** `node hub.js setup-link` prints it again until someone has claimed the hub.
+- **Coming from the JSON files (v2.0)?** Start the new hub on the same `DATA_DIR`. It imports `users.json`, `teams.json`,
+  `agents.json` and `messages.jsonl` once, in one transaction, and renames them to `*.imported`. Tokens and browser sign-ins keep working.
+
+## Security model
+
+- Every API call needs a token except reading or accepting an invite and exchanging a sign-in link. Non-members get 404 for a
+  team, so nothing leaks. Tokens are 256-bit random and stored only as SHA-256 hashes.
+- Each browser and computer has its own sign-in, revocable on its own. Rotating your main token (Connect page, or
+  `backchannel rotate-token`) signs out every other browser and computer and closes their open connections.
+- Agents belong to the person who connected them. Nobody else can run, impersonate or remove them (team owners can remove).
+- Coding agents are read-only unless started with `--write`. With `--approve`, the owner confirms every request.
+- The UI ships a strict Content Security Policy (no inline script except the UI's own, by hash), `no-referrer`, and frame blocking.
+- Abuse limits: per-IP limits on public routes, per-user limits on reads and writes, caps on open streams and sockets, and a
+  2 MB body limit.
 
 ## How routing works
 
 - A message goes to the `@handles` it **starts** with. Mentions later in the text are just references.
 - With no leading handle, it goes back to whoever sent the message being answered.
-- Each agent reply is one hop. Past the hop limit (default 8, set it on the Connect page) the hub stops delivering, so agents can't loop forever.
+- Each agent reply is one hop. Past the hop limit (default 8, set on the Connect page) the hub stops delivering, so agents can't loop forever.
 - Everything is scoped to one team; agents never reach another team's agents.
-- Messages are logged to `data/messages.jsonl`. Users and teams live in `data/users.json` and `data/teams.json` (tokens stored as hashes only). Agents and their undelivered messages are saved in `data/agents.json`, so they survive hub restarts and come back online as soon as their connector or session reconnects. Remove an offline agent from the Agents page (or `DELETE /api/agents/<id>`). Delete `data/` to start fresh.
+- An agent's inbox is delivered in the order messages were posted. Delivery is at most once: a message handed to a connector
+  that crashes before acting on it is not redelivered (the thread still shows it, and the sender can ask again).
 
-## Files
+## Development
 
-| File | What it does |
+```bash
+npm test               # hub API, permissions, storage, import, operations (node --test)
+LOG_FORMAT=pretty node hub.js
+```
+
+| Path | What it does |
 |---|---|
-| `hub.js`, `server/` | Auth, teams, invites, roles, routing, threads, live feed (SSE), REST API; serves the UI |
-| `cli.js` | Join teams, invite people, list agents, ask agents from a shell |
-| `test/` | `node --test` (hub API, permissions, transport) |
-| `agent.js` + `backends.js` | Connector daemon. Long-polls the hub over outbound HTTP only, so it works behind NAT |
+| `hub.js` | Entrypoint: config, database, HTTP server, graceful shutdown; `setup-link` and `backup` commands |
+| `server/` | `config` (env validation), `log`, `report` (errors, Sentry), `db` (SQLite, migrations, JSON import), `repo` (queries), `auth`, `limits`, `realtime` (streams, long polls), `routes` (the API), `app` (HTTP, headers, health, static), `bundle` (client package) |
+| `bin/backchannel.js`, `cli.js` | The `backchannel` command |
+| `agent.js` + `backends.js` | Connector. Long-polls the hub over outbound HTTP only, so it works behind NAT |
 | `mcp.js` | MCP server that puts a live Claude Code or Codex session on the network |
 | `public/index.html` | The control room UI |
-
-See [SCOPE.md](SCOPE.md) for what's in and out of v1.
+| `docs/` | [Teams design](docs/TEAMS-PLAN.md), [production plan](docs/PRODUCTION-PLAN.md) |

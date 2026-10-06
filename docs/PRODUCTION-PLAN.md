@@ -32,9 +32,8 @@ No new product features. The HTTP API stays the same, so the clients, the UI and
 - **Health and lifecycle.** `GET /healthz` (process up) and `GET /readyz` (database answers). On SIGTERM: stop accepting connections,
   end SSE streams, answer pending long polls with an empty inbox (connectors just reconnect), close the database, exit within 10 s.
 - **Config is validated at startup.** Bad env (port, URL, numbers) fails fast with one clear message.
-- **Installable clients.** `package.json` gets `bin: { backchannel }` with subcommands (`join`, `open`, `connect`
-  (= agent.js), `mcp` (= mcp.js), `hub`, ...). People install with `npm i -g github:FilipMilinkovic/backchannel`
-  or run `npx -y github:FilipMilinkovic/backchannel ...`, so nobody needs a clone. The Connect page generates those commands.
+- **Installable clients.** `package.json` gets `bin: { backchannel }` with subcommands (`join`, `login`, `open`, `connect`
+  (= agent.js), `mcp` (= mcp.js), ...), so nobody needs a clone. The Connect page generates those commands. (See "Changed during the build".)
 - **Deploy targets.** `Dockerfile` (non-root, `/data` volume, healthcheck), `fly.toml` (one machine, a volume, health checks),
   and docs for Docker, Fly and Render/Railway. GitHub Actions runs the tests on Node 22 and 24 and builds the image.
 
@@ -71,18 +70,45 @@ inbox(team_id, agent_id, message_id, seq, PK(team_id, agent_id, message_id))
 
 Agent presence (`lastSeen`, `state`, `stateThread`) stays in memory, as today (it resets on restart anyway).
 
-## Out of scope (next)
+## Changed during the build
 
-Multiple hub instances, email/OAuth sign-in, HttpOnly cookie sessions instead of bearer tokens in localStorage,
-message retention policies, an npm registry release (needs Filip), a hosted multi-tenant service.
+- **Clients install from the hub, not from GitHub.** The repo is private, so `npm i -g github:...` would need repo access.
+  The hub serves its own client package at `/install/backchannel.tgz` (built in memory, plain tar + gzip), which also keeps
+  clients on the hub's version.
+- **Per-computer sign-in.** `backchannel login '<link>'` exchanges a one-time link (from the Connect page, valid up to 10 minutes)
+  for that computer's own session. The Connect page commands no longer contain tokens.
+- **Backups:** `node hub.js backup <file>` (`VACUUM INTO`, safe while running). `node hub.js setup-link` reprints the owner link.
+
+## Codex plan review: what we did
+
+| Point | Outcome |
+|---|---|
+| Import completion marker, crash between commit and rename | `meta.json_import` committed with the data; next start only finishes the renames. Tested |
+| Damaged source data | Import fails with file and line; only a torn last JSONL line (crash mid-append) is dropped. Duplicates and dangling references are counted and logged |
+| v1 contract | `server/legacy.js` keeps the old Store's v1 logic; inboxes come from saved queues, not recipients; file order is kept |
+| Atomic invite accept, setup invite | One transaction (user, membership, use count, claiming ownerless agents), with an in-transaction re-check |
+| Inbox order and delivery | Delivered in message order; message and inbox rows commit together, then waiters wake. At-most-once delivery documented (acks are future work) |
+| Revocation holes | Streams record their credential and are re-checked every 30 s and on logout/sign-in; rotation deletes unused login codes; code exchange and session creation share a transaction |
+| Shutdown | Draining flag, readiness 503, released polls return `[]` without dequeuing, idle sockets swept, handlers awaited before `db.close()`, repeat signals ignored |
+| SSE gaps and slow readers | UI refetches messages after reconnect; a reader with over 1 MB buffered is dropped |
+| Proxy trust | `TRUST_PROXY=fly|cloudflare|xff` instead of trusting any header |
+| Limits | Limiter key cap, connection cap, stream cap, browser error cap; Sentry capped with timeouts |
+| Node 22.13 | Avoided `db.isTransaction`; suite passes on 22.13.0 and 24; CI runs both |
+
+## Known limitations
+
+- One hub process (SSE and long polls live in memory). Fine for teams; scaling out needs a shared pub/sub.
+- Delivery to a connector is at most once.
+- Browsers keep their session token in localStorage (protected by the CSP); HttpOnly cookies would be stronger.
+- No email/OAuth sign-in, no retention policy, no npm registry release.
 
 ## Checklist
 
-- [ ] config, log, report, limits, realtime modules
-- [ ] SQLite schema, repo, JSON import (v2 and v1)
-- [ ] routes ported onto repo; existing black-box tests pass unchanged
-- [ ] new tests: import, sessions expiry, rate limits, headers, health, request ids, client errors, shutdown
-- [ ] Dockerfile, .dockerignore, fly.toml, CI workflow
-- [ ] `backchannel` bin + Connect page commands
-- [ ] README: deploy in 5 minutes, operate (logs, backup, upgrade)
+- [x] config, log, report, limits, realtime modules
+- [x] SQLite schema, repo, JSON import (v2 and v1)
+- [x] routes ported onto repo; existing black-box tests pass
+- [x] new tests: import, sessions expiry, rate limits, headers, health, request ids, client errors, shutdown, backup, install
+- [x] Dockerfile, .dockerignore, fly.toml, CI workflow
+- [x] `backchannel` bin + Connect page commands
+- [x] README: deploy, onboard, operate
 - [ ] Codex review of the diff; fixes
