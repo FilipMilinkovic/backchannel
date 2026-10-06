@@ -40,10 +40,20 @@ The repo has a `railway.json` (Dockerfile build, `/readyz` health check, restart
 4. Redeploy if it already started, then find the owner link in **Deploy Logs**: search for `Setup link`.
    With the Railway CLI: `railway ssh -- node hub.js setup-link`.
 
+Or from a terminal, without connecting GitHub (this uploads the working directory):
+
+```bash
+npm install -g @railway/cli && railway login
+railway init --name backchannel && railway add --service hub
+railway volume add --mount-path /data && railway domain
+railway up --service hub        # every later deploy is just this line
+```
+
 On Railway the hub sets `PUBLIC_URL` from the generated domain and reads client IPs the way Railway's edge
 provides them (`TRUST_PROXY=railway`). With a custom domain, set `PUBLIC_URL=https://your.domain` under **Variables**.
-Optional: `SENTRY_DSN`. Turn on volume backups in the volume's settings. Redeploys take the hub down for a few
-seconds (Railway never mounts one volume twice); connectors, MCP sessions and browsers reconnect by themselves.
+Optional: `SENTRY_DSN`. The hub keeps its own daily backups on the volume; Railway's volume backups (Pro plan) also
+protect against losing the volume. Redeploys take the hub down for a few seconds (Railway never mounts one volume
+twice); connectors, MCP sessions and browsers reconnect by themselves.
 
 ### Deploy to Fly.io
 
@@ -160,6 +170,7 @@ The hub reads environment variables only, and refuses to start with a clear mess
 | `MAX_CONNECTIONS` | `5000` | Open sockets for the whole hub |
 | `SESSION_DAYS` | `30` | Browser and computer sign-ins expire after this many days unused |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | How long a deploy or restart waits for requests to finish |
+| `BACKUP_HOURS`, `BACKUP_KEEP` | `24`, `7` | Automatic database copies in `DATA_DIR/backups`; `BACKUP_HOURS=0` turns them off |
 
 Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/config.json`, and `HUB_URL`, `HUB_TOKEN`, `HUB_TEAM` override it.
 
@@ -172,8 +183,10 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - **Errors.** Unexpected server errors, unhandled rejections and errors in people's browsers are logged at `error` and, with
   `SENTRY_DSN`, sent to Sentry (capped at 30 a minute). An uncaught exception shuts the hub down cleanly and exits non-zero, so
   Docker or Fly restarts it.
-- **Backups.** `node hub.js backup /data/backup.db` writes a consistent copy while the hub runs (don't copy `backchannel.db`
-  alone: recent writes may still be in `backchannel.db-wal`). On Fly, volume snapshots are daily as well.
+- **Backups.** The hub copies its database to `DATA_DIR/backups` once a day and keeps a week (`BACKUP_HOURS`, `BACKUP_KEEP`).
+  These live on the same disk, so they cover mistakes and bad upgrades, not a lost disk: for that, use your host's volume
+  snapshots (Fly takes them daily; Railway on the Pro plan) or copy a backup elsewhere. `node hub.js backup <file>` writes one
+  on demand. Don't copy `backchannel.db` alone: recent writes may still be in `backchannel.db-wal`.
   To restore, stop the hub and put the backup in place as `backchannel.db`.
 - **Upgrades.** Deploy the new version. Schema migrations run at startup, in a transaction. Take a backup first; to roll back,
   restore that backup with the older version (a hub refuses a database newer than itself).

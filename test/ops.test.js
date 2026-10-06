@@ -11,6 +11,8 @@ import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { startHub, query, prefix, delay, tempDir, ROOT } from './helpers.js';
 import { loadConfig } from '../server/config.js';
+import { openDb } from '../server/db.js';
+import { backupIfDue } from '../server/backup.js';
 
 // Opens an SSE stream; resolves with { res, events, ended } once the hello event arrived.
 function openStream(url) {
@@ -232,6 +234,25 @@ test('the hub serves an installable client package and longer-lived sign-in link
   assert.equal((await h.ok('/api/me/login-link', owner.token, 'POST')).expiresInSeconds, 60);
   assert.equal((await h.ok('/api/me/login-link', owner.token, 'POST', { expiresInSeconds: 600 })).expiresInSeconds, 600);
   for (const bad of [601, 5, 1.5, '600']) assert.equal((await h.api('/api/me/login-link', owner.token, 'POST', { expiresInSeconds: bad })).status, 400);
+});
+
+test('automatic backups run when due and keep the newest copies', (t) => {
+  const dir = tempDir(t);
+  const db = openDb(dir);
+  const first = backupIfDue(db, dir, 24, 3);
+  assert.ok(first && fs.existsSync(first.file));
+  assert.equal(backupIfDue(db, dir, 24, 3), null, 'not due again yet');
+  const backups = path.join(dir, 'backups');
+  for (const day of ['01', '02', '03', '04']) fs.writeFileSync(path.join(backups, `backchannel-2026-01-${day}T00-00-00-000Z.db`), 'old');
+  const old = new Date(Date.now() - 25 * 3_600_000);
+  for (const f of fs.readdirSync(backups)) fs.utimesSync(path.join(backups, f), old, old);
+  const second = backupIfDue(db, dir, 24, 3);
+  assert.ok(second, 'due once the newest copy is older than the interval');
+  const left = fs.readdirSync(backups).sort();
+  assert.equal(left.length, 3);
+  assert.ok(left.includes(path.basename(first.file)) && left.includes(path.basename(second.file)));
+  assert.ok(!left.includes('backchannel-2026-01-01T00-00-00-000Z.db'));
+  db.close();
 });
 
 test('setup-link and backup commands; a backup restores as a working hub', async (t) => {

@@ -68,6 +68,9 @@ export function loadConfig(env = process.env) {
       streamsPerUser: int('MAX_STREAMS_PER_USER', 50, 1, 10_000),
     },
     sessionDays: int('SESSION_DAYS', 30, 1, 3650),
+    // Automatic copies in DATA_DIR/backups. 0 turns them off.
+    backupHours: int('BACKUP_HOURS', 24, 0, 24 * 30),
+    backupKeep: int('BACKUP_KEEP', 7, 1, 365),
     shutdownMs: int('SHUTDOWN_TIMEOUT_MS', 10_000, 0, 120_000),
   };
   if (problems.length) {

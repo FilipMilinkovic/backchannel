@@ -9,6 +9,7 @@ import { RateLimiter, StreamCap } from './limits.js';
 import { httpError } from './auth.js';
 import { redact } from './log.js';
 import { buildClientTarball } from './bundle.js';
+import { backupIfDue } from './backup.js';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8' };
@@ -182,7 +183,14 @@ export function createApp({ config, repo, log, reporter, version, root }) {
       const n = repo.pruneSessions(Date.now() - config.sessionDays * 86_400_000);
       if (n) log.info('expired browser sessions removed', { count: n });
     }),
+    ...(config.backupHours ? [every(600_000, 'backup', backup), setTimeout(backup, 60_000)] : []),
   ];
+  function backup() {
+    try {
+      const done = backupIfDue(repo.db, config.dataDir, config.backupHours, config.backupKeep);
+      if (done) log.info('database backed up', { file: done.file, removed: done.removed });
+    } catch (err) { reporter.error(err, { message: 'backup failed' }); }
+  }
   for (const t of timers) t.unref();
 
   return {

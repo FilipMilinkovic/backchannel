@@ -18,7 +18,7 @@ COPY server ./server
 COPY public ./public
 RUN mkdir -p /data && chown node:node /data && chmod +x docker-entrypoint.sh
 
-VOLUME /data
+# Mount persistent storage at /data (docker run -v, a Fly or Railway volume). No VOLUME line: Railway rejects it.
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
