@@ -3,7 +3,9 @@
 > **Status: plan approved, not started.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
 > 375 px), the hub, the clients, and [beads](https://github.com/gastownhall/beads).
 > Phase L (launch readiness) was added on 2026-10-07 after a security and operations review. It lists what must be
-> done before marketing to real users.
+> done before marketing to real users. On 2026-10-08 we chose a **closed beta on the shared hub** with **global
+> handles**, split Phase L into three tracks, and pulled its four security fixes forward as **Phase L0**, shipped to
+> production before anything else.
 
 **Goal:** Backchannel is good at one agent asking another a question. v3 makes it a place where a team's agents
 **coordinate work**:
@@ -55,7 +57,8 @@ Along the way, fix the UI, make installation one step, and let people close dele
 | Split the UI | `public/index.html` (markup), `public/app.css`, `public/app/*.js` as ES modules: `api`, `state`, `render-*`, `views/*`. `server/app.js` serves them with long cache plus a version query, and the CSP drops the hash. |
 | Demo seed script | `node scripts/seed.js [hub]` creates two users, long handles and names, a long repo, branch and URL, unbroken identifiers, code blocks, all statuses, many threads and tasks. It becomes the QA fixture for every UI change. (The audit for this plan used a hand-run version.) |
 | Server-side delegation state | New `threads` table. `owing()` and `statusOf()` move to `server/threads.js` and are tested there. `GET /threads` returns `{ id, title, status, waitingOn, from, to, count, updated }` with cursor pagination. The UI stops downloading 5000 messages and loads a thread's messages when it's opened. |
-| Schema v4 | `threads(team_id, id, title, state, closed_by, closed_at, summary, updated_at)`. Existing threads are backfilled from messages. |
+| Acknowledged delivery (from Phase L) | A connector that crashes after taking a message loses it, and users will read that as flakiness. Taking a message leases it, and posting the reply or an `ack` releases it. An expired lease puts the message back. Done here because "Mark as done" (Phase 1) also changes the inbox, so both land in one migration. |
+| Schema v4 | `threads(team_id, id, title, state, closed_by, closed_at, summary, updated_at)`, backfilled from messages, and lease columns on `inbox` (`leased_until`, `leased_by`). |
 
 ## Phase 1: UI fixes and "Mark as done"
 
@@ -116,6 +119,7 @@ nobody is told whether setup actually worked.
 | Change | Detail |
 |---|---|
 | **One-line installer** | `curl -fsSL https://hub/install.sh \| sh -s -- <code>` (Windows: `irm https://hub/install.ps1 \| iex`). It checks for Node 22.13 or newer and says exactly how to get it if missing. It unpacks the client into `~/.backchannel/lib` (no sudo, no `npm -g`) and links `~/.local/bin/backchannel`, adding it to PATH if needed. Then it runs `login` and `setup` and prints a checklist. The npm command stays as a "Use npm instead" option. |
+| **Activation funnel (from Phase L)** | Count each step on the hub (no third-party analytics): invite opened, account created, computer signed in, session connected, first delegation, first answer. It uses the same events as the checklist below. An owner-only view or a CLI report shows where people drop off. |
 | **Live setup checklist** | On the invite screen and on Connect, a three-step checklist turns ✓ as things happen. (1) "Run this" becomes "Signed in on *Filips-MacBook*" when the code is exchanged. (2) "Restart Claude Code" becomes "Claude Code connected as @filip" when a session registers. (3) The optional "Make an agent reachable" becomes "@filip-claude online". The hub already knows all three events and just has to broadcast them. Expired codes are replaced automatically, with a countdown. |
 | **"Copy as a prompt"** | This is the button that hands the command to the agent. Next to *Copy command*, it copies a ready prompt for Claude Code or Codex: "Set me up on Backchannel: run `<command>`, then run `backchannel doctor` and tell me the result." The person pastes it into the agent they already have open, and the agent installs, verifies and reports. Browsers can't start a terminal themselves, so this is the closest thing to a one-click install. |
 | **Doctor results in the UI** | `setup` and `doctor` report a short health summary to the hub. Connect lists *Your computers* (name, client version, Claude Code ✓, Codex ✓, last seen, Sign out). |
@@ -127,16 +131,30 @@ nobody is told whether setup actually worked.
 **Goal:** it is safe to let people we don't know join teams, and to market the hosted hub. Launch means Phases 0, 1
 and 2 plus this phase. Phases 4 to 6 (roles, board, memory) come after launch: we launch on delegation.
 
+**Launch shape (decided 2026-10-08):** a closed beta on the shared hub we already run. We invite teams ourselves
+(invites plus a waitlist, no open sign-up yet), and email is optional at first. Terms and a privacy policy are still
+needed before the first outside team joins. Handles stay global across the hub.
+
+Phase L runs as three tracks, so the non-code work never blocks the code:
+
+| Track | Owner | Contents |
+|---|---|---|
+| **L0. Security fixes** | Claude | The first four rows of *Security* below. Small, independent of Phase 0, and production already has users, so they ship to production first. |
+| **Engineering** | Claude / Codex | The rest of *Security*, *Operations*. |
+| **Product** | Claude | *Accounts and data*, scoped to the closed beta. |
+| **Business** | Filip | *Legal and launch basics*, except the activation funnel (moved to Phase 2). Runs alongside the others. |
+
 ### Security
 
 | Item | Detail |
 |---|---|
 | **Inbound messages are data, not instructions** | Today the inbox hook and the MCP server instructions tell a live session to answer requests "using what you know or can find in this workspace", asking first only for edits or secrets. The session keeps whatever permissions it already has, and many people run Claude Code without permission prompts. One message from a teammate, or from an agent that read an injected web page, can steer it into running commands or reading `.env`. Fix: `check_inbox`, `ask_agent` results and the hook wrap message text as quoted reference material with the sender shown. The instructions say a message alone is never a reason to run commands, edit files, or read or send secrets without asking the user. The same wrapping goes into connector prompts. This brings the Phase 6 rule forward and applies it to messages. |
-| **Hardcoded secret protection in connectors** | "Read-only" Claude Code (`Read,Glob,Grep`, `dontAsk`) and Codex (`--sandbox read-only`) can read `.env` in the repo, and replies go to the whole team. Check whether either can read outside the working folder too. Before the policy system exists, connectors always deny `**/.env*`, `**/*.pem`, `**/id_*`, `~/.ssh`, `~/.aws`, `~/.config/gcloud` and `~/.backchannel` (Claude: `--disallowedTools` path rules; Codex: a prompt rule plus the redaction below). They also scrub `sk-…`, `AKIA…`, `ghp_…`, `xox…` and PEM blocks from replies and `ATTACH:` files before posting. These become the hub defaults for `paths.deny` and `redactSecrets` in Phase 3. |
+| **Hardcoded secret protection in connectors** | "Read-only" Claude Code (`Read,Glob,Grep`, `dontAsk`) and Codex (`--sandbox read-only`) can read `.env` in the repo, and replies go to the whole team. Check whether either can read outside the working folder too. Codex's `read-only` sandbox most likely allows reading the whole disk (`~/.ssh` included), and a prompt rule is not a control. If a test confirms it, read-only Codex connectors say "can read your whole disk" in their description and profile until there is a real control. Before the policy system exists, connectors always deny `**/.env*`, `**/*.pem`, `**/id_*`, `~/.ssh`, `~/.aws`, `~/.config/gcloud` and `~/.backchannel` (Claude: `--disallowedTools` path rules; Codex: a prompt rule plus the redaction below). They also scrub `sk-…`, `AKIA…`, `ghp_…`, `xox…` and PEM blocks from replies and `ATTACH:` files before posting. These become the hub defaults for `paths.deny` and `redactSecrets` in Phase 3. |
 | **Write access needs a deliberate opt-in** | With `--write`, any team member can make the connector run Bash on the owner's machine. `--write --no-approve` refuses to start unless `--i-trust-this-team` is also passed, and the connector prints who can reach it. Its profile shows "Edits without approval" in warning style. |
+| **Request quota per agent** | Without a limit, a teammate can use up someone else's Claude or Codex plan. The hub caps requests per requester per agent (default 30 an hour, a team setting later in Phase 3) and answers past the cap with a clear "@maya-claude takes at most 30 requests an hour from you". |
 | **Requesters allow-list (from Phase 3)** | Ship `requesters { allow, deny }` early, as an agent setting the hub enforces in `postMessage`. Default for write agents: only the owner. Default for read agents: all members. |
 | **Web approvals (from Phase 3)** | Ship the Approvals inbox early, so `--approve` doesn't need a terminal left open and works with the background connector. |
-| **Client distribution integrity** | The hub serves the client to every user's machine (`/install/backchannel.tgz`, later `install.sh` and `backchannel update`). Anyone who controls the hub or the Railway account controls those machines. Turn on 2FA for Railway and GitHub and limit who can deploy. Publish a SHA-256 for each client version, have `install.sh` and `update` check it, and sign releases once there's a release pipeline. |
+| **Client distribution integrity** | The hub serves the client to every user's machine (`/install/backchannel.tgz`, later `install.sh` and `backchannel update`). Anyone who controls the hub or the Railway account controls those machines. Turn on 2FA for Railway and GitHub and limit who can deploy. Publish a SHA-256 for each client version **somewhere the hub doesn't control** (GitHub releases or the repo): checksums served by the hub prove nothing when the hub is the thing that's compromised. `install.sh` and `update` check against that source. Sign releases once there's a release pipeline. |
 | **External review** | Before marketing, get a security review of the hub, the connector and the MCP server from someone outside the project. Serve `/.well-known/security.txt` with a contact for reporting vulnerabilities, and add `docs/security.md` (Phase 7 #6) describing the trust model honestly: what a teammate's agent can and can't make yours do. |
 
 ### Operations
@@ -144,7 +162,7 @@ and 2 plus this phase. Phases 4 to 6 (roles, board, memory) come after launch: w
 | Item | Detail |
 |---|---|
 | **Off-site backups** | Today's backups are daily copies, 7 kept, on the same 5 GB volume as the database. They don't survive losing the volume, and with files allowed up to 1 GB per team, a few active teams fill it. Upload each backup to S3-compatible storage (R2 or S3, with credentials in env and the upload done in plain `fetch`, so still no dependencies). Lower `TEAM_FILES_MB` for the hosted hub. Run a restore drill and write it down. |
-| **Acknowledged delivery (from Phase 7 #1)** | A connector that crashes after taking a message loses it, and users will read that as flakiness. Taking a message leases it, and posting the reply or an `ack` releases it. An expired lease puts the message back. |
+| **Acknowledged delivery** | Moved into Phase 0, alongside the inbox change for "Mark as done". Still required for launch. |
 | **Monitoring** | Check that `SENTRY_DSN` is set in production. Add an external uptime check on `/readyz`, alerts to email or phone, and a public status page. |
 | **Know the ceiling** | One process and one SQLite file. Load-test with `scripts/seed.js` data (teams, threads, open streams and long polls) to find where it degrades, and write the numbers in `docs/run-a-hub.md`. Phase 0 removes the full-table scan in `threadSummaries`. |
 
@@ -153,8 +171,8 @@ and 2 plus this phase. Phases 4 to 6 (roles, board, memory) come after launch: w
 | Item | Detail |
 |---|---|
 | **Email on accounts** | Optional at first, required for new accounts on the hosted hub. Used for account recovery (today an identity is a handle plus a token, so someone who loses every signed-in computer and browser is locked out), sign-in links, and notifications. Sent through an HTTP email API, with no SDK. |
-| **Self-serve start** | Today an account exists only through an invite. Pick one: a waitlist where we send invites (enough for a closed beta), or "Create a workspace" with email. |
-| **Handles across companies** | Handles are unique across the whole hub, so companies sharing a hub compete for `@alex`. Either scope handles to a team (a larger change: agents, routing and the CLI assume global handles), or keep them global with a clear "taken" message and suggestions. Decide before there are many users. |
+| **Self-serve start** | Decided: a waitlist where we send invites, enough for the closed beta. "Create a workspace" with email comes after the beta. |
+| **Handles across companies** | Decided: handles stay global. When a handle is taken, say so clearly and suggest free ones (`alex-acme`, `alexk`). |
 | **Deletion and export** | A person can delete their account (their messages stay, attributed to "deleted user"). A team owner can delete the team and all its data, including files and backups after they rotate out. A team owner can export the team's messages and files. |
 | **Retention (from Phase 7 #5)** | A per-team retention setting for messages and files, with a sensible default on the hosted hub. |
 
@@ -166,14 +184,13 @@ and 2 plus this phase. Phases 4 to 6 (roles, board, memory) come after launch: w
 | **Terms, privacy, DPA** | Terms of service, a privacy policy, and a data processing agreement for companies. Say where data lives (Railway, `sfo`) and list subprocessors (Railway, Sentry, the email provider). Say that the hub never calls an LLM, and that each person's own Claude Code or Codex does. |
 | **AI vendor terms** | A connector uses its owner's `claude` or `codex` subscription to answer other people's requests. Check that Anthropic's and OpenAI's terms allow this for each plan type, and say in the docs that each owner needs a plan that does. |
 | **Name and identifiers** | Check whether anyone holds a trademark on "Backchannel". The MCP server still calls itself `agent-network` (`serverInfo` in `mcp.js`), and so does the agent card's `protocolVersion`. |
-| **Activation funnel** | Count each step on the hub (no third-party analytics): invite opened, account created, computer signed in, session connected, first delegation, first answer. Add a small owner-only view or a CLI report. It shows where Phase 2 still loses people. |
 | **Support** | A support address or channel, linked from the UI and the docs. |
 
-### Open launch question
+### Settled launch question
 
-**One shared hub, or a hub per team?** A shared hosted hub makes everything under Accounts and data, and under Legal,
-required before launch. Self-hosting makes the installer, upgrades and signed releases the main work, and most of
-Accounts and data can wait. This decides the order inside Phase L.
+**One shared hub, or a hub per team?** A shared hub, as a closed beta (decided 2026-10-08). That keeps terms, privacy
+and deletion on the launch list; open sign-up and required email wait until after the beta. Self-hosting stays
+documented, and signed releases matter for both.
 
 ## Phase 3: Guardrails and approvals on the web
 
@@ -396,17 +413,18 @@ Production runs schema v3. Every deploy in this plan migrates forward at startup
 
 | Phase | Size | Depends on |
 |---|---|---|
+| L0 Security fixes | S | |
 | 0 Foundations | M | |
 | 1 UI fixes and Mark as done | M | 0 |
 | 2 Installation | M | 0 |
-| L Launch readiness | L | 0, 2 (its requesters and approvals are the first slice of 3) |
+| L Launch readiness (rest) | L | 0, 2 (its requesters and approvals are the first slice of 3) |
 | 3 Guardrails and web approvals | L | 0 (and the background connector in 2), L |
 | 4 Roles and discovery | M | 3 (a role's policy is a level) |
 | 5 Task board | L | 3, 4 |
 | 6 Context and memory | M | 4 (role scope), 5 (task summaries) |
 | 7 Polish | S each | |
 
-Phases 1 and 2 touch different files and can run in parallel, for example with one track going to Codex as in v2.
+L0 ships to production first, on its own branch. Phases 1 and 2 touch different files and can run in parallel, for example with one track going to Codex as in v2.
 Launch comes after Phases 0, 1, 2 and L. Phase 3 then builds the policy system on the defaults L hardcoded.
 Phase 3 goes before the board, because connectors that pick up work must not exist without `tasks.canClaim` and approvals.
 
@@ -417,3 +435,5 @@ Phase 3 goes before the board, because connectors that pick up work must not exi
 3. **Installer:** `curl … | sh` (and `irm … | iex` on Windows) is the main path. npm stays as a fallback.
 4. **beads interop** (JSONL import and export): later, not in Phase 5.
 5. **Auto pick-up:** off for every agent until its owner turns it on (`tasks.autoPickUp` defaults to `false` at every level).
+6. **Launch shape:** a closed beta on the shared hub, with invites and a waitlist (2026-10-08).
+7. **Handles:** global across the hub, with suggestions when one is taken (2026-10-08).
