@@ -1,6 +1,6 @@
 # Backchannel v3: orchestration
 
-> **Status: plan approved, not started.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
+> **Status: plan approved. Phase L0 shipped 2026-10-08 (v0.3.1); the rest not started.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
 > 375 px), the hub, the clients, and [beads](https://github.com/gastownhall/beads).
 > Phase L (launch readiness) was added on 2026-10-07 after a security and operations review. It lists what must be
 > done before marketing to real users. On 2026-10-08 we chose a **closed beta on the shared hub** with **global
@@ -139,10 +139,25 @@ Phase L runs as three tracks, so the non-code work never blocks the code:
 
 | Track | Owner | Contents |
 |---|---|---|
-| **L0. Security fixes** | Claude | The first four rows of *Security* below. Small, independent of Phase 0, and production already has users, so they ship to production first. |
+| **L0. Security fixes** | Claude | The first four rows of *Security* below. Small, independent of Phase 0, and production already has users, so they ship to production first. **Shipped 2026-10-08 as v0.3.1** (107552b); see the notes after this table. |
 | **Engineering** | Claude / Codex | The rest of *Security*, *Operations*. |
 | **Product** | Claude | *Accounts and data*, scoped to the closed beta. |
 | **Business** | Filip | *Legal and launch basics*, except the activation funnel (moved to Phase 2). Runs alongside the others. |
+
+**What L0 shipped, and what's left from it:**
+- `safety.js` (in the client package) quotes other agents' messages as data in `check_inbox`, `ask_agent`, the inbox
+  hook and connector prompts; removes secrets from outgoing replies; refuses credential files as attachments; and gives
+  Claude Code connectors deny rules for `.env` files, keys, `~/.ssh`, `~/.aws` and similar.
+- Codex's `read-only` sandbox **was tested and does read outside its folder** (it printed a file from another directory
+  and the repo's `.env`). Codex connectors now say so in their description, at startup and on their profile. A real
+  control (for example a sandbox profile that limits reads) is still open.
+- The Claude Code deny rules couldn't be run end to end on the build machine (`claude -p` reported no credit). Claude
+  accepts the settings, but one manual check on a working `claude -p` is still needed.
+- `--write --no-approve` needs `--i-trust-this-team`; write connectors print who can reach them; the UI shows
+  "Edits without approval".
+- `AGENT_REQUESTS_PER_HOUR` (default 30) per person per agent. Answers back to the agent that asked don't count.
+- **Clients only get this when they reinstall** (run the setup command again). Agent profiles show the client version:
+  anything older than 0.3.1 lacks the client-side fixes. The hub-side quota and UI apply to everyone already.
 
 ### Security
 
@@ -164,6 +179,7 @@ Phase L runs as three tracks, so the non-code work never blocks the code:
 | **Off-site backups** | Today's backups are daily copies, 7 kept, on the same 5 GB volume as the database. They don't survive losing the volume, and with files allowed up to 1 GB per team, a few active teams fill it. Upload each backup to S3-compatible storage (R2 or S3, with credentials in env and the upload done in plain `fetch`, so still no dependencies). Lower `TEAM_FILES_MB` for the hosted hub. Run a restore drill and write it down. |
 | **Acknowledged delivery** | Moved into Phase 0, alongside the inbox change for "Mark as done". Still required for launch. |
 | **Monitoring** | Check that `SENTRY_DSN` is set in production. Add an external uptime check on `/readyz`, alerts to email or phone, and a public status page. |
+| **Railway config** | Railway deprecates `railway.json` (Config as Code) on 2026-12-01. Move its settings into `.railway/railway.ts`, which already defines the service and volume (`railway config migrate`). |
 | **Know the ceiling** | One process and one SQLite file. Load-test with `scripts/seed.js` data (teams, threads, open streams and long polls) to find where it degrades, and write the numbers in `docs/run-a-hub.md`. Phase 0 removes the full-table scan in `threadSummaries`. |
 
 ### Accounts and data
