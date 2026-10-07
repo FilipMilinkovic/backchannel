@@ -13,6 +13,7 @@ import { startHub, query, prefix, delay, tempDir, ROOT } from './helpers.js';
 import { loadConfig } from '../server/config.js';
 import { openDb } from '../server/db.js';
 import { backupIfDue } from '../server/backup.js';
+import { CLIENT_FILES } from '../server/bundle.js';
 
 // Opens an SSE stream; resolves with { res, events, ended } once the hello event arrived.
 function openStream(url) {
@@ -269,4 +270,12 @@ test('setup-link and backup commands; a backup restores as a working hub', async
   assert.equal(cli('backup', file).status, 1, 'never overwrites');
   const restored = await startHub(t, (dir) => fs.copyFileSync(file, path.join(dir, 'backchannel.db')));
   assert.equal((await restored.ok(prefix(owner) + '/messages', owner.token))[0].text, 'keep me');
+});
+
+test('the Docker image contains every file the client package ships', () => {
+  const dockerfile = fs.readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+  const copied = dockerfile.split('\n').filter((l) => l.startsWith('COPY ')).flatMap((l) => l.split(/\s+/).slice(1, -1));
+  for (const f of CLIENT_FILES.filter((f) => fs.existsSync(path.join(ROOT, f)) && f !== 'LICENSE')) {
+    assert.ok(copied.some((c) => f === c || f.startsWith(c.replace(/\/?$/, '/'))), `${f} is missing from the Dockerfile, so installs from a deployed hub would lack it`);
+  }
 });
