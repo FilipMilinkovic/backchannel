@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
-export const CLIENT_FILES = ['bin/backchannel.js', 'cli.js', 'client.js', 'agent.js', 'backends.js', 'mcp.js', 'hooks/inbox-hook.js', 'AGENT_INSTRUCTIONS.md', 'LICENSE'];
+export const CLIENT_FILES = ['bin/backchannel.js', 'cli.js', 'client.js', 'agent.js', 'backends.js', 'mcp.js', 'setup.js', 'hooks/inbox-hook.js', 'AGENT_INSTRUCTIONS.md', 'LICENSE'];
 
 function header(name, size, mtime) {
   const h = Buffer.alloc(512);

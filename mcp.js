@@ -46,7 +46,7 @@ hub.listen(
 
 // Tools need a resolved team. Resolve lazily so a hub that starts after us still works.
 async function ensureTeam() {
-  if (fatal) throw Object.assign(new Error(`${fatal}. Check HUB_TOKEN and HUB_TEAM in this MCP server's config`), { status: 401 });
+  if (fatal) throw Object.assign(new Error(`Backchannel isn't connected: ${fatal}. Tell the user to run \`backchannel doctor\` in a terminal, then restart this session`), { status: 401 });
   if (!hub.team) await hub.resolveTeam();
 }
 

@@ -257,6 +257,9 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
 .actions { display: flex; gap: 4px; justify-content: flex-end; }
 
 /* ---------- connect ---------- */
+.manual { margin-top: 14px; }
+.manual > summary { cursor: pointer; color: var(--ink-2); font-size: var(--text-sm); padding: 4px 0; }
+.manual[open] > summary { margin-bottom: 12px; }
 .connect { max-width: 760px; padding: 8px 28px 64px; }
 .block { padding: 28px 0; border-bottom: 1px solid var(--line); }
 .block:last-child { border-bottom: 0; }
@@ -476,13 +479,11 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
 
         <section class="block" aria-labelledby="setupH">
           <h2 id="setupH">Set up a computer</h2>
-          <p>Once on each computer that runs an agent or a coding session. Needs Node.js 22.13 or newer. Nothing to clone: the hub serves the client.</p>
-          <div class="code-label"><span>1. Install the <span class="mono">backchannel</span> command</span></div>
-          <div class="code"><pre id="installCmd"></pre><button class="btn" type="button" data-copy="installCmd">Copy</button></div>
-          <div class="code-label"><span>2. Sign it in as you</span></div>
+          <p>Run one command in a terminal on each computer you work on. It installs the <span class="mono">backchannel</span> command, signs the computer in as you, and connects Claude Code and Codex if they're installed. Needs Node.js 22.13 or newer.</p>
+          <button class="btn primary" type="button" data-action="login-link" id="loginLinkBtn">Create setup command</button>
           <div class="code" id="loginBox" hidden><pre id="loginCmd"></pre><button class="btn" type="button" data-copy="loginCmd">Copy</button></div>
-          <button class="btn" type="button" data-action="login-link" id="loginLinkBtn">Create sign-in command</button>
-          <div class="help" id="loginMsg" role="status">The command works once, within 10 minutes. Each computer gets its own sign-in, and the commands below need no token.</div>
+          <div class="help" id="loginMsg" role="status">The command contains a one-time sign-in link: it works once, within 10 minutes, and no token is copied around.</div>
+          <div class="callout" id="setupNote" hidden><span>Then <b>restart open Claude Code and Codex sessions</b>; they connect when they start. Something not working? Run <span class="mono">backchannel doctor</span>.</span></div>
         </section>
 
         <section class="block" aria-labelledby="reachH">
@@ -511,18 +512,21 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
 
         <section class="block" aria-labelledby="delegH">
           <h2 id="delegH">Delegate from your coding agent</h2>
-          <p>Adds <span class="mono">list_agents</span>, <span class="mono">ask_agent</span> and <span class="mono">check_inbox</span> tools to your session. When your agent needs something from a teammate, it asks their agent and gets the answer back mid-task.</p>
-          <div class="grid-form" style="grid-template-columns:repeat(auto-fit,minmax(200px,280px))">
-            <div><label class="label" for="mHandle">Session handle</label><input class="input mono" id="mHandle" placeholder="filip" autocomplete="off" spellcheck="false"></div>
-            <div><label class="label" for="mOwner">Your name</label><input class="input" id="mOwner" placeholder="Filip" autocomplete="off"></div>
-          </div>
-          <div class="seg tabs" role="group" aria-label="Coding agent" id="mTabs">
-            <button type="button" data-tool="claude" aria-pressed="true">Claude Code</button>
-            <button type="button" data-tool="codex" aria-pressed="false">Codex</button>
-          </div>
-          <div class="code-label"><span id="mWhere">Run once in your terminal</span></div>
-          <div class="code"><pre id="mCmd"></pre><button class="btn" type="button" data-copy="mCmd">Copy</button></div>
-          <div class="callout" id="mNote"></div>
+          <p>Adds <span class="mono">list_agents</span>, <span class="mono">ask_agent</span>, <span class="mono">check_inbox</span> and <span class="mono">reply</span> tools to your Claude Code and Codex sessions, so your agent can ask teammates' agents mid-task. The setup command above does this for you; installed one of them later? Run <span class="mono">backchannel setup</span>.</p>
+          <details class="manual">
+            <summary>Set it up by hand</summary>
+            <div class="grid-form" style="grid-template-columns:repeat(auto-fit,minmax(200px,280px))">
+              <div><label class="label" for="mHandle">Session handle</label><input class="input mono" id="mHandle" placeholder="filip" autocomplete="off" spellcheck="false"></div>
+              <div><label class="label" for="mOwner">Your name</label><input class="input" id="mOwner" placeholder="Filip" autocomplete="off"></div>
+            </div>
+            <div class="seg tabs" role="group" aria-label="Coding agent" id="mTabs">
+              <button type="button" data-tool="claude" aria-pressed="true">Claude Code</button>
+              <button type="button" data-tool="codex" aria-pressed="false">Codex</button>
+            </div>
+            <div class="code-label"><span id="mWhere">Run once in your terminal</span></div>
+            <div class="code"><pre id="mCmd"></pre><button class="btn" type="button" data-copy="mCmd">Copy</button></div>
+            <div class="callout" id="mNote"></div>
+          </details>
         </section>
 
         <section class="block" aria-labelledby="tokenH">
@@ -905,9 +909,9 @@ async function createLoginCommand(btn) {
   btn.disabled = true;
   try {
     const { url, expiresInSeconds } = await api('/api/me/login-link', { method: 'POST', body: JSON.stringify({ expiresInSeconds: 600 }) });
-    setCmd('loginCmd', `backchannel login '${url}'`);
-    $('loginBox').hidden = false;
-    btn.textContent = 'Create another';
+    setCmd('loginCmd', `npm install -g ${location.origin}/install/backchannel.tgz && \\\n  backchannel login '${url}'`);
+    $('loginBox').hidden = false; $('setupNote').hidden = false;
+    btn.textContent = 'Create another'; btn.classList.remove('primary');
     $('loginMsg').textContent = `Works once, until ${new Date(Date.now() + expiresInSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Each computer gets its own sign-in.`;
   } catch (err) { $('loginMsg').textContent = `Couldn't create it: ${err.message}`; }
   finally { btn.disabled = false; }
@@ -922,7 +926,6 @@ function renderConnect() {
   $('hopsInput').disabled = !isOwner(); $('hopsSave').hidden = !isOwner(); $('hopsOwnerOnly').hidden = isOwner();
   $('tokenShown').textContent = tokenRevealed ? S.token : masked();
   $('revealBtn').textContent = tokenRevealed ? 'Hide' : 'Show';
-  setCmd('installCmd', `npm install -g ${location.origin}/install/backchannel.tgz`);
   buildConnector(); buildMcp();
 }
 
@@ -972,13 +975,13 @@ function buildMcp() {
   document.querySelectorAll('#mTabs button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.tool === mcpTool)));
   if (mcpTool === 'claude') {
     $('mWhere').textContent = 'Run once in your terminal';
-    setCmd('mCmd', `claude mcp add backchannel --scope user \\\n  -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)}${teamArg((t) => ` -e HUB_TEAM=${t}`)} \\\n  -- backchannel mcp`);
-    $('mNote').innerHTML = '<span>Then just work. Your agent asks teammates’ agents when it needs something from them.</span>';
+    setCmd('mCmd', `claude mcp remove backchannel --scope user 2>/dev/null; \\\n  claude mcp add backchannel --scope user \\\n  -e AGENT_ID=${shq(handle)} -e AGENT_OWNER=${shq(owner)}${teamArg((t) => ` -e HUB_TEAM=${t}`)} \\\n  -- backchannel mcp`);
+    $('mNote').innerHTML = '<span>Then restart open sessions and just work. Your agent asks teammates’ agents when it needs something from them.</span>';
   } else {
     $('mWhere').textContent = 'Add to ~/.codex/config.toml';
     const toml = (s) => JSON.stringify(String(s));
     setCmd('mCmd', `[mcp_servers.backchannel]\ncommand = "backchannel"\nargs = ["mcp"]\ntool_timeout_sec = 600\n\n[mcp_servers.backchannel.env]\nAGENT_KIND = "codex"\nAGENT_ID = ${toml(handle)}\nAGENT_OWNER = ${toml(owner)}${teamArg((t) => `\nHUB_TEAM = "${t}"`)}`);
-    $('mNote').innerHTML = '<span><b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
+    $('mNote').innerHTML = '<span>Replace any existing <b>[mcp_servers.backchannel]</b> tables. <b>tool_timeout_sec</b> gives other agents up to 10 minutes to reply.</span>';
   }
   store.set('bc.mcp', JSON.stringify({ h: $('mHandle').value, o: $('mOwner').value }));
 }

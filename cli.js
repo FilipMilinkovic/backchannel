@@ -9,6 +9,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { spawn } from 'node:child_process';
 import { Hub, CONFIG_FILE as CONFIG, loadConfig } from './client.js';
+import { setupAgents, doctor } from './setup.js';
 function saveConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2), { mode: 0o600 });
@@ -20,7 +21,7 @@ const { values: opt, positionals: [cmd, ...args] } = parseArgs({
     hub: { type: 'string' }, team: { type: 'string' }, handle: { type: 'string' }, name: { type: 'string' },
     as: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
-    print: { type: 'boolean', default: false },
+    print: { type: 'boolean', default: false }, 'skip-agents': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -32,6 +33,12 @@ const hub = new Hub(hubUrl, process.env.HUB_TOKEN || cfg.token, opt.team || proc
 const BIN = /backchannel(\.js)?$/.test(process.argv[1] || '') ? 'backchannel' : 'node cli.js';
 const die = (msg) => { console.error(msg); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function connectAgents(saved, force = false) {
+  if (opt['skip-agents'] && !force) return console.log(`Skipped Claude Code and Codex. Connect them later with: ${BIN} setup`);
+  console.log('\nConnecting your coding agents:');
+  setupAgents(saved);
+}
 
 const commands = {
   async join() {
@@ -49,13 +56,15 @@ const commands = {
       name: opt.name || opt.handle || os.userInfo().username,
     };
     const res = await joiner.req('POST', `/api/invites/${code}/accept`, body);
-    saveConfig({ ...cfg, hub: base, token: res.token || joiner.token, team: res.team.id, handle: res.user.handle, name: res.user.name });
+    const saved = { ...cfg, hub: base, token: res.token || joiner.token, team: res.team.id, handle: res.user.handle, name: res.user.name };
+    saveConfig(saved);
     console.log(`Joined "${res.team.name}" as @${res.user.handle}. Saved to ${CONFIG}.`);
     if (res.token) {
       // Tokens stay out of terminal output (and logs, transcripts) unless asked for.
       console.log(`Your personal token is saved there; connectors and MCP servers on this machine use it automatically.`);
       console.log(opt['show-token'] ? `\n  ${res.token}` : `For another machine, print it with: ${BIN} token`);
     }
+    connectAgents(saved);
   },
 
   // Signs this computer in with a one-time link from the Connect page. It gets its own credential,
@@ -69,10 +78,23 @@ const commands = {
     const me = await new Hub(base, res.token).req('GET', '/api/me');
     const keepTeam = cfg.hub === base && me.teams.some((t) => t.id === cfg.team);
     const team = keepTeam ? cfg.team : me.teams.length === 1 ? me.teams[0].id : undefined;
-    saveConfig({ ...cfg, hub: base, token: res.token, team, handle: me.user.handle, name: me.user.name });
+    const saved = { ...cfg, hub: base, token: res.token, team, handle: me.user.handle, name: me.user.name };
+    saveConfig(saved);
     console.log(`Signed in as @${me.user.handle} on ${base}. Saved to ${CONFIG}.`);
     if (!team && me.teams.length > 1) console.log(`You're in several teams; pick one with: ${BIN} use <team>`);
-    console.log(`Connectors and MCP servers on this computer now use it automatically.`);
+    connectAgents(saved);
+  },
+
+  // Points Claude Code and Codex at this hub (login and join do this too). Run it after installing one of them.
+  async setup() {
+    if (!cfg.token) die(`This computer isn't signed in yet. Create a sign-in command on your hub's Connect page and run it.`);
+    const me = await hub.req('GET', '/api/me');
+    console.log(`Signed in as @${me.user.handle} on ${hub.url}.`);
+    connectAgents(cfg, true);
+  },
+
+  async doctor() {
+    process.exitCode = (await doctor(hub, { ...cfg, hub: hubUrl })) ? 1 : 0;
   },
 
   async whoami() {
@@ -183,8 +205,11 @@ if (!cmd || opt.help || !commands[cmd]) {
 ` : '';
   console.log(`Backchannel CLI
 
-  join <invite-link>          Join a team (creates your account on first use; --show-token)
-  login <sign-in-link>        Sign this computer in (create the link on the Connect page)
+  join <invite-link>          Join a team and connect your coding agents (--show-token, --skip-agents)
+  login <sign-in-link>        Sign this computer in and connect Claude Code and Codex to the hub
+                              (create the link on the Connect page; --skip-agents to only sign in)
+  setup                       Connect Claude Code and Codex to the hub you're signed in to
+  doctor                      Check the hub, your sign-in, and Claude Code and Codex
   whoami / teams              Show your account and teams
   use <team>                  Set your default team
   agents                      List agents in the team
@@ -200,4 +225,7 @@ Config: ${CONFIG} (HUB_URL, HUB_TOKEN, HUB_TEAM override it)`);
 }
 
 try { await commands[cmd](); }
-catch (err) { die(`${err.message}${err.cause?.code === 'ECONNREFUSED' || err.message === 'fetch failed' ? ` (is the hub running at ${hubUrl}?)` : ''}`); }
+catch (err) {
+  const unreachable = err.cause?.code === 'ECONNREFUSED' || err.message === 'fetch failed';
+  die(`${err.message}${unreachable ? ` (is the hub running at ${hubUrl}?)` : ''}${err.status === 401 ? `\nYour sign-in for ${hubUrl} doesn't work. Create a new sign-in command on its Connect page and run it.` : ''}`);
+}

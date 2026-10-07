@@ -38,7 +38,11 @@ export class Hub {
 
   // Picks the team: the configured one, or the user's only team. Call once before team-scoped calls.
   async resolveTeam() {
-    if (!this.token) throw Object.assign(new Error(`no token for ${this.url}. Join a team first (node cli.js join <invite-link>), or set HUB_TOKEN.`), { status: 401 });
+    if (!this.token) {
+      const cfg = loadConfig();
+      const elsewhere = cfg.hub && cfg.hub.replace(/\/$/, '') !== this.url ? ` (this computer is signed in to ${cfg.hub}; HUB_URL may be pointing somewhere else)` : '';
+      throw Object.assign(new Error(`not signed in to ${this.url}${elsewhere}. Run \`backchannel doctor\` in a terminal for the fix`), { status: 401 });
+    }
     const me = await this.req('GET', '/api/me');
     if (this.team) {
       const t = me.teams.find((x) => x.id === this.team || x.name.toLowerCase() === String(this.team).toLowerCase());

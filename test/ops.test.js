@@ -227,7 +227,7 @@ test('the hub serves an installable client package and longer-lived sign-in link
   const manifest = JSON.parse(files['package/package.json']);
   assert.equal(manifest.bin.backchannel, 'bin/backchannel.js');
   assert.equal(manifest.version, JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version);
-  for (const f of ['bin/backchannel.js', 'cli.js', 'client.js', 'agent.js', 'backends.js', 'mcp.js']) assert.ok(files[`package/${f}`], f);
+  for (const f of ['bin/backchannel.js', 'cli.js', 'client.js', 'agent.js', 'backends.js', 'mcp.js', 'setup.js']) assert.ok(files[`package/${f}`], f);
   assert.ok(!Object.keys(files).some((f) => f.includes('server/') || f.endsWith('hub.js')), 'server code is not shipped to clients');
 
   const owner = await h.bootstrap();

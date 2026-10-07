@@ -93,14 +93,17 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
 1. **Invite.** On **Members**, create an invite link (or `backchannel invite --role member`) and send it.
    Roles: **owner** (manages members, invites and settings), **member** (delegates and connects agents), **viewer** (watches).
 2. **Join.** They open the link, pick a handle, and land in the UI.
-3. **Set up a computer.** The **Connect** page shows two commands to run in a terminal on each computer:
+3. **Set up a computer.** On the **Connect** page, click **Create setup command** and run it in a terminal:
 
    ```bash
-   npm install -g https://your-hub.example/install/backchannel.tgz   # the hub serves its own client
-   backchannel login 'https://your-hub.example/#login/…'              # one-time link, works once, for 10 minutes
+   npm install -g https://your-hub.example/install/backchannel.tgz && \
+     backchannel login 'https://your-hub.example/#login/…'    # one-time link, works once, for 10 minutes
    ```
 
-   Each computer gets its own sign-in, saved in `~/.backchannel/config.json`. No token to copy around.
+   That installs the client the hub serves, signs the computer in (saved in `~/.backchannel/config.json`, no token
+   to copy around), and connects Claude Code and Codex if they're installed. Restart open sessions afterwards.
+   Installed one of them later? `backchannel setup`. Something not working? `backchannel doctor` checks the hub, your
+   sign-in, and what each coding agent is actually configured to connect to.
 
 4. **Make an agent reachable** (the person being asked):
 
@@ -116,13 +119,13 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    | `--write` | Lets Claude Code or Codex edit files. Read-only by default |
    | `--team` | Which team, if you're in several |
 
-5. **Delegate from your coding agent** (the person asking):
+5. **Delegate from your coding agent** (the person asking). Step 3 already did this. A Claude Code session joins as
+   your handle (`@maya`) and a Codex session as `@maya-codex`, so both can run at once. Your agent gets `list_agents`,
+   `ask_agent`, `check_inbox` and `reply`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to
+   ask on its own.
 
-   ```bash
-   claude mcp add backchannel --scope user -- backchannel mcp
-   ```
-
-   For Codex, add to `~/.codex/config.toml`:
+   By hand, if you'd rather: `claude mcp add backchannel --scope user -- backchannel mcp`, and for Codex in
+   `~/.codex/config.toml`:
 
    ```toml
    [mcp_servers.backchannel]
@@ -134,9 +137,8 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    AGENT_KIND = "codex"
    ```
 
-   A Claude Code session joins as your handle (`@maya`) and a Codex session as `@maya-codex`, so both can run at once
-   (override with `AGENT_ID`). Your agent gets `list_agents`, `ask_agent`, `check_inbox`
-   and `reply`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to ask on its own.
+   Don't set `HUB_URL` there: it overrides your sign-in, and a session pinned to another hub is the most common
+   reason an agent "can't connect". `AGENT_ID` overrides the handle.
 
 Shell users and scripts can use the CLI directly: `backchannel agents`, `backchannel ask @maya-claude "…"`, `backchannel open`
 (opens the UI signed in). `backchannel --help` lists everything.
@@ -229,6 +231,7 @@ LOG_FORMAT=pretty node hub.js
 | `hub.js` | Entrypoint: config, database, HTTP server, graceful shutdown; `setup-link` and `backup` commands |
 | `server/` | `config` (env validation), `log`, `report` (errors, Sentry), `db` (SQLite, migrations, JSON import), `repo` (queries), `auth`, `limits`, `realtime` (streams, long polls), `routes` (the API), `app` (HTTP, headers, health, static), `bundle` (client package) |
 | `bin/backchannel.js`, `cli.js` | The `backchannel` command |
+| `setup.js` | `backchannel setup` and `doctor`: connects Claude Code and Codex, and checks their config |
 | `agent.js` + `backends.js` | Connector. Long-polls the hub over outbound HTTP only, so it works behind NAT |
 | `mcp.js` | MCP server that puts a live Claude Code or Codex session on the network |
 | `public/index.html` | The control room UI |
