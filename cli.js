@@ -94,7 +94,7 @@ const commands = {
   },
 
   async doctor() {
-    process.exitCode = (await doctor(hub, { ...cfg, hub: hubUrl })) ? 1 : 0;
+    process.exitCode = (await doctor(hub, { ...cfg, hub: opt.hub || process.env.HUB_URL || cfg.hub, token: hub.token })) ? 1 : 0;
   },
 
   async whoami() {

@@ -148,14 +148,14 @@ export async function doctor(hub, cfg, log = console.log) {
   const fail = (m, fix) => { bad++; log(`  ✗ ${m}${fix ? `\n      → ${fix}` : ''}`); };
   log(`Backchannel doctor (client in ${tilde(path.dirname(BIN).replace(/\/bin$/, ''))})\n`);
 
-  if (!cfg.hub) fail('This computer isn\'t signed in to a hub', "Create a sign-in command on your hub's Connect page and run it");
+  if (!cfg.hub || !cfg.token) fail(`This computer isn't signed in${cfg.hub ? ` to ${cfg.hub}` : ' to a hub'}`, "On your hub's Connect page, click Create setup command and run it");
   else {
     // Any HTTP answer means it's reachable; hubs older than 0.2 have no /healthz.
     const up = await fetch(new URL('/healthz', cfg.hub))
       .then(async (r) => ({ ok: r.status < 500, version: (await r.json().catch(() => ({}))).version }))
       .catch((e) => ({ error: e.cause?.code || e.message }));
     if (!up.ok) fail(`Can't reach ${cfg.hub} (${up.error || 'not healthy'})`, sameHub(cfg.hub, 'http://127.0.0.1:7777') ? 'Start the local hub with node hub.js, or sign in to your team\'s hub' : 'Check the address and your network');
-    else ok(`This computer is signed in to ${cfg.hub}${up.version ? ` (hub v${up.version})` : ''}`);
+    else ok(`Hub ${cfg.hub} is reachable${up.version ? ` (v${up.version})` : ''}`);
     if (up.ok) {
       try {
         const me = await hub.resolveTeam();
