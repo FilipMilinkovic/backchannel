@@ -203,7 +203,67 @@ test('disconnected polls preserve later messages and removed agents wake pending
   const pending = h.api(p + '/agents/worker/inbox?wait=30', owner.token);
   await delay(30);
   await h.ok(p + '/agents/worker', owner.token, 'DELETE');
-  assert.equal((await pending).status, 404);
+  assert.equal((await pending).status, 410, 'a disconnected agent is told to stop, not to register again');
+});
+
+test('disconnect stops the running process; a fresh start reconnects', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  const bob = await h.join(owner, 'member', 'bob');
+  const p = prefix(owner);
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobbot' });
+  await h.ok(p + '/agents', owner.token, 'POST', { id: 'mine' });
+  // Members can only disconnect their own agents; owners can disconnect anyone's.
+  assert.equal((await h.api(p + '/agents/mine', bob.token, 'DELETE')).status, 403);
+  await h.ok(p + '/agents/bobbot', owner.token, 'DELETE');
+  const gone = await h.api(p + '/agents/bobbot/inbox', bob.token);
+  assert.equal(gone.status, 410);
+  assert.match(gone.body.error, /disconnected from this team by alice\. Start it again/);
+  for (const [method, route, body] of [['POST', '/agents/bobbot/status', { state: 'idle' }], ['POST', '/messages', { from: 'bobbot', text: 'hi' }]]) {
+    assert.equal((await h.api(p + route, bob.token, method, body)).status, 410, route);
+  }
+  // The process that was connected re-registers with resume: it stays stopped, even across a hub restart.
+  await h.restart();
+  assert.equal((await h.api(p + '/agents', bob.token, 'POST', { id: 'bobbot', resume: true })).status, 410);
+  assert.ok(!(await h.ok(p + '/agents', bob.token)).some((a) => a.id === 'bobbot'));
+  // Starting it again is a fresh registration and clears the disconnect.
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobbot' });
+  assert.equal((await h.api(p + '/agents/bobbot/inbox', bob.token)).status, 200);
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobbot', resume: true });
+  assert.equal(query(h.dir, 'SELECT count(*) AS n FROM agent_disconnects')[0].n, 0);
+  // Live sessions watch /pending instead of draining /inbox; a disconnect ends that wait the same way.
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobsession', kind: 'session' });
+  const watching = h.api(p + '/agents/bobsession/pending?wait=30', bob.token);
+  await delay(30);
+  await h.ok(p + '/agents/bobsession', bob.token, 'DELETE');
+  assert.equal((await watching).status, 410);
+  assert.equal((await h.api(p + '/agents/bobsession/claim', bob.token, 'POST', { ids: [] })).status, 410);
+  // Unknown agents that were never disconnected are still plain 404s, so connectors re-register after hub data loss.
+  assert.equal((await h.api(p + '/agents/nobody/inbox', bob.token)).status, 404);
+});
+
+test('agent profiles carry repos, machine and approval details without credentials', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  const p = prefix(owner);
+  const before = Date.now();
+  const agent = await h.ok(p + '/agents', owner.token, 'POST', {
+    id: 'coder', backend: 'claude-code', access: 'write', approve: true, workdir: '~/code', host: 'laptop', platform: 'darwin', client: '0.3.0',
+    repos: [
+      { name: 'payments', path: '~/code/payments', remote: 'https://filip:ghp_secret@github.com/acme/payments.git?x=1', branch: 'main' },
+      { name: 'web', remote: 'git@github.com:acme/web.git' }, 'junk', null,
+      ...Array.from({ length: 30 }, (_, i) => ({ name: `r${i}` })),
+    ],
+  });
+  assert.equal(agent.repos.length, 20 - 2, 'at most 20 entries are read, and non-objects are dropped');
+  assert.deepEqual(agent.repos[0], { name: 'payments', path: '~/code/payments', remote: 'https://github.com/acme/payments.git', branch: 'main' });
+  assert.equal(agent.repos[1].remote, 'git@github.com:acme/web.git');
+  assert.equal(agent.approve, true); assert.equal(agent.host, 'laptop'); assert.equal(agent.workdir, '~/code'); assert.equal(agent.client, '0.3.0');
+  assert.ok(agent.connectedAt >= before);
+  assert.ok(!JSON.stringify(query(h.dir, 'SELECT card FROM agents')).includes('ghp_secret'));
+  assert.equal((await h.ok(p + '/agents/coder/card', owner.token))['x-repos'][0].name, 'payments');
+  const old = await h.ok(p + '/agents', owner.token, 'POST', { id: 'old', repo: 'legacy' });
+  assert.deepEqual(old.repos, []); assert.equal(old.approve, null); assert.equal(old.repo, 'legacy');
 });
 
 test('role changes and token rotation terminate outstanding agent polls', async (t) => {
@@ -317,7 +377,7 @@ test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
   const db = openDb(dir);
   const repo = createRepo(db);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   const setup = repo.setupInvite();
   assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);

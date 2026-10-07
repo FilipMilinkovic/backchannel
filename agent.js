@@ -6,7 +6,7 @@ import readline from 'node:readline/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { hubFromEnv, saveFile } from './client.js';
+import { hubFromEnv, saveFile, describeWorkspace, machineInfo } from './client.js';
 import { backends } from './backends.js';
 
 const { values: opt } = parseArgs({
@@ -31,14 +31,17 @@ if (!run) { console.error(`unknown backend "${opt.backend}". Options: ${Object.k
 const id = opt.id.toLowerCase();
 const cwd = path.resolve(opt.cwd.replace(/^~/, process.env.HOME));
 const isCoder = opt.backend === 'claude-code' || opt.backend === 'codex';
-// Built from the owner's name, which may only be known once we've reached the hub.
+// Built from the owner's name, which may only be known once we've reached the hub, and the repos found in the folder.
+let workspace = null;
+const where = () => (workspace?.repos.length > 1 ? `${workspace.repos.length} repos in ${path.basename(cwd)}`
+  : `the ${workspace?.repos[0]?.name || path.basename(cwd)} repo`);
 const describe = (owner) => opt.about || (isCoder
-  ? `${owner ? owner + "'s" : 'A'} ${opt.backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to the ${path.basename(cwd)} repo.`
+  ? `${owner ? owner + "'s" : 'A'} ${opt.backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.`
   : `${owner ? owner + "'s" : 'An'} ${opt.backend} assistant.`);
 let description = describe(opt.owner);
 const hub = hubFromEnv({ url: opt.hub, team: opt.team });
 const card = { id, name: opt.name || id, backend: opt.backend, model: opt.model, owner: opt.owner, description,
-  access: isCoder && opt.write ? 'write' : 'read', repo: isCoder ? path.basename(cwd) : null };
+  access: isCoder && opt.write ? 'write' : 'read', repo: isCoder ? path.basename(cwd) : null, approve: opt.approve, ...machineInfo() };
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
 
 function systemPrompt(agents, sender) {
@@ -150,9 +153,13 @@ console.log(`@${id} (${opt.backend}${isCoder ? ` in ${cwd}` : ''}) connecting to
 try {
   // Fail fast on bad tokens or teams; if the hub is just down, listen() keeps retrying.
   const me = await hub.resolveTeam().catch((err) => { if (err.status) throw err; return null; });
-  if (me && !card.owner) { card.owner = me.user.name || me.user.handle; card.description = description = describe(card.owner); }
+  if (isCoder) Object.assign(card, workspace = await describeWorkspace(cwd));
+  if (me && !card.owner) card.owner = me.user.name || me.user.handle;
+  card.description = description = describe(card.owner);
   await hub.listen(card, handle, (s) => console.log(s));
 } catch (err) {
+  // 410: someone disconnected this agent from the hub's UI or CLI. That's a deliberate stop, not a failure.
+  if (err.status === 410) process.exit(0); // listen() already said who disconnected it
   console.error(`@${id} can't connect: ${err.message}`);
   process.exit(1);
 }

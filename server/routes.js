@@ -1,6 +1,7 @@
 // The hub API (see docs/TEAMS-PLAN.md): accounts, invites, teams, members, agents, messages, threads, live events.
 import crypto from 'node:crypto';
 import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, stillValid, requireRole } from './auth.js';
+import { cleanRemote } from './util.js';
 
 const LOGIN_TTL_MS = 60_000;
 const MAX_ATTACHMENTS = 20;
@@ -36,7 +37,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       url: `${publicUrl()}/api/teams/${a.teamId}/agents/${a.id}`, version: '0.1.0', provider: { organization: a.owner || 'unknown' },
       capabilities: { streaming: false, pushNotifications: false }, defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
       skills: a.skills?.length ? a.skills : [{ id: 'chat', name: 'Chat', description: a.description || 'General conversation' }],
-      'x-backend': a.backend, 'x-handle': `@${a.id}` };
+      'x-backend': a.backend, 'x-handle': `@${a.id}`, 'x-repos': a.repos || [] };
   }
   const ownedBy = (userId) => (key) => {
     const [t, id] = key.split('/');
@@ -56,14 +57,21 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       return true;
     });
   }
-  function removeAgent(teamId, id) { repo.deleteAgent(teamId, id); rt.forget(teamId, id); }
+  function disconnectAgent(teamId, id, userId) { repo.disconnectAgent(teamId, id, userId); rt.forget(teamId, id); }
+  // A missing agent: 410 when someone disconnected it (its process should stop, not register again), otherwise 404.
+  function missingAgent(teamId, id) {
+    const d = repo.disconnected(teamId, id);
+    if (!d) return httpError(404, 'unknown agent');
+    const by = d.byUserId && repo.userById(d.byUserId);
+    return httpError(410, `@${id} was disconnected from this team${by ? ` by ${by.name || by.handle}` : ''}. Start it again to reconnect.`);
+  }
   function validName(name) {
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 200) throw httpError(400, 'name must be 1 to 200 characters');
     return name.trim();
   }
   function ownedAgent(team, user, id) {
     const agent = repo.agent(team.id, id);
-    if (!agent) throw httpError(404, 'unknown agent');
+    if (!agent) throw missingAgent(team.id, id);
     if (agent.ownerUserId !== user.id) throw httpError(403, 'agent belongs to another user');
     return agent;
   }
@@ -145,7 +153,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   }
   // After waiting, the agent, the token and the caller's role must all still hold.
   function recheck({ team, auth, id }, p) {
-    if (rt.currentPresence(team.id, id) !== p || !repo.agent(team.id, id)) throw httpError(404, 'agent was removed');
+    if (!repo.agent(team.id, id)) throw missingAgent(team.id, id);
+    if (rt.currentPresence(team.id, id) !== p) throw httpError(404, 'agent was removed');
     if (!stillValid(repo, auth)) throw httpError(401, 'token was rotated');
     const now = repo.member(team.id, auth.user.id);
     if (!now) throw httpError(404, 'unknown team');
@@ -362,23 +371,31 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       if (!HANDLE.test(id) || id === 'human') throw httpError(400, 'id must be a handle; "human" is reserved');
       const prev = repo.agent(team.id, id);
       if (prev && prev.ownerUserId !== user.id) throw httpError(409, 'agent belongs to another user');
+      // A process that was already connected (resume) stays stopped once disconnected; a fresh start reconnects.
+      if (!prev && b.resume === true && repo.disconnected(team.id, id)) throw missingAgent(team.id, id);
       const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : null);
+      // Repositories the agent works in, for its profile. Remotes lose any credentials before they're stored.
+      const repos = (Array.isArray(b.repos) ? b.repos.slice(0, 20) : []).filter((r) => r && typeof r === 'object')
+        .map((r) => ({ name: str(r.name, 200) || 'repo', path: str(r.path, 500), remote: cleanRemote(str(r.remote, 500)), branch: str(r.branch, 200) }));
       const agent = { id, teamId: team.id, ownerUserId: user.id, name: str(b.name, 200) || id, backend: str(b.backend, 40) || 'unknown',
         model: str(b.model, 100), owner: str(b.owner, 200), description: str(b.description, 2000) || '', kind: b.kind === 'session' ? 'session' : 'agent',
         access: b.access === 'write' ? 'write' : 'read', repo: str(b.repo, 200), skills: Array.isArray(b.skills) ? b.skills.slice(0, 50) : [],
+        repos, workdir: str(b.workdir, 500), host: str(b.host, 100), platform: str(b.platform, 40), client: str(b.client, 40),
+        approve: typeof b.approve === 'boolean' ? b.approve : null, connectedAt: Date.now(),
         registeredAt: prev?.registeredAt || Date.now() };
-      repo.saveAgent(agent);
+      repo.tx(() => { repo.clearDisconnect(team.id, id); repo.saveAgent(agent); });
       rt.presenceOf(team.id, id).lastSeen = Date.now();
       broadcastAgents(team.id);
       return send(res, 200, publicAgent(repo.agent(team.id, id)));
     }
     if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|pending|status|requeue|claim))?$/.exec(rest))) {
       const a = repo.agent(team.id, m[1]);
-      if (!a) throw httpError(404, 'unknown agent');
+      if (!a) throw missingAgent(team.id, m[1]);
+      // Disconnect: removes the agent and stops its connector or live session. Its owner or a team owner can do it.
       if (!m[2] && req.method === 'DELETE') {
         requireRole(member, ['owner', 'member']);
         if (member.role !== 'owner') ownedAgent(team, user, a.id);
-        removeAgent(team.id, a.id); broadcastAgents(team.id);
+        disconnectAgent(team.id, a.id, user.id); broadcastAgents(team.id);
         return send(res, 200, { ok: true });
       }
       if (m[2] === 'card' && req.method === 'GET') return send(res, 200, agentCard(a));

@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 
 // Content types for uploads, by extension. Anything else is sent as application/octet-stream.
 const TYPES = { '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json', '.csv': 'text/csv', '.html': 'text/html',
@@ -35,6 +36,49 @@ export async function saveFile(hub, id, dir) {
   for (let n = 2; fs.existsSync(target); n++) target = path.join(dir, `${stem} (${n})${ext}`);
   fs.writeFileSync(target, data);
   return { path: target, info, data };
+}
+
+// Git remotes are shown to the whole team, so credentials (https://user:token@host/…) and query strings are dropped
+// before they leave this computer. The hub applies the same rule (server/util.js).
+export function cleanRemote(url) {
+  if (!url) return null;
+  const m = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#]*@)?([^?#]*)/i.exec(url);
+  return m ? m[1] + m[2] : url.replace(/^[^@/]*:[^@/]*@/, '');
+}
+
+const tilde = (p) => (p === os.homedir() || p.startsWith(os.homedir() + path.sep) ? '~' + p.slice(os.homedir().length) : p);
+const git = (dir, ...args) => new Promise((resolve) => {
+  execFile('git', args, { cwd: dir, encoding: 'utf8', timeout: 3000 }, (err, out) => resolve(err ? null : out.trim() || null));
+});
+async function gitRepo(dir) {
+  const top = await git(dir, 'rev-parse', '--show-toplevel');
+  if (!top) return null;
+  const [origin, branch] = await Promise.all([git(top, 'remote', 'get-url', 'origin'), git(top, 'rev-parse', '--abbrev-ref', 'HEAD')]);
+  const first = origin ? null : ((await git(top, 'remote')) || '').split('\n')[0];
+  const remote = cleanRemote(origin || (first ? await git(top, 'remote', 'get-url', first) : null));
+  // Named after the remote when there is one, so worktrees and renamed folders still show the real repo.
+  const name = remote?.replace(/\/+$/, '').split(/[/:]/).pop().replace(/\.git$/, '') || path.basename(top);
+  return { name, path: tilde(top), remote, branch: branch === 'HEAD' ? null : branch };
+}
+
+// What an agent working in `dir` can reach, for its profile: the git repo it's in, or the repos directly inside it
+// (a folder like ~/code). Resolves to { workdir, repos } and never rejects.
+export async function describeWorkspace(dir) {
+  const own = await gitRepo(dir);
+  if (own) return { workdir: tilde(dir), repos: [own] };
+  let subs = [];
+  try {
+    subs = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith('.')).slice(0, 200)
+      .map((e) => path.join(dir, e.name)).filter((sub) => fs.existsSync(path.join(sub, '.git'))).slice(0, 20);
+  } catch {}
+  return { workdir: tilde(dir), repos: (await Promise.all(subs.map(gitRepo))).filter(Boolean) };
+}
+
+// Where a connector or session runs, for its profile.
+export function machineInfo() {
+  let client = null;
+  try { client = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || null; } catch {}
+  return { host: os.hostname().split('.')[0], platform: process.platform, client };
 }
 
 export const formatSize = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
@@ -125,16 +169,18 @@ export class Hub {
     return this.#run(card, log, async () => { const r = await this.pending(card.id, after); after = r.cursor; await onUpdate(r.messages); });
   }
 
-  // Re-registers if the hub restarts; backs off if it's down. Stops on auth/permission errors, since retrying can't fix those.
+  // Re-registers if the hub restarts; backs off if it's down. Stops on auth/permission errors, since retrying can't fix those,
+  // and when someone disconnects the agent (410).
   async #run(card, log, step) {
-    let registered = false, backoff = 1000;
+    let registered = false, connected = false, backoff = 1000;
     for (;;) {
       try {
         if (!this.team) await this.resolveTeam();
-        if (!registered) { await this.register(card); registered = true; backoff = 1000; log(`@${card.id} online in team ${this.team}`); }
+        // `resume` tells the hub this process was already connected: if the agent was disconnected meanwhile, stay stopped.
+        if (!registered) { await this.register({ ...card, resume: connected }); registered = connected = true; backoff = 1000; log(`@${card.id} online in team ${this.team}`); }
         await step();
       } catch (err) {
-        if (err.status === 401 || err.status === 403 || err.status === 409) { log(`stopped: ${err.message}`); throw err; }
+        if ([401, 403, 409, 410].includes(err.status)) { log(`stopped: ${err.message}`); throw err; }
         // A 404 while registered means the hub forgot the agent (restart, removal): register again right away.
         if (err.status === 404 && registered) { registered = false; continue; }
         if (registered) log(`hub unreachable (${err.message}), retrying…`);

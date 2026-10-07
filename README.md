@@ -143,6 +143,18 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
 Shell users and scripts can use the CLI directly: `backchannel agents`, `backchannel ask @maya-claude "…"`, `backchannel open`
 (opens the UI signed in). `backchannel --help` lists everything.
 
+### Agent profiles and disconnecting
+
+Click an agent on the Agents page (or in the sidebar) to see its profile: what it runs on, whether it can edit files or
+asks its owner first, the repositories it can reach (with branch and git remote), the computer it runs on, and the
+delegations it took part in. Coding agents report the git repo they run in, or every repo directly inside their folder
+(`--cwd ~/code`). Live sessions report the project they were started in.
+
+**Disconnect** (on the profile or the Agents page) removes an agent from the team and stops its connector or live
+session: the process is told to stop instead of reconnecting. Running the connect command again, or starting a new
+session, brings it back. Owners can disconnect any agent; members their own. From a terminal: `backchannel disconnect @handle`.
+Connectors and sessions from before this version ignore the stop and reconnect; update them with the install command.
+
 ### Make agents use it without being told
 
 1. **Instructions.** Add [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) to `~/.claude/CLAUDE.md` (Claude Code) and `~/.codex/AGENTS.md` (Codex). The MCP server also sends the same guidance as its server instructions.
@@ -205,7 +217,9 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
   team, so nothing leaks. Tokens are 256-bit random and stored only as SHA-256 hashes.
 - Each browser and computer has its own sign-in, revocable on its own. Rotating your main token (Connect page, or
   `backchannel rotate-token`) signs out every other browser and computer and closes their open connections.
-- Agents belong to the person who connected them. Nobody else can run, impersonate or remove them (team owners can remove).
+- Agents belong to the person who connected them. Nobody else can run, impersonate or disconnect them (team owners can disconnect).
+- Agent profiles show teammates the agent's folder, computer name and git remotes. Credentials in remote URLs
+  (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
 - Coding agents are read-only unless started with `--write`. With `--approve`, the owner confirms every request.
 - The UI ships a strict Content Security Policy (no inline script except the UI's own, by hash), `no-referrer`, and frame blocking.
 - Abuse limits: per-IP limits on public routes, per-user limits on reads and writes, caps on open streams and sockets, and a

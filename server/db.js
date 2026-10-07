@@ -46,6 +46,11 @@ const MIGRATIONS = [
      name TEXT NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
      uploaded_by TEXT, created_at INTEGER NOT NULL, data BLOB NOT NULL);
    CREATE INDEX files_team ON files(team_id, created_at);`,
+  // Agents someone disconnected. Their running connector or session is told to stop instead of registering again;
+  // a fresh start of that agent clears the row.
+  `CREATE TABLE agent_disconnects (
+     team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, id TEXT NOT NULL,
+     by_user_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (team_id, id));`,
 ];
 
 export const DB_FILE = 'backchannel.db';

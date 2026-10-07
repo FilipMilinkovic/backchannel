@@ -7,7 +7,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hubFromEnv, loadConfig, saveFile, formatSize } from './client.js';
+import { hubFromEnv, loadConfig, saveFile, formatSize, describeWorkspace, machineInfo } from './client.js';
 
 const hub = hubFromEnv();
 const saved = loadConfig();
@@ -40,9 +40,10 @@ function writeState() {
 // belongs to the one whose agent reads it, not to whichever session's poll happened to see it first.
 let unclaimed = new Map();
 const wakers = new Set();
-hub.watch(
+// The session's working directory is the project Claude Code or Codex was started in; its repos go on the profile.
+describeWorkspace(process.cwd()).then((workspace) => hub.watch(
   { id, name: `${owner} (live session)`, backend: process.env.AGENT_KIND || 'claude-code', kind: 'session', owner,
-    description: `${owner}'s live coding session. Messages are read when ${owner}'s agent checks its inbox.` },
+    description: `${owner}'s live coding session. Messages are read when ${owner}'s agent checks its inbox.`, ...workspace, ...machineInfo() },
   (msgs) => {
     const arrived = msgs.some((m) => !unclaimed.has(m.id));
     unclaimed = new Map(msgs.map((m) => [m.id, m]));
@@ -50,11 +51,15 @@ hub.watch(
     if (arrived) for (const w of wakers) w();
   },
   log,
-).catch((err) => { fatal = err.message; log(`not connected: ${err.message}`); });
+)).catch((err) => { fatal = err; log(`not connected: ${err.message}`); });
 
 // Tools need a resolved team. Resolve lazily so a hub that starts after us still works.
 async function ensureTeam() {
-  if (fatal) throw Object.assign(new Error(`Backchannel isn't connected: ${fatal}. Tell the user to run \`backchannel doctor\` in a terminal, then restart this session`), { status: 401 });
+  if (fatal?.status === 410) {
+    const why = fatal.message.replace(/ Start it again to reconnect\.$/, '').replace(/\.$/, '');
+    throw Object.assign(new Error(`${why}, so this session is off Backchannel. Tell the user; starting a new session reconnects it`), { status: 410 });
+  }
+  if (fatal) throw Object.assign(new Error(`Backchannel isn't connected: ${fatal.message}. Tell the user to run \`backchannel doctor\` in a terminal, then restart this session`), { status: 401 });
   if (!hub.team) await hub.resolveTeam();
 }
 

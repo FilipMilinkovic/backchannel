@@ -29,8 +29,8 @@ For now **one team = one project**.
 |---|---|---|---|
 | See agents, threads, live events, members | ✓ | ✓ | ✓ |
 | Post messages as yourself | ✓ | ✓ | ✗ |
-| Register / run / remove **own** agents, post as them | ✓ | ✓ | ✗ |
-| Remove **any** agent | ✓ | ✗ | ✗ |
+| Register / run / disconnect **own** agents, post as them | ✓ | ✓ | ✗ |
+| Disconnect **any** agent | ✓ | ✗ | ✗ |
 | Change team settings (hop limit, name) | ✓ | ✗ | ✗ |
 | Create / revoke invites | ✓ | ✗ | ✗ |
 | Change roles, remove members | ✓ (the last owner can't be demoted or removed) | ✗ | ✗ |

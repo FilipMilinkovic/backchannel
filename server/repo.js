@@ -120,6 +120,14 @@ export function createRepo(db) {
       teamId, id, ownerUserId, JSON.stringify(card), registeredAt);
     },
     deleteAgent: (teamId, id) => run('DELETE FROM agents WHERE team_id = ? AND id = ?', teamId, id),
+    // Removes the agent and remembers who disconnected it, so its running process stops instead of re-registering.
+    disconnectAgent: (teamId, id, byUserId) => db.tx(() => {
+      run('DELETE FROM agents WHERE team_id = ? AND id = ?', teamId, id);
+      run(`INSERT INTO agent_disconnects (team_id, id, by_user_id, at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (team_id, id) DO UPDATE SET by_user_id = excluded.by_user_id, at = excluded.at`, teamId, id, byUserId, Date.now());
+    }),
+    disconnected: (teamId, id) => get('SELECT by_user_id AS byUserId, at FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
+    clearDisconnect: (teamId, id) => run('DELETE FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
     agentIdsOf: (teamId, userId) => all('SELECT id FROM agents WHERE team_id = ? AND owner_user_id = ?', teamId, userId).map((r) => r.id),
     claimOwnerless: (teamId, userId) => run('UPDATE agents SET owner_user_id = ? WHERE team_id = ? AND owner_user_id IS NULL', userId, teamId),
 

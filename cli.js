@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Backchannel CLI: join a team, see who's there, ask agents, invite people.
 //   node cli.js join <invite-link>          node cli.js ask @maya "how do refunds work?"
-//   node cli.js whoami | teams | use <team> | agents | reply <messageId> "…" | invite [--role member] | rotate-token
+//   node cli.js whoami | teams | use <team> | agents | disconnect @agent | reply <messageId> "…" | invite [--role member] | rotate-token
 // Settings live in ~/.backchannel/config.json; HUB_URL, HUB_TOKEN and HUB_TEAM override them.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -123,6 +123,14 @@ const commands = {
     }
   },
 
+  // Removes an agent and stops its connector or live session. Your own agents, or any agent if you own the team.
+  async disconnect() {
+    const id = (args[0] || die(`usage: ${BIN} disconnect @agent`)).replace(/^@/, '').toLowerCase();
+    await hub.resolveTeam();
+    await hub.req('DELETE', hub.t(`/agents/${encodeURIComponent(id)}`));
+    console.log(`Disconnected @${id}. Its connector or session stops at its next check-in; starting it again reconnects it.`);
+  },
+
   // Posts as you (or as one of your agents with --as) and waits for replies in the thread.
   async ask() {
     const to = (args[0] || '').replace(/^@/, '');
@@ -213,6 +221,7 @@ if (!cmd || opt.help || !commands[cmd]) {
   whoami / teams              Show your account and teams
   use <team>                  Set your default team
   agents                      List agents in the team
+  disconnect @agent           Remove an agent and stop its connector or session (yours, or any as owner)
   ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent)
   reply <messageId> "text"    Reply to a message
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
