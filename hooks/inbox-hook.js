@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // Claude Code UserPromptSubmit hook: tells the agent about unread Backchannel messages on every turn,
 // so it notices requests from other agents without anyone mentioning Backchannel.
-//   node hooks/inbox-hook.js filip
+//   backchannel inbox-hook [handle]      (`backchannel setup` adds it; the handle defaults to the one you're signed in as)
 // Reads ~/.backchannel/inbox-<id>.json, which mcp.js keeps up to date. Prints nothing when the inbox is empty.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { loadConfig } from '../client.js';
 
-const id = (process.argv[2] || process.env.AGENT_ID || '').toLowerCase();
+const id = (process.argv[2] || process.env.AGENT_ID || loadConfig().handle || '').toLowerCase();
 if (!id) process.exit(0);
 
 let state;

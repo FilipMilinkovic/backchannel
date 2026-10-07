@@ -1,5 +1,6 @@
 // Connects the coding agents on this computer (Claude Code, Codex) to Backchannel, and checks that they are.
-//   backchannel setup     points their MCP config at this install's `backchannel mcp` (login and join do this too)
+//   backchannel setup     points their MCP config at this install's `backchannel mcp` (login and join do this too),
+//                         adds the unread-messages hook to Claude Code and the Backchannel instructions to Codex
 //   backchannel doctor    shows what each one would connect to, and what's wrong
 // The MCP server reads the hub, token and handle from ~/.backchannel/config.json, so the configs we write carry no
 // hub address or token. Settings that would pin a session to another hub (HUB_URL, HUB_TOKEN) are removed.
@@ -116,7 +117,69 @@ function problems(state, cfg) {
   return out;
 }
 
-const TOOLS = [[inspectClaude, setupClaude], [inspectCodex, setupCodex]];
+// ---------- nudges, so agents use Backchannel without being told ----------
+// Claude Code gets the instructions from the MCP server itself; the hook adds a 📬 line to every prompt while
+// messages are unread. Codex gets the instructions as a marked block in its global AGENTS.md.
+
+const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
+const CODEX_AGENTS = path.join(path.dirname(CODEX_TOML), 'AGENTS.md');
+const START = '<!-- backchannel:start -->', END = '<!-- backchannel:end -->';
+// The hook reads the inbox of the handle the session runs as: your handle, unless setup kept an AGENT_ID.
+const hookCommand = (id) => shellArgs([NODE, BIN, 'inbox-hook', ...(id ? [id] : [])]);
+const isOurHook = (h) => /inbox-hook/.test(h?.command || '');
+
+function inspectHook(id) {
+  let json = {};
+  try { json = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8')); }
+  catch (err) { if (err.code !== 'ENOENT') return { unreadable: true, problem: `can't read ${tilde(CLAUDE_SETTINGS)} (${err.message})` }; }
+  const want = hookCommand(id);
+  const found = (json.hooks?.UserPromptSubmit || []).flatMap((g) => g.hooks || []).filter(isOurHook);
+  const ok = found.length === 1 && found[0].command === want;
+  return { json, want, found, ok, problem: ok ? null : found.length ? 'the unread-messages hook runs another install' : 'no unread-messages hook' };
+}
+
+function setupHook(state, log) {
+  if (state.unreadable) return log(`  ! Claude Code: skipped the unread-messages hook: ${state.problem}`);
+  const { json } = state;
+  json.hooks ||= {};
+  const groups = (json.hooks.UserPromptSubmit || [])
+    .map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !isOurHook(h)) }))
+    .filter((g) => g.hooks.length);
+  json.hooks.UserPromptSubmit = [...groups, { hooks: [{ type: 'command', command: state.want }] }];
+  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
+  if (fs.existsSync(CLAUDE_SETTINGS)) fs.copyFileSync(CLAUDE_SETTINGS, CLAUDE_SETTINGS + '.bak');
+  fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(json, null, 2) + '\n');
+  log(`  ✓ Claude Code: ${state.found.length ? 'updated' : 'added'} the unread-messages hook in ${tilde(CLAUDE_SETTINGS)}`);
+}
+
+const instructions = () => fs.readFileSync(new URL('./AGENT_INSTRUCTIONS.md', import.meta.url), 'utf8').trim();
+
+function inspectInstructions() {
+  let text = '';
+  try { text = fs.readFileSync(CODEX_AGENTS, 'utf8'); } catch {}
+  const block = `${START}\n${instructions()}\n${END}`;
+  const at = text.indexOf(START), end = text.indexOf(END);
+  // Instructions someone pasted in by hand (no markers) are theirs to keep.
+  const byHand = at < 0 && /check_inbox/.test(text) && /backchannel/i.test(text);
+  const ok = byHand || (at >= 0 && text.slice(at, end + END.length) === block);
+  return { text, block, at, end, ok, problem: ok ? null : at >= 0 ? `the Backchannel instructions in ${tilde(CODEX_AGENTS)} are out of date` : `no Backchannel instructions in ${tilde(CODEX_AGENTS)}` };
+}
+
+function setupInstructions(state, log) {
+  const { text, block, at, end } = state;
+  const next = at >= 0 && end > at
+    ? text.slice(0, at) + block + text.slice(end + END.length)
+    : (text.trim() ? text.replace(/\n*$/, '\n\n') : '') + block + '\n';
+  fs.mkdirSync(path.dirname(CODEX_AGENTS), { recursive: true });
+  fs.writeFileSync(CODEX_AGENTS, next);
+  log(`  ✓ Codex: ${at >= 0 ? 'updated' : 'added'} the Backchannel instructions in ${tilde(CODEX_AGENTS)}`);
+}
+
+// [inspect MCP config, set it up, inspect the nudge, set it up]
+const TOOLS = [
+  [inspectClaude, setupClaude, (state, cfg) => inspectHook(keptEnv(state, cfg).AGENT_ID), setupHook],
+  [inspectCodex, setupCodex, inspectInstructions, setupInstructions],
+];
 
 // Settings worth keeping from the old config: a chosen handle, name or team, unless they were meant for another hub.
 function keptEnv(state, cfg) {
@@ -128,13 +191,14 @@ function keptEnv(state, cfg) {
 // Points every installed coding agent at this install. Returns true if anything changed.
 export function setupAgents(cfg, log = console.log) {
   let changed = false, found = false;
-  for (const [inspect, setup] of TOOLS) {
+  for (const [inspect, setup, inspectNudge, setupNudge] of TOOLS) {
     const state = inspect();
     if (!state.installed) continue;
     found = true;
-    if (!problems(state, cfg).length) { log(`  ✓ ${state.name}: already connected`); continue; }
-    setup(state, keptEnv(state, cfg), log);
-    changed = true;
+    if (!problems(state, cfg).length) log(`  ✓ ${state.name}: already connected`);
+    else { setup(state, keptEnv(state, cfg), log); changed = true; }
+    const nudge = inspectNudge(state, cfg);
+    if (!nudge.ok) { setupNudge(nudge, log); changed = true; }
   }
   if (!found) log('  No Claude Code or Codex found on this computer. Install one, then run: backchannel setup');
   if (changed) log('\nRestart any open Claude Code and Codex sessions: they connect when they start.');
@@ -166,10 +230,12 @@ export async function doctor(hub, cfg, log = console.log) {
       }
     }
   }
-  for (const [inspect] of TOOLS) {
+  for (const [inspect, , inspectNudge] of TOOLS) {
     const state = inspect();
     if (!state.installed) { log(`  - ${state.name}: not installed`); continue; }
     const issues = problems(state, cfg);
+    const nudge = inspectNudge(state, cfg);
+    if (!nudge.ok) issues.push(nudge.problem);
     for (const dir of state.shadows || []) issues.push(`${tilde(dir)} overrides it with its own project-local server (claude mcp remove backchannel --scope local, in that folder)`);
     if (issues.length) fail(`${state.name}: ${issues.join('; ')}`, 'Run: backchannel setup');
     else ok(`${state.name}: connected through this install${state.server.env.AGENT_ID ? ` as @${state.server.env.AGENT_ID}` : ''}`);

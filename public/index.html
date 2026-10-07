@@ -344,6 +344,9 @@ td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hid
 .gate-card .alt { margin-top: 18px; color: var(--ink-3); font-size: var(--text-sm); }
 .gate-card .alt button { border: 0; background: none; padding: 0; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .token-box { display: flex; align-items: center; gap: 8px; padding: 10px 10px 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--rail); }
+.gate-card .code { margin-bottom: 6px; }
+.next-steps { margin: 16px 0 0; padding-left: 20px; color: var(--ink-3); font-size: var(--text-sm); line-height: 1.55; }
+.next-steps li + li { margin-top: 6px; }
 .token-box code { flex: 1; min-width: 0; font: var(--text-sm)/1.4 var(--mono); color: var(--ink); overflow-wrap: anywhere; }
 .viewer-note { padding: 14px 24px 18px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: var(--text-sm); }
 .invite-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 16px; }
@@ -905,14 +908,20 @@ const setCmd = (id, text) => { $(id).textContent = text; };
 // Only needed when you're in several teams; otherwise the CLI picks your one team.
 const teamArg = (flag) => (S.teams.length > 1 ? flag(S.team) : '');
 
+// One command that installs the client from this hub and signs the computer in with a one-time link.
+async function setupCommand() {
+  const { url, expiresInSeconds } = await api('/api/me/login-link', { method: 'POST', body: JSON.stringify({ expiresInSeconds: 600 }) });
+  const until = new Date(Date.now() + expiresInSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return { cmd: `npm install -g ${location.origin}/install/backchannel.tgz && \\\n  backchannel login '${url}'`, until };
+}
 async function createLoginCommand(btn) {
   btn.disabled = true;
   try {
-    const { url, expiresInSeconds } = await api('/api/me/login-link', { method: 'POST', body: JSON.stringify({ expiresInSeconds: 600 }) });
-    setCmd('loginCmd', `npm install -g ${location.origin}/install/backchannel.tgz && \\\n  backchannel login '${url}'`);
+    const { cmd, until } = await setupCommand();
+    setCmd('loginCmd', cmd);
     $('loginBox').hidden = false; $('setupNote').hidden = false;
     btn.textContent = 'Create another'; btn.classList.remove('primary');
-    $('loginMsg').textContent = `Works once, until ${new Date(Date.now() + expiresInSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Each computer gets its own sign-in.`;
+    $('loginMsg').textContent = `Works once, until ${until}. Each computer gets its own sign-in.`;
   } catch (err) { $('loginMsg').textContent = `Couldn't create it: ${err.message}`; }
   finally { btn.disabled = false; }
 }
@@ -945,14 +954,15 @@ function buildConnector() {
   const env = [];
   if (backend === 'openai') env.push('OPENAI_API_KEY=sk-…');
   if (backend === 'grok') env.push('XAI_API_KEY=xai-…');
-  const args = [`--id ${shq(handle)}`, `--backend ${backend}`];
+  // The connector defaults to @<you>-claude on Claude Code, so only spell out what differs.
+  const args = [...(raw ? [`--id ${shq(handle)}`] : []), ...(backend === 'claude-code' ? [] : [`--backend ${backend}`])];
   if (S.teams.length > 1) args.push(`--team ${S.team}`);
   const owner = $('cOwner').value.trim();
   if (owner) args.push(`--owner ${shq(owner)}`);
   if (coder) args.push(`--cwd ${shq($('cFolder').value.trim() || '~/code/your-repo')}`);
   if (coder && $('cWrite').checked) args.push('--write');
-  if ($('cApprove').checked) args.push('--approve');
-  setCmd('cCmd', `${env.length ? env.join(' ') + ' ' : ''}backchannel connect \\\n  ${args.join(' ')}`);
+  if (!$('cApprove').checked) args.push('--no-approve');
+  setCmd('cCmd', `${env.length ? env.join(' ') + ' ' : ''}backchannel connect${args.length ? ` \\\n  ${args.join(' ')}` : ''}`);
   const notes = {
     'claude-code': 'Uses the <b>claude</b> CLI and the account it’s signed in to. Requests run headless in the folder.',
     codex: 'Uses the <b>codex</b> CLI and the account it’s signed in to. Runs in Codex’s sandbox.',
@@ -1344,14 +1354,19 @@ function showGate(kind, note = '') {
 }
 
 async function showJoin(code) {
+  // A token this hub no longer accepts (rotated, revoked, or from an earlier hub at this address) would make the
+  // invite calls fail, so drop it and join as a new account.
+  let me = null;
+  if (S.token) {
+    try { me = await api('/api/me'); }
+    catch (err) { if (err.status === 401) { S.token = ''; store.set('bc.token', ''); } }
+  }
   let info;
   try { info = await api(`/api/invites/${encodeURIComponent(code)}`); }
   catch (err) {
     return gate(`<h1>This invite doesn't work</h1><p>${err.status === 404 ? 'The link is invalid, expired or already used. Ask for a new one.' : esc(err.message)}</p>
       <button class="btn primary" type="button" id="toApp">Continue</button>`), ($('toApp').onclick = () => { history.replaceState(null, '', '#'); boot(); });
   }
-  let me = null;
-  if (S.token) { try { me = await api('/api/me'); } catch {} }
   const head = `<h1>Join ${esc(info.teamName)}</h1>
     <p>${info.invitedBy ? `${esc(info.invitedBy)} invited you` : 'You’re invited'} as a <b style="color:var(--ink-2)">${esc(info.role)}</b>. You'll be able to ${info.role === 'viewer' ? 'follow the team’s delegations' : 'delegate to teammates’ agents and connect your own'}.</p>`;
   if (me) {
@@ -1383,11 +1398,21 @@ async function showJoin(code) {
       if (res.token) {
         S.token = res.token; store.set('bc.token', res.token);
         gate(`<h1>You're in, @${esc(res.user.handle)}</h1>
-          <p>This is your personal access token. You won't need to paste it anywhere: under <b>Connect</b>, set up each computer with a one-time sign-in command. Keep a copy in your password manager for scripts and CI; you can see it again under Connect, in this browser.</p>
-          <div class="token-box"><code id="newToken">${esc(res.token)}</code><button class="btn" type="button" id="copyNew">Copy</button></div>
+          <p>Now set up the computer you code on. Run this in a terminal: it installs the <span class="mono">backchannel</span> command, signs the computer in as you, and connects Claude Code and Codex. Needs Node.js 22.13 or newer.</p>
+          <div class="code"><pre id="joinCmd">Creating your setup command…</pre><button class="btn" type="button" data-copy="joinCmd">Copy</button></div>
+          <div class="help" id="joinMsg" role="status"></div>
+          <ol class="next-steps">
+            <li>Restart open Claude Code and Codex sessions. Then just ask, like <i>“ask Sam’s agent how refunds work”</i>.</li>
+            <li>To let teammates’ agents ask yours, run <span class="mono">backchannel connect</span> in your repo. It asks you before each request.</li>
+          </ol>
+          <details class="manual"><summary>Access token for scripts and CI</summary>
+            <p class="help">You won't need it for the steps above. Anyone with it can act as you; you can see it again under Connect, in this browser.</p>
+            <div class="token-box"><code id="newToken">${esc(res.token)}</code><button class="btn" type="button" id="copyNew">Copy</button></div></details>
           <div style="margin-top:18px"><button class="btn primary" type="button" id="toApp" style="width:100%;justify-content:center">Continue to ${esc(res.team.name)}</button></div>`);
         $('copyNew').onclick = (ev) => copy(ev.currentTarget, res.token);
         $('toApp').onclick = () => refreshAccount();
+        setupCommand().then(({ cmd, until }) => { $('joinCmd').textContent = cmd; $('joinMsg').textContent = `Works once, until ${until}. Need it later or on another computer? Connect → Create setup command.`; })
+          .catch((err) => { $('joinCmd').textContent = '—'; $('joinMsg').textContent = `Couldn't create it (${err.message}). Continue, then use Connect → Create setup command.`; });
       } else {
         await refreshAccount();
       }
