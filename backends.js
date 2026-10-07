@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { claudeDenySettings } from './safety.js';
 
 // Codex ships inside the ChatGPT app and often isn't on PATH.
 function codexBin() {
@@ -42,6 +43,16 @@ function run(cmd, args, { cwd, input, timeoutMs = Number(process.env.CODER_TIMEO
   });
 }
 
+// Arguments for `claude -p`. Credentials (.env files, keys, ~/.ssh, …) are denied by permission rules in every mode.
+export function claudeArgs({ system, model, write, dirs = [] }) {
+  const args = ['-p', '--output-format', 'text', '--append-system-prompt', system, '--settings', claudeDenySettings()];
+  for (const d of dirs) args.push('--add-dir', d); // where attached files were saved
+  if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash');
+  else args.push('--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep');
+  if (model) args.push('--model', model);
+  return args;
+}
+
 export const backends = {
   openai: (o) => chatCompletions({
     baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
@@ -58,14 +69,7 @@ export const backends = {
   }),
 
   // Claude Code in headless mode, working inside the owner's repo.
-  'claude-code': async ({ system, prompt, model, cwd, write, dirs = [] }) => {
-    const args = ['-p', '--output-format', 'text', '--append-system-prompt', system];
-    for (const d of dirs) args.push('--add-dir', d); // where attached files were saved
-    if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash');
-    else args.push('--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep');
-    if (model) args.push('--model', model);
-    return run('claude', args, { cwd, input: prompt });
-  },
+  'claude-code': async ({ prompt, cwd, ...o }) => run('claude', claudeArgs(o), { cwd, input: prompt }),
 
   // Codex CLI non-interactive mode; the final message is written to a file.
   codex: async ({ system, prompt, model, cwd, write }) => {

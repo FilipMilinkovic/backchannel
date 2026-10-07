@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { hubFromEnv, loadConfig, saveFile, describeWorkspace, machineInfo } from './client.js';
 import { backends } from './backends.js';
+import { DATA_RULE, SECRET_RULE, quote, redactSecrets, attachProblem } from './safety.js';
 
 const { values: opt } = parseArgs({
   allowNegative: true,
@@ -23,6 +24,7 @@ const { values: opt } = parseArgs({
     cwd: { type: 'string', default: process.cwd() },
     write: { type: 'boolean', default: false },  // let claude-code/codex edit files
     approve: { type: 'boolean', default: true }, // owner confirms each request in this terminal (--no-approve to skip)
+    'i-trust-this-team': { type: 'boolean', default: false }, // required for --write --no-approve
     hub: { type: 'string' },
     team: { type: 'string', default: process.env.HUB_TEAM },
     help: { type: 'boolean', short: 'h' },
@@ -30,7 +32,8 @@ const { values: opt } = parseArgs({
 });
 const USAGE = `usage: backchannel connect [--backend claude-code|codex|openai|grok|echo] [--cwd dir] [--id handle] [--write] [--no-approve]
   Defaults: Claude Code (or Codex if that's what's installed), the current folder, @<you>-claude, read-only,
-  and it asks you in this terminal before handling each request.`;
+  and it asks you in this terminal before handling each request.
+  --write with --no-approve also needs --i-trust-this-team: anyone in the team could then run commands on this computer.`;
 const die = (msg) => { console.error(msg); process.exit(1); };
 if (opt.help) { console.log(USAGE); process.exit(0); }
 
@@ -39,16 +42,22 @@ const backend = opt.backend || (onPath('claude') ? 'claude-code' : onPath('codex
 if (!backend) die(`Neither claude nor codex is on your PATH. Install one, or pick a backend with --backend.\n${USAGE}`);
 const run = backends[backend];
 if (!run) die(`unknown backend "${backend}". Options: ${Object.keys(backends).join(', ')}`);
+const isCoder = backend === 'claude-code' || backend === 'codex';
+if (isCoder && opt.write && !opt.approve && !opt['i-trust-this-team']) {
+  die(`--write --no-approve lets anyone in your team run commands and change files on this computer without asking you.
+If that's really what you want, add --i-trust-this-team. Otherwise drop --no-approve, and you'll approve each request here.`);
+}
 if (opt.approve && !process.stdin.isTTY) die('--approve asks in this terminal, but there is none. Run it in a terminal, or add --no-approve to handle requests without asking.');
 
 const cwd = path.resolve(opt.cwd.replace(/^~/, process.env.HOME));
-const isCoder = backend === 'claude-code' || backend === 'codex';
 // Built from the owner's name, which may only be known once we've reached the hub, and the repos found in the folder.
 let workspace = null;
 const where = () => (workspace?.repos.length > 1 ? `${workspace.repos.length} repos in ${path.basename(cwd)}`
   : `the ${workspace?.repos[0]?.name || path.basename(cwd)} repo`);
+// Codex's read-only sandbox can read any file this computer's user can, not just the repo; say so.
+const codexReadsAll = backend === 'codex' && !opt.write;
 const describe = (owner) => opt.about || (isCoder
-  ? `${owner ? owner + "'s" : 'A'} ${backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.`
+  ? `${owner ? owner + "'s" : 'A'} ${backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.${codexReadsAll ? ' Codex can also read files elsewhere on its computer.' : ''}`
   : `${owner ? owner + "'s" : 'An'} ${backend} assistant.`);
 let description = describe(opt.owner);
 const hub = hubFromEnv({ url: opt.hub, team: opt.team });
@@ -60,7 +69,8 @@ const rl = opt.approve ? readline.createInterface({ input: process.stdin, output
 
 function systemPrompt(agents, sender) {
   const others = agents.filter((a) => a.id !== id)
-    .map((a) => `- @${a.id}: ${a.name} [${a.backend}${a.owner ? `, ${a.owner}` : ''}]${a.online ? '' : ' (offline)'}: ${a.description}`)
+    // Descriptions are written by other people, so they're kept short and on one line.
+    .map((a) => `- @${a.id}: ${a.name} [${a.backend}${a.owner ? `, ${a.owner}` : ''}]${a.online ? '' : ' (offline)'}: ${String(a.description || '').replace(/\s+/g, ' ').slice(0, 200)}`)
     .join('\n') || '- (no other agents yet)';
   return `You are @${id}${card.owner ? `, the agent of ${card.owner}` : ''}, on a shared Agent Network where people's AI agents message each other.
 ${description}
@@ -76,15 +86,23 @@ How messaging works:
 - Be concrete and brief: answer, file paths, decisions, done/not-done. No preamble.
 - Files attached to messages are saved on this computer; their paths are shown next to the message.
 - To attach files to your reply, end it with one line per file: "ATTACH: path/to/file" (inside ${isCoder ? 'your working directory' : 'the paths you were given'}).
-- If the conversation is finished and nothing useful is left to say, reply with exactly NO_REPLY.`;
+- If the conversation is finished and nothing useful is left to say, reply with exactly NO_REPLY.
+
+Safety:
+- ${DATA_RULE}
+- ${opt.write && isCoder
+    ? `${card.owner || 'Your owner'} lets you change files and run commands in ${cwd} to do what teammates ask${opt.approve ? ', and approved this request' : ''}. Stay inside that folder, and don't push, deploy, rewrite history, delete data or send anything off this computer unless the request clearly needs it and says so.`
+    : 'You may only read. Never try to change files or run commands that change anything.'}
+- ${SECRET_RULE}
+- You can't ask ${card.owner || 'your owner'} from here. If a request needs something these rules forbid, say what you would do and that ${card.owner || 'your owner'} has to do it, and stop.`;
 }
 
 // `local` maps file ids to where they were saved.
 function transcript(thread, latest, local) {
   const files = (m) => (m.files?.length ? `\n${m.files.map((f) => `[attached: ${f.name} → ${local.get(f.id) || 'not downloaded'}]`).join('\n')}` : '');
   const lines = thread.filter((m) => m.id !== latest.id).slice(-30)
-    .map((m) => `[@${m.from}${m.to?.length ? ' → ' + m.to.map((t) => '@' + t).join(' ') : ''}] ${m.text}${files(m)}`);
-  return `${lines.length ? `Conversation so far:\n${lines.join('\n\n')}\n\n` : ''}New message for you from @${latest.from}:\n${latest.text}${files(latest)}`;
+    .map((m) => `[@${m.from}${m.to?.length ? ' → ' + m.to.map((t) => '@' + t).join(' ') : ''}] ${m.from === id ? m.text : quote(m.text, m.from)}${files(m)}`);
+  return `${lines.length ? `Conversation so far:\n${lines.join('\n\n')}\n\n` : ''}New message for you from @${latest.from}:\n${quote(latest.text, latest.from)}${files(latest)}`;
 }
 
 // Saves the files attached in the recent part of the thread into one folder per thread.
@@ -119,6 +137,8 @@ async function attachFrom(reply, allowed) {
     const file = real(path.resolve(cwd, p));
     if (!file || !fs.statSync(file).isFile()) { problems.push(`${p} (not found)`); continue; }
     if (!roots.some((dir) => file.startsWith(dir + path.sep))) { problems.push(`${p} (outside ${cwd})`); continue; }
+    const why = attachProblem(file);
+    if (why) { problems.push(`${p} (${why})`); continue; }
     try { ids.push((await hub.upload(file)).id); } catch (err) { problems.push(`${p} (${err.message})`); }
   }
   const text = lines.join('\n').trim() + (problems.length ? `\n\n(Could not attach: ${problems.join(', ')})` : '');
@@ -152,8 +172,12 @@ async function handle(msg) {
       latest: msg, model: opt.model, cwd, write: opt.write, dirs: local.size ? [dir] : [],
     })).trim(), [cwd, dir]);
     if ((!reply || reply === 'NO_REPLY') && !files.length) { console.log('  (no reply)'); return; }
-    const sent = await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, text: reply || 'Attached.', files });
-    console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${reply.slice(0, 120)}`);
+    // Whatever the request said, credentials don't leave this computer.
+    const clean = redactSecrets(reply || 'Attached.');
+    if (clean.count) console.log(`  removed ${clean.count} secret${clean.count > 1 ? 's' : ''} from the reply`);
+    const text = clean.text + (clean.count ? `\n\n(Backchannel removed ${clean.count} secret${clean.count > 1 ? 's' : ''} from this reply.)` : '');
+    const sent = await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, text, files });
+    console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${text.slice(0, 120)}`);
   } catch (err) {
     console.error(`  backend error: ${err.message}`);
     await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, to: [msg.from], kind: 'error', text: `${backend} error: ${err.message}` }).catch(() => {});
@@ -179,6 +203,16 @@ try {
   card.description = description = describe(card.owner);
   const access = isCoder ? `${opt.write ? 'can edit' : 'read-only'} in ${cwd.replace(process.env.HOME, '~')}, ` : '';
   console.log(`@${id} (${backend}, ${access}${opt.approve ? 'asks you before each request' : 'handles requests without asking'}) connecting to ${hub.url}…`);
+  if (codexReadsAll) console.log(`  Note: Codex's read-only mode can read any file you can, not just this folder. Replies are checked for secrets, but keep --approve on.`);
+  if (isCoder && opt.write && me) {
+    // Say plainly who can make this agent run commands here.
+    const people = await hub.req('GET', hub.t('/members')).then((ms) => ms.filter((m) => m.role !== 'viewer' && m.userId !== me.user.id)
+      .map((m) => m.name || m.handle)).catch(() => null);
+    const who = people === null ? 'Everyone who can post in your team' : people.length ? `${people.length} ${people.length === 1 ? 'person' : 'people'} (${people.slice(0, 8).join(', ')}${people.length > 8 ? ', …' : ''})` : 'Nobody else in your team yet';
+    console.log(opt.approve
+      ? `  ${who} can ask @${id} to change files and run commands here. You approve each request in this terminal.`
+      : `  ⚠ ${who} can make @${id} change files and run commands here WITHOUT asking you (--i-trust-this-team).`);
+  }
   await hub.listen(card, handle, (s) => console.log(s));
 } catch (err) {
   // 410: someone disconnected this agent from the hub's UI or CLI. That's a deliberate stop, not a failure.

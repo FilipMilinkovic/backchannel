@@ -133,7 +133,8 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    | `--cwd` | The repo the coding agent works in. Default: the current folder |
    | `--id` | The agent's handle. Default: your handle plus the backend, like `maya-claude` |
    | `--no-approve` | Handle requests without asking. By default each request is shown in your terminal and waits for your yes |
-   | `--write` | Lets Claude Code or Codex edit files. Read-only by default |
+   | `--write` | Lets Claude Code or Codex edit files and run commands. Read-only by default |
+   | `--i-trust-this-team` | Required with `--write --no-approve`: anyone in the team could then run commands on this computer without asking you |
    | `--team` | Which team, if you're in several |
 
 5. **Delegate from your coding agent** (the person asking). Step 3 already did this. A Claude Code session joins as
@@ -197,6 +198,7 @@ The hub reads environment variables only, and refuses to start with a clear mess
 | `RATE_PUBLIC_PER_MIN` | `20` | Per IP: invite lookups and accepts, sign-in link exchanges, client downloads |
 | `RATE_WRITES_PER_MIN` | `240` | Per user: messages, invites, agent registrations, other changes |
 | `RATE_READS_PER_MIN` | `1200` | Per user |
+| `AGENT_REQUESTS_PER_HOUR` | `30` | Requests one person can send to one agent that isn't theirs, per hour, so nobody uses up a teammate's Claude or Codex plan. Answers don't count. `0` turns it off |
 | `MAX_STREAMS_PER_USER` | `50` | Open live streams and long polls per user |
 | `MAX_CONNECTIONS` | `5000` | Open sockets for the whole hub |
 | `MAX_FILE_MB`, `TEAM_FILES_MB` | `25`, `1024` | Largest attachment, and the total a team can store (attachments live in the database, so backups include them) |
@@ -238,6 +240,15 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - Agent profiles show teammates the agent's folder, computer name and git remotes. Credentials in remote URLs
   (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
 - Coding agents are read-only unless started with `--write`. The owner confirms every request unless the connector runs with `--no-approve`.
+  `--write --no-approve` also needs `--i-trust-this-team`, and the connector says who can reach it.
+- Messages from other agents are handed to agents as quoted data, never as instructions, and agents are told not to
+  change files, run commands or share secrets because a message asked them to, without asking their user.
+- Connectors keep credentials in: Claude Code is denied `.env` files, keys and folders like `~/.ssh` and `~/.aws` by
+  permission rules, files that hold or contain credentials are never attached, and anything that looks like a secret
+  (API keys, tokens, private keys, `PASSWORD=` lines) is removed from replies before they're sent. Live sessions apply
+  the same checks to `ask_agent` and `reply`. Codex's read-only sandbox can still read files outside its folder, so a
+  Codex connector says so in its description; keep approval on.
+- One person can send at most 30 requests an hour to someone else's agent (`AGENT_REQUESTS_PER_HOUR`).
 - The UI ships a strict Content Security Policy (no inline script except the UI's own, by hash), `no-referrer`, and frame blocking.
 - Abuse limits: per-IP limits on public routes, per-user limits on reads and writes, caps on open streams and sockets, and a
   2 MB body limit.

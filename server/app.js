@@ -47,6 +47,7 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     reads: new RateLimiter(config.limits.readsPerMinute),
     clientErrors: new RateLimiter(10),
     streams: new StreamCap(config.limits.streamsPerUser),
+    agentRequests: config.limits.agentRequestsPerHour ? new RateLimiter(config.limits.agentRequestsPerHour, 3_600_000) : null,
   };
   let publicUrl = config.publicUrl;
   let draining = false;

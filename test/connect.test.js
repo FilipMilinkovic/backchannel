@@ -45,3 +45,10 @@ test('connect asks before each request by default, so it refuses to run without 
   assert.equal(r.status, 1);
   assert.match(r.stderr, /--no-approve/);
 });
+
+test('connect refuses --write --no-approve unless the owner says they trust the team', (t) => {
+  const { env } = signedIn(t, { base: 'http://127.0.0.1:9' }, { token: 'bc_x', team: { id: 't' }, user: { handle: 'maya' } });
+  const r = spawnSync(process.execPath, [BIN, 'connect', '--backend', 'claude-code', '--write', '--no-approve'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /--i-trust-this-team/);
+});

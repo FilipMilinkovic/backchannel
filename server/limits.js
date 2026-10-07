@@ -4,9 +4,10 @@ import { httpError } from './auth.js';
 const MAX_KEYS = 50_000;
 
 export class RateLimiter {
-  constructor(perMinute) {
-    this.capacity = perMinute;
-    this.refillPerMs = perMinute / 60_000;
+  // `capacity` requests per `windowMs` (a minute unless given), refilled evenly.
+  constructor(capacity, windowMs = 60_000) {
+    this.capacity = capacity;
+    this.refillPerMs = capacity / windowMs;
     this.buckets = new Map(); // key -> { tokens, at }
     setInterval(() => this.sweep(), 60_000).unref();
   }

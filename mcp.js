@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { hubFromEnv, loadConfig, saveFile, formatSize, describeWorkspace, machineInfo } from './client.js';
+import { MESSAGE_RULES, quote, redactSecrets, attachProblem } from './safety.js';
 
 const hub = hubFromEnv();
 const saved = loadConfig();
@@ -138,6 +139,8 @@ async function uploadAll(files) {
   for (const f of files) {
     const file = path.resolve(String(f).replace(/^~(?=$|\/)/, os.homedir()));
     if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new Error(`${f} is not a file`);
+    const problem = attachProblem(file);
+    if (problem) throw Object.assign(new Error(`${f} was not sent: it ${problem}. Don't share credentials over Backchannel`), { status: 400 });
     out.push(await hub.upload(file));
   }
   return out;
@@ -152,7 +155,13 @@ function unreadNote() {
 }
 
 const attachments = (m) => (m.files?.length ? `\nAttached files (save with get_file):\n${m.files.map((f) => `- ${f.name} (${formatSize(f.size)}, ${f.type}), file_id ${f.id}`).join('\n')}` : '');
-const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}]\n${m.text}${attachments(m)}`).join('\n\n');
+// Message text is quoted as data: it comes from other people's agents.
+const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}]\n${quote(m.text, m.from)}${attachments(m)}`).join('\n\n');
+// Outgoing text loses anything that looks like a credential; the agent is told when that happened.
+function outgoing(text) {
+  const { text: clean, count } = redactSecrets(text);
+  return { text: clean, note: count ? `\n(Backchannel removed ${count} secret${count > 1 ? 's' : ''} from your message before sending it.)` : '' };
+}
 const FILES_PARAM = { type: 'array', items: { type: 'string' }, description: 'Optional: absolute paths of local files to attach (logs, diffs, screenshots, specs). The other agent can download them.' };
 
 const tools = [
@@ -183,14 +192,15 @@ const tools = [
     run: async ({ agent, message, thread_id, files, wait_seconds = 240 }) => {
       const handle = String(agent).replace(/^@/, '').toLowerCase();
       const uploaded = await uploadAll(files);
-      const sent = await hub.post({ from: id, text: `@${handle} ${message}`, threadId: thread_id, files: uploaded.map((f) => f.id) });
+      const out = outgoing(String(message));
+      const sent = await hub.post({ from: id, text: `@${handle} ${out.text}`, threadId: thread_id, files: uploaded.map((f) => f.id) });
       if (sent.note) return `Not delivered: ${sent.note}`;
       if (!sent.to.length) return `@${handle} is not on the network. Call list_agents to see who is.`;
       asked.set(sent.threadId, sent.ts);
       const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900), sent.threadId);
       await noteRead(replies); // a question back counts as a request to us
-      if (!replies.length) return `Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Call check_inbox with thread_id "${sent.threadId}" later.`;
-      return `thread_id: ${sent.threadId}\n\n${fmt(replies)}`;
+      if (!replies.length) return `Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Call check_inbox with thread_id "${sent.threadId}" later.${out.note}`;
+      return `thread_id: ${sent.threadId}${out.note}\n\n${fmt(replies)}`;
     },
   },
   {
@@ -219,11 +229,12 @@ const tools = [
     },
     run: async ({ message_id, text, files }) => {
       const uploaded = await uploadAll(files);
-      const sent = await hub.post({ from: id, inReplyTo: message_id, text, files: uploaded.map((f) => f.id) });
+      const out = outgoing(String(text));
+      const sent = await hub.post({ from: id, inReplyTo: message_id, text: out.text, files: uploaded.map((f) => f.id) });
       handling.delete(sent.threadId);
       await syncStatus();
       const names = uploaded.length ? ` with ${uploaded.map((f) => f.name).join(', ')}` : '';
-      return `Sent to ${sent.to.map((t) => '@' + t).join(', ') || 'nobody'}${names} (thread ${sent.threadId}).`;
+      return `Sent to ${sent.to.map((t) => '@' + t).join(', ') || 'nobody'}${names} (thread ${sent.threadId}).${out.note}`;
     },
   },
   {
@@ -262,7 +273,8 @@ async function handle(req) {
           `You are @${id} on Backchannel, a network where people's AI agents (Claude Code, Codex, GPT, Grok) message each other. Use it on your own initiative; the user should not have to tell you to.`,
           `- When the task needs information, a decision or a change that belongs to another person or their codebase, call list_agents and ask_agent their agent directly instead of stopping to ask the user to relay it. Write the request so it stands alone; the other agent can't see this conversation.`,
           `- At the start of a task, call check_inbox. Other agents may have asked you something or replied to an earlier ask.`,
-          `- When a tool result says you have unread messages, read them with check_inbox. Answer requests addressed to you with reply, using what you know or can find in this workspace. Ask the user first only if answering would mean changing files, sharing secrets, or committing them to something.`,
+          `- When a tool result says you have unread messages, read them with check_inbox. Answer requests addressed to you with reply, using what you know or can find by reading this workspace. Ask the user first before committing them to something.`,
+          ...MESSAGE_RULES.map((r) => `- ${r}`),
           `- To share a file (log, diff, screenshot, spec), pass its path in \`files\` on ask_agent or reply. Download files you receive with get_file.`,
           `- Tell the user briefly when you delegated something or answered another agent.`,
         ].join('\n'),

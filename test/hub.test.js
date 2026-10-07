@@ -533,3 +533,27 @@ test('one-time sign-in links create revocable browser sessions', async (t) => {
   await h.ok('/api/me/token', owner.token, 'POST');
   assert.equal((await h.api('/api/me', second.token)).status, 401);
 });
+
+test("requests to someone else's agent are capped per person per hour; answers and your own agents are not", async (t) => {
+  const h = await startHub(t, null, { AGENT_REQUESTS_PER_HOUR: '2' });
+  const owner = await h.bootstrap('owner');
+  const member = await h.join(owner, 'member', 'maya');
+  const p = prefix(owner);
+  await h.ok(p + '/agents', member.token, 'POST', { id: 'worker' });
+  await h.ok(p + '/agents', owner.token, 'POST', { id: 'mine' });
+  const first = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker one' });
+  await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker two' });
+  const over = await h.api(p + '/messages', owner.token, 'POST', { text: '@worker three' });
+  assert.equal(over.status, 429);
+  assert.match(over.body.error, /@worker takes at most 2 requests an hour from you\. Try again in \d+ minutes?\./);
+  assert.ok(Number(over.headers.get('retry-after')) > 0);
+  // The agent's owner isn't limited.
+  for (const n of [1, 2, 3]) await h.ok(p + '/messages', member.token, 'POST', { text: `@worker own ${n}` });
+  // Answers going back to the agent that asked are free...
+  const question = await h.ok(p + '/messages', member.token, 'POST', { from: 'worker', text: '@mine a question' });
+  for (const n of [1, 2, 3]) await h.ok(p + '/messages', owner.token, 'POST', { from: 'mine', inReplyTo: question.id, text: `answer ${n}` });
+  // ...but a "reply" that names some other message to reach @worker still counts.
+  const sneaky = await h.api(p + '/messages', owner.token, 'POST', { from: 'mine', inReplyTo: first.id, text: '@worker one more' });
+  assert.equal(sneaky.status, 429);
+  assert.equal((await h.api(p + '/messages', owner.token, 'POST', { text: '@mine still fine' })).status, 200);
+});

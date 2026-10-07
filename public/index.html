@@ -270,6 +270,7 @@ td .h { color: var(--ink); font-weight: 500; }
 td .d { color: var(--ink-3); max-width: 40ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: var(--r-sm); background: var(--raised-2); color: var(--ink-2); font-size: var(--text-xs); white-space: nowrap; }
 .tag.write { background: var(--signal-soft); color: var(--signal); }
+.tag.warn { background: var(--danger-soft); color: var(--danger); }
 .status-cell { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .actions { display: flex; gap: 4px; justify-content: flex-end; }
 tr[data-profile] { cursor: pointer; }
@@ -930,6 +931,10 @@ const canManage = (a) => isOwner() || !!(S.me && a.ownerUserId === S.me.user.id)
 const agentStatus = (a) => (!a.online ? `Offline · seen ${a.lastSeen ? rel(a.lastSeen) : 'never'}` : a.state === 'working' ? 'Working' : a.state === 'approval' ? 'Waiting for approval' : 'Online');
 const statusDot = (a) => `<span class="dot ${a.online ? (a.state !== 'idle' ? 'busy' : 'on') : ''}" aria-hidden="true"></span>`;
 const isCoder = (a) => a.backend === 'claude-code' || a.backend === 'codex';
+// A coding agent that edits files and runs commands for anyone in the team, without its owner approving each request.
+const unguarded = (a) => a.kind !== 'session' && isCoder(a) && a.access === 'write' && a.approve === false;
+const accessTag = (a) => (unguarded(a) ? '<span class="tag warn" title="Edits files and runs commands without its owner approving each request">Edits without approval</span>'
+  : `<span class="tag ${a.access === 'write' ? 'write' : ''}">${a.access === 'write' ? 'Can edit' : 'Read-only'}</span>`);
 const PLATFORM = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' };
 
 // Online agents are disconnected (their connector or session stops); offline ones are removed. Two clicks within 4s.
@@ -992,7 +997,7 @@ function renderAgentTable() {
         <td><button class="link-h" type="button" data-profile="${esc(a.id)}" aria-label="Open @${esc(a.id)}'s profile">@${esc(a.id)}</button><div class="d" title="${esc(a.description)}">${esc(a.description)}</div></td>
         <td>${esc(ownerOf(a.id))}${a.ownerUserId && S.me && a.ownerUserId === S.me.user.id ? '<span class="you-tag">you</span>' : ''}</td>
         <td class="col-hide">${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}${a.kind === 'session' ? ' <span class="tag">live session</span>' : ''}</td>
-        <td class="col-hide">${a.kind === 'session' ? '<span class="tag">asks others</span>' : !isCoder(a) ? '<span class="tag">No files</span>' : `<span class="tag ${a.access === 'write' ? 'write' : ''}">${a.access === 'write' ? 'Can edit' : 'Read-only'}</span>`}${repoLabel(a) ? ` <span class="mono" style="color:var(--ink-3)">${esc(repoLabel(a))}</span>` : ''}</td>
+        <td class="col-hide">${a.kind === 'session' ? '<span class="tag">asks others</span>' : !isCoder(a) ? '<span class="tag">No files</span>' : accessTag(a)}${repoLabel(a) ? ` <span class="mono" style="color:var(--ink-3)">${esc(repoLabel(a))}</span>` : ''}</td>
         <td><span class="status-cell">${statusDot(a)}${agentStatus(a)}</span></td>
         <td><div class="actions">
           ${a.kind !== 'session' && a.online && canPost() ? `<button class="btn" type="button" data-delegate="${esc(a.id)}">Delegate</button>` : ''}
@@ -1028,10 +1033,14 @@ function renderProfile() {
     : 'Connector · answers requests on its own, in its owner’s environment']);
   rows.push(['Runs', `${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}`]);
   if (session) rows.push(['Files', `Whatever ${esc(owner || 'its owner')}’s session is allowed to touch. Their own ${esc(BACKEND[a.backend] || a.backend)} permissions apply.`]);
-  else if (coder) rows.push(['Files', a.access === 'write' ? '<span class="tag write">Can edit</span> Reads and changes files in its repositories' : '<span class="tag">Read-only</span> Reads files in its repositories but can’t change them']);
+  else if (coder) rows.push(['Files', a.access === 'write' ? `${accessTag(a)} Reads and changes files in its repositories, and runs commands`
+    : a.backend === 'codex' ? '<span class="tag">Read-only</span> Can’t change files. Codex’s read-only mode can also read files outside its repositories'
+    : '<span class="tag">Read-only</span> Reads files in its repositories but can’t change them']);
   else rows.push(['Files', '<span class="tag">None</span> Answers from the model’s knowledge, without access to code']);
   if (!session && a.approve !== null && a.approve !== undefined) {
-    rows.push(['Approval', a.approve ? `${esc(owner || 'Its owner')} approves each request before it runs` : 'Handles requests without asking its owner']);
+    rows.push(['Approval', a.approve ? `${esc(owner || 'Its owner')} approves each request before it runs`
+      : unguarded(a) ? '<span class="tag warn">No approval</span> Anyone in the team can make it change files and run commands without asking its owner'
+      : 'Handles requests without asking its owner']);
   }
   if (a.workdir) rows.push(['Folder', `<span class="mono">${esc(a.workdir)}</span>`]);
 

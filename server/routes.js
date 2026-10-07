@@ -129,6 +129,17 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     if (msg.hop >= team.maxHops && targets.length) {
       msg.note = `hop limit (${team.maxHops}) reached; not delivered. Post a new message to continue.`;
     }
+    // New requests and follow-ups to someone else's agent count against a per-person hourly quota. An answer going back
+    // to the agent that asked doesn't.
+    if (!msg.note && limits.agentRequests) {
+      for (const id of targets) {
+        if (repo.agent(team.id, id).ownerUserId === user.id || (msg.reply && id === parent?.from)) continue;
+        try { limits.agentRequests.take(`${team.id}/${id}/${user.id}`); } catch (err) {
+          const minutes = Math.max(1, Math.ceil((err.retryAfter || 60) / 60));
+          throw Object.assign(httpError(429, `@${id} takes at most ${config.limits.agentRequestsPerHour} requests an hour from you. Try again in ${minutes} minute${minutes > 1 ? 's' : ''}.`), { retryAfter: err.retryAfter });
+        }
+      }
+    }
     repo.tx(() => {
       repo.insertMessage(msg);
       if (!msg.note) for (const id of targets) repo.enqueue(team.id, id, msg.id);

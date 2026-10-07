@@ -66,6 +66,9 @@ export function loadConfig(env = process.env) {
       writesPerMinute: int('RATE_WRITES_PER_MIN', 240, 1, 100_000),
       readsPerMinute: int('RATE_READS_PER_MIN', 1200, 1, 1_000_000),
       streamsPerUser: int('MAX_STREAMS_PER_USER', 50, 1, 10_000),
+      // Requests one person can send to one agent that isn't theirs, per hour, so nobody uses up a teammate's
+      // Claude or Codex plan. 0 turns it off.
+      agentRequestsPerHour: int('AGENT_REQUESTS_PER_HOUR', 30, 0, 100_000),
     },
     // Attachments: the largest single file, and the total a team may store.
     maxFileMb: int('MAX_FILE_MB', 25, 1, 1024),
