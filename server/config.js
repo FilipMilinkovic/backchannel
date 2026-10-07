@@ -67,6 +67,9 @@ export function loadConfig(env = process.env) {
       readsPerMinute: int('RATE_READS_PER_MIN', 1200, 1, 1_000_000),
       streamsPerUser: int('MAX_STREAMS_PER_USER', 50, 1, 10_000),
     },
+    // Attachments: the largest single file, and the total a team may store.
+    maxFileMb: int('MAX_FILE_MB', 25, 1, 1024),
+    teamFilesMb: int('TEAM_FILES_MB', 1024, 1, 1_000_000),
     sessionDays: int('SESSION_DAYS', 30, 1, 3650),
     // Automatic copies in DATA_DIR/backups. 0 turns them off.
     backupHours: int('BACKUP_HOURS', 24, 0, 24 * 30),

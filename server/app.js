@@ -79,6 +79,19 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     return body;
   }
 
+  // Raw request bytes (file uploads), refused once they pass `max`.
+  async function readRaw(req, max) {
+    if (Number(req.headers['content-length'] || 0) > max) throw httpError(413, `file too large (max ${Math.round(max / 1_048_576)} MB)`);
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > max) throw httpError(413, `file too large (max ${Math.round(max / 1_048_576)} MB)`);
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, size);
+  }
+
   function serveStatic(req, res, pathname) {
     if (!['GET', 'HEAD'].includes(req.method)) throw httpError(405, 'method not allowed');
     let decoded;
@@ -114,7 +127,7 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     let url = null;
     try { url = new URL(req.url, 'http://hub.local'); } catch {} // e.g. "//[": answered with 400 below
     const ctx = { req, res, url, path: url?.pathname ?? '', requestId, ip: clientIp(req), userId: undefined,
-      readBody: () => readBody(req), draining: () => draining };
+      readBody: () => readBody(req), readRaw: (max) => readRaw(req, max), draining: () => draining };
 
     res.setHeader('x-request-id', requestId);
     res.setHeader('x-content-type-options', 'nosniff');

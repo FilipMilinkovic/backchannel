@@ -140,6 +140,15 @@ export function createRepo(db) {
       return [...map.values()].map((t) => ({ ...t, participants: [...t.participants] })).sort((a, b) => b.updated - a.updated);
     },
 
+    // ---------- files ----------
+    // Metadata only; fileData() reads the bytes.
+    insertFile: (f) => run('INSERT INTO files (id, team_id, name, type, size, sha256, uploaded_by, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      f.id, f.teamId, f.name, f.type, f.size, f.sha256, f.uploadedBy, f.createdAt, f.data),
+    file: (teamId, id) => get(`SELECT id, name, type, size, sha256, uploaded_by AS uploadedBy, created_at AS createdAt
+      FROM files WHERE team_id = ? AND id = ?`, teamId, id),
+    fileData: (teamId, id) => get('SELECT data FROM files WHERE team_id = ? AND id = ?', teamId, id)?.data,
+    teamFileBytes: (teamId) => get('SELECT coalesce(sum(size), 0) AS n FROM files WHERE team_id = ?', teamId).n,
+
     // Inboxes are delivered in the order messages were posted. A no-op if the agent is gone.
     enqueue: (teamId, agentId, messageId) => run(`INSERT OR IGNORE INTO inbox (team_id, agent_id, message_id)
       SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?)`, teamId, agentId, messageId, teamId, agentId),

@@ -213,6 +213,21 @@ textarea::placeholder, input::placeholder { color: var(--ink-3); }
 .field-foot { display: flex; align-items: center; gap: 10px; padding: 6px 8px 8px 14px; font-size: var(--text-xs); color: var(--ink-3); }
 .field-foot .route-hint { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .field-foot .route-hint b { color: var(--ink-2); font-weight: 500; }
+.files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.files:empty { display: none; }
+.field-box .files { margin: 0; padding: 4px 14px 0; }
+.file {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--rail); color: var(--ink-2); font: inherit; font-size: var(--text-sm); cursor: pointer;
+}
+.file:hover { border-color: var(--line-strong); color: var(--ink); }
+.file .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.file .sz { color: var(--ink-3); font-size: var(--text-xs); flex: none; }
+.file svg { width: 13px; height: 13px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.attach { position: relative; height: 28px; padding: 0 8px; font-size: var(--text-xs); }
+.attach input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.attach:focus-within { outline: 2px solid var(--signal); outline-offset: 2px; }
+.field-box.drop { border-color: var(--signal); }
 .form-error { color: var(--danger); font-size: var(--text-sm); margin-top: 8px; min-height: 0; }
 
 /* new delegation */
@@ -401,7 +416,8 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
           <div class="field-box">
             <label class="sr-only" for="replyText">Reply</label>
             <textarea id="replyText" rows="2" placeholder="Follow up in this delegation…"></textarea>
-            <div class="field-foot"><span class="route-hint" id="replyHint"></span><button class="btn primary" type="submit" id="replySend">Send <kbd>↵</kbd></button></div>
+            <div class="files" id="replyFiles"></div>
+            <div class="field-foot"><span class="route-hint" id="replyHint"></span><label class="btn ghost attach">Attach<input type="file" multiple data-attach="replyForm" aria-label="Attach files"></label><button class="btn primary" type="submit" id="replySend">Send <kbd>↵</kbd></button></div>
           </div>
           <div class="form-error" id="replyError" role="alert"></div>
         </form>
@@ -413,7 +429,8 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
           <div class="field-box">
             <label class="sr-only" for="newText">Request</label>
             <textarea id="newText" rows="5" placeholder="What do you need? Include the context their agent needs, because it can't see your screen."></textarea>
-            <div class="field-foot"><span class="route-hint" id="newHint">Enter to send · Shift+Enter for a new line</span><button class="btn primary" type="submit" id="newSend">Delegate <kbd>↵</kbd></button></div>
+            <div class="files" id="newFiles"></div>
+            <div class="field-foot"><span class="route-hint" id="newHint">Enter to send · Shift+Enter for a new line</span><label class="btn ghost attach">Attach<input type="file" multiple data-attach="newForm" aria-label="Attach files"></label><button class="btn primary" type="submit" id="newSend">Delegate <kbd>↵</kbd></button></div>
           </div>
           <div class="form-error" id="newError" role="alert"></div>
         </form>
@@ -571,8 +588,10 @@ const S = {
 
 const ICON = {
   back: '<svg class="i" viewBox="0 0 16 16"><path d="M10 3 5 8l5 5"/></svg>',
+  file: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6L9 2Z"/><path d="M9 2v4h4"/></svg>',
 };
-const LABEL = { working: 'Working', approval: 'Needs approval', queued: 'Queued', answered: 'Answered', declined: 'Declined', error: 'Failed', stalled: 'Stopped' };
+const size = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
+const LABEL = { working: 'Working', approval: 'Needs approval', queued: 'Waiting', answered: 'Answered', declined: 'Declined', error: 'Failed', stalled: 'Stopped' };
 const ACTIVE = new Set(['working', 'approval', 'queued']);
 const BACKEND = { 'claude-code': 'Claude Code', codex: 'Codex', openai: 'OpenAI', grok: 'Grok', echo: 'Echo' };
 
@@ -628,6 +647,7 @@ function threads() {
     t.from = t.first.from; t.to = t.first.to || [];
     t.title = t.first.title || summarize(t.first.text);
     t.updated = t.last.ts;
+    t.waiting = owing(t);
     t.status = statusOf(t);
     out.push(t);
   }
@@ -659,8 +679,27 @@ function statusOf(t) {
   if (last.kind === 'error') return 'error';
   if (last.kind === 'declined') return 'declined';
   if (last.note) return 'stalled';
-  const pending = (last.to || []).filter((r) => { const a = agentById(r); return a && a.kind !== 'session'; });
-  return pending.length ? 'queued' : 'answered';
+  return t.waiting.length ? 'queued' : 'answered';
+}
+
+// The agents a thread is still waiting on. Each message asks the agents it's addressed to, except the one it answers.
+// A reply (the sender named the message it answers) settles everything its sender owed, unless it hands work on to
+// someone else. Writing to whoever asked always settles that ask.
+// Messages from before the hub recorded `reply` count as replies when an agent sent them with inReplyTo.
+function owing(t) {
+  const byId = new Map(t.msgs.map((m) => [m.id, m]));
+  let debts = []; // { debtor, creditor }
+  for (const m of t.msgs) {
+    const parent = m.inReplyTo && byId.get(m.inReplyTo);
+    const isReply = m.kind === 'error' || m.kind === 'declined' || (m.reply ?? (m.fromKind === 'agent' && !!m.inReplyTo));
+    const answering = isReply && parent && parent.from !== m.from ? parent.from : null;
+    const to = m.to || [];
+    const asks = m.note ? [] : to.filter((r) => r !== m.from && r !== answering && agentById(r));
+    debts = debts.filter((d) => d.debtor !== m.from
+      || !((isReply && !asks.length) || to.includes(d.creditor)));
+    for (const r of asks) if (!debts.some((d) => d.debtor === r && d.creditor === m.from)) debts.push({ debtor: r, creditor: m.from });
+  }
+  return [...new Set(debts.map((d) => d.debtor))].filter((id) => agentById(id));
 }
 
 function workingIn(threadId) {
@@ -781,7 +820,7 @@ function renderDetail() {
       <button class="btn ghost back" type="button" data-action="back">${ICON.back} Delegations</button>
       <h2>${esc(t.title)}</h2>
       <div class="facts">
-        <span class="pill ${t.status}">${LABEL[t.status]}</span>
+        <span class="pill ${t.status}">${t.status === 'queued' && t.waiting.length ? `Waiting on ${esc(t.waiting.map(display).join(', '))}` : LABEL[t.status]}</span>
         <span><span class="who">${esc(senderName(t.first))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
         <span class="num">Started ${clock(t.first.ts)}</span>
         <span class="num" title="Agent-to-agent replies used out of the hop limit">Hops ${hops} of ${max}</span>
@@ -801,6 +840,7 @@ function renderDetail() {
               ${m.to?.length ? `<span class="meta">to ${esc(m.to.map(display).join(', '))}</span>` : ''}
               <span class="meta num">${clock(m.ts)}</span></div>
             <div class="msg-body">${md(m.to?.length ? (stripLead(m.text) || m.text) : m.text)}</div>
+            ${m.files?.length ? `<div class="files">${m.files.map((f) => `<button type="button" class="file" data-file="${esc(f.id)}" data-name="${esc(f.name)}" title="Download ${esc(f.name)}">${ICON.file}<span class="nm">${esc(f.name)}</span><span class="sz num">${size(f.size)}</span></button>`).join('')}</div>` : ''}
             ${m.note ? `<div class="notice">Stopped: this thread reached the hop limit (${max}). Send a new message to continue.</div>` : ''}
           </div>
         </article>`;
@@ -1128,6 +1168,8 @@ document.addEventListener('click', async (e) => {
   const t = e.target.closest('button, [data-id], a');
   if (!t) return;
   if (t.dataset.view) return setView(t.dataset.view);
+  if (t.dataset.file) return downloadFile(t.dataset.file, t.dataset.name).catch((err) => { $('replyError').textContent = `Couldn't download ${t.dataset.name}: ${err.message}`; });
+  if (t.dataset.unattach) { pending[t.dataset.unattach].splice(Number(t.dataset.i), 1); return renderPending(t.dataset.unattach); }
   if (t.dataset.goto) return setView(t.dataset.goto);
   if (t.dataset.filter) { S.filter = t.dataset.filter; store.set('bc.filter', S.filter); return renderList(); }
   if (t.dataset.action === 'new' || t.id === 'newBtn') return startNew();
@@ -1218,14 +1260,46 @@ $('inviteForm').addEventListener('submit', async (e) => {
 
 $('picker').addEventListener('change', (e) => { if (e.target.name === 'to') { S.composeTo = e.target.value; store.set('bc.lastTo', S.composeTo); } });
 
+// Files picked for each composer, uploaded when the message is sent.
+const pending = { newForm: [], replyForm: [] };
+const MAX_FILES = 20;
+function addFiles(formId, list) {
+  pending[formId].push(...[...list].filter((f) => f.size > 0));
+  pending[formId] = pending[formId].slice(0, MAX_FILES);
+  renderPending(formId);
+}
+function renderPending(formId) {
+  $(formId === 'newForm' ? 'newFiles' : 'replyFiles').innerHTML = pending[formId].map((f, i) =>
+    `<button type="button" class="file" data-unattach="${formId}" data-i="${i}" title="Remove ${esc(f.name)}">${ICON.file}<span class="nm">${esc(f.name)}</span><span class="sz num">${size(f.size)} ✕</span></button>`).join('');
+}
+async function uploadFile(file) {
+  const res = await fetch(`/api/teams/${encodeURIComponent(S.team)}/files?name=${encodeURIComponent(file.name)}`, {
+    method: 'POST', body: file, headers: { 'content-type': file.type || 'application/octet-stream', authorization: `Bearer ${S.token}` } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${file.name}: ${body.error || `upload failed (${res.status})`}`);
+  return body;
+}
+async function downloadFile(id, name) {
+  const res = await fetch(`/api/teams/${encodeURIComponent(S.team)}/files/${encodeURIComponent(id)}`, { headers: { authorization: `Bearer ${S.token}` } });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `download failed (${res.status})`);
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 async function submit(form, textEl, errEl, btn, body) {
-  const text = textEl.value.trim();
+  const files = pending[form.id];
+  const text = textEl.value.trim() || (files.length ? `Attached ${files.map((f) => f.name).join(', ')}.` : '');
   errEl.textContent = '';
   if (!text) { errEl.textContent = 'Write a message first.'; textEl.focus(); return null; }
   btn.disabled = true;
   try {
-    const msg = await post('/messages', body(text));
+    const uploaded = [];
+    for (const f of files) uploaded.push(await uploadFile(f));
+    const msg = await post('/messages', { ...body(text), ...(uploaded.length ? { files: uploaded.map((f) => f.id) } : {}) });
     textEl.value = ''; autosize(textEl);
+    pending[form.id] = []; renderPending(form.id);
     if (msg.note) errEl.textContent = 'Not delivered: this delegation hit the hop limit. Raise it in Connect or start a new delegation.';
     return msg;
   } catch (err) {
@@ -1253,6 +1327,19 @@ $('replyForm').addEventListener('submit', async (e) => {
   if (msg && !S.messages.some((m) => m.id === msg.id)) { S.messages.push(msg); renderDetail(); }
   updateReplyHint();
 });
+
+document.addEventListener('change', (e) => {
+  const formId = e.target.dataset?.attach;
+  if (!formId) return;
+  addFiles(formId, e.target.files);
+  e.target.value = '';
+});
+for (const formId of ['newForm', 'replyForm']) {
+  const box = $(formId).querySelector('.field-box');
+  box.addEventListener('dragover', (e) => { if (e.dataTransfer?.types.includes('Files')) { e.preventDefault(); box.classList.add('drop'); } });
+  box.addEventListener('dragleave', () => box.classList.remove('drop'));
+  box.addEventListener('drop', (e) => { if (!e.dataTransfer?.files.length) return; e.preventDefault(); box.classList.remove('drop'); addFiles(formId, e.dataTransfer.files); });
+}
 
 function autosize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 240) + 'px'; }
 for (const el of [$('replyText'), $('newText')]) {

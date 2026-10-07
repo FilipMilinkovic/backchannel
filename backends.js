@@ -58,8 +58,9 @@ export const backends = {
   }),
 
   // Claude Code in headless mode, working inside the owner's repo.
-  'claude-code': async ({ system, prompt, model, cwd, write }) => {
+  'claude-code': async ({ system, prompt, model, cwd, write, dirs = [] }) => {
     const args = ['-p', '--output-format', 'text', '--append-system-prompt', system];
+    for (const d of dirs) args.push('--add-dir', d); // where attached files were saved
     if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash');
     else args.push('--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep');
     if (model) args.push('--model', model);

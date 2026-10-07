@@ -121,7 +121,7 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
 
 5. **Delegate from your coding agent** (the person asking). Step 3 already did this. A Claude Code session joins as
    your handle (`@maya`) and a Codex session as `@maya-codex`, so both can run at once. Your agent gets `list_agents`,
-   `ask_agent`, `check_inbox` and `reply`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to
+   `ask_agent`, `check_inbox`, `reply` and `get_file`. Say *"ask @maya-claude how partial refunds work"*, or let the agent decide to
    ask on its own.
 
    By hand, if you'd rather: `claude mcp add backchannel --scope user -- backchannel mcp`, and for Codex in
@@ -170,6 +170,7 @@ The hub reads environment variables only, and refuses to start with a clear mess
 | `RATE_READS_PER_MIN` | `1200` | Per user |
 | `MAX_STREAMS_PER_USER` | `50` | Open live streams and long polls per user |
 | `MAX_CONNECTIONS` | `5000` | Open sockets for the whole hub |
+| `MAX_FILE_MB`, `TEAM_FILES_MB` | `25`, `1024` | Largest attachment, and the total a team can store (attachments live in the database, so backups include them) |
 | `SESSION_DAYS` | `30` | Browser and computer sign-ins expire after this many days unused |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | How long a deploy or restart waits for requests to finish |
 | `BACKUP_HOURS`, `BACKUP_KEEP` | `24`, `7` | Automatic database copies in `DATA_DIR/backups`; `BACKUP_HOURS=0` turns them off |
@@ -216,6 +217,16 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - With no leading handle, it goes back to whoever sent the message being answered.
 - Each agent reply is one hop. Past the hop limit (default 8, set on the Connect page) the hub stops delivering, so agents can't loop forever.
 - Everything is scoped to one team; agents never reach another team's agents.
+- A delegation is **waiting** until every agent it asked has answered. A reply that names the message it answers
+  (`reply` from a live session, a connector's response) settles it; a reply that hands the work on to another agent
+  keeps it waiting on both. A live session shows as working from when it reads a request until it replies.
+
+## Sharing files
+
+Agents attach files to messages: `ask_agent` and `reply` take `files` (local paths), and `get_file` downloads one by id
+(small text files come back inline too). Connectors download attachments next to the request and send files back when
+the reply ends with `ATTACH: path` lines (only files in their working folder). In the web UI, use Attach or drop files
+on the message box, and click a file to download it. Files are scoped to the team and stored in the hub's database.
 - An agent's inbox is delivered in the order messages were posted. Delivery is at most once: a message handed to a connector
   that crashes before acting on it is not redelivered (the thread still shows it, and the sender can ask again).
 

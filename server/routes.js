@@ -1,7 +1,21 @@
 // The hub API (see docs/TEAMS-PLAN.md): accounts, invites, teams, members, agents, messages, threads, live events.
+import crypto from 'node:crypto';
 import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, stillValid, requireRole } from './auth.js';
 
 const LOGIN_TTL_MS = 60_000;
+const MAX_ATTACHMENTS = 20;
+const FILE_PATH = /^\/api\/teams\/[a-f0-9]+\/files$/;
+
+// A file name safe to store and to put in a download header: no folders, control characters or quotes.
+function fileName(raw) {
+  const base = String(raw || '').split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f"]/g, '').trim().slice(0, 200);
+  return base && base !== '.' && base !== '..' ? base : 'file';
+}
+const fileType = (raw) => {
+  const t = String(raw || '').split(';')[0].trim().toLowerCase();
+  return /^[a-z0-9][\w.+-]*\/[\w.+-]+$/.test(t) && t.length <= 100 ? t : 'application/octet-stream';
+};
+const fileView = ({ id, name, type, size }) => ({ id, name, type, size });
 
 export function createApi({ repo, rt, config, publicUrl, limits }) {
   // ---------- views ----------
@@ -77,6 +91,10 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     }
     if (b.threadId !== undefined && b.threadId !== null && typeof b.threadId !== 'string') throw httpError(400, 'threadId must be a string');
     if (b.inReplyTo !== undefined && b.inReplyTo !== null && typeof b.inReplyTo !== 'string') throw httpError(400, 'inReplyTo must be a string');
+    if (b.files !== undefined && (!Array.isArray(b.files) || b.files.length > MAX_ATTACHMENTS || b.files.some((f) => typeof f !== 'string'))) {
+      throw httpError(400, `files must be an array of at most ${MAX_ATTACHMENTS} file ids`);
+    }
+    const files = [...new Set(b.files || [])].map((fid) => repo.file(team.id, fid) || (() => { throw httpError(404, `unknown file ${fid}`); })());
     let parent = b.inReplyTo ? repo.message(b.inReplyTo) : null;
     if (b.inReplyTo && (!parent || parent.teamId !== team.id)) throw httpError(404, 'unknown parent message');
     const thread = b.threadId ? repo.threadMessages(team.id, b.threadId) : null;
@@ -88,7 +106,11 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     }
     const msg = { id: newId(), teamId: team.id, threadId: b.threadId || parent?.threadId || null,
       inReplyTo: parent?.id || null, from, fromKind, by: user.id, text, ts: Date.now(),
-      hop: fromKind === 'agent' ? (parent?.hop ?? 0) + 1 : 0 };
+      hop: fromKind === 'agent' ? (parent?.hop ?? 0) + 1 : 0,
+      // True when the sender answered a specific message (inReplyTo given), false for new requests and follow-ups.
+      // Tells the UI whether a delegation is still waiting on someone.
+      reply: !!b.inReplyTo };
+    if (files.length) msg.files = files.map(fileView);
     if (b.kind === 'error' || b.kind === 'declined') msg.kind = b.kind;
     if (b.title !== undefined) msg.title = b.title.trim();
     if (!msg.threadId) msg.threadId = msg.id;
@@ -157,7 +179,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     // Authenticate before reading bodies, then again after the await to honor revocations.
     let auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
     if (auth) (req.method === 'GET' ? limits.reads : limits.writes).take(`user:${auth.user.id}`);
-    const b = ['POST', 'PATCH'].includes(req.method) ? await ctx.readBody() : {};
+    const upload = req.method === 'POST' && FILE_PATH.test(p); // raw bytes, read once the team and role are checked
+    const b = ['POST', 'PATCH'].includes(req.method) && !upload ? await ctx.readBody() : {};
     auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
     let user = auth?.user || null;
     ctx.userId = user?.id;
@@ -347,6 +370,34 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         rt.broadcast(team.id, { type: 'status', id: a.id, state: pr.state, threadId: pr.stateThread });
         return send(res, 200, { ok: true });
       }
+    }
+    if (rest === '/files' && upload) {
+      requireRole(member, ['owner', 'member']);
+      const max = config.maxFileMb * 1_048_576;
+      const data = await ctx.readRaw(max);
+      // Re-check after the upload: the token or membership may have been revoked meanwhile.
+      auth = authenticate(req, url, repo, { sessionDays });
+      requireRole(repo.member(team.id, auth.user.id) || { role: null }, ['owner', 'member']);
+      if (!data.length) throw httpError(400, 'the file is empty');
+      if (repo.teamFileBytes(team.id) + data.length > config.teamFilesMb * 1_048_576) {
+        throw httpError(507, `this team's file storage is full (${config.teamFilesMb} MB)`);
+      }
+      const file = { id: crypto.randomBytes(12).toString('hex'), teamId: team.id, name: fileName(url.searchParams.get('name')),
+        type: fileType(req.headers['content-type']), size: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex'),
+        uploadedBy: auth.user.id, createdAt: Date.now(), data };
+      repo.insertFile(file);
+      return send(res, 200, { ...fileView(file), sha256: file.sha256 });
+    }
+    if ((m = /^\/files\/([a-f0-9]+)(\/info)?$/.exec(rest)) && req.method === 'GET') {
+      const file = repo.file(team.id, m[1]);
+      if (!file) throw httpError(404, 'unknown file');
+      if (m[2]) return send(res, 200, { ...fileView(file), sha256: file.sha256, createdAt: file.createdAt });
+      const data = repo.fileData(team.id, file.id);
+      // Always a download, never rendered on the hub's origin.
+      res.writeHead(200, { 'content-type': file.type, 'content-length': data.length, 'cache-control': 'private, no-store',
+        'content-disposition': `attachment; filename="${file.name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+        'content-security-policy': "default-src 'none'; sandbox" });
+      return res.end(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
     }
     if (rest === '/messages' && req.method === 'POST') {
       requireRole(member, ['owner', 'member']); return send(res, 200, postMessage(team, user, b));

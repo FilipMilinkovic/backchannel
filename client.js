@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+// Content types for uploads, by extension. Anything else is sent as application/octet-stream.
+const TYPES = { '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json', '.csv': 'text/csv', '.html': 'text/html',
+  '.js': 'text/javascript', '.ts': 'text/plain', '.py': 'text/x-python', '.yaml': 'application/yaml', '.yml': 'application/yaml',
+  '.xml': 'application/xml', '.diff': 'text/x-diff', '.patch': 'text/x-diff', '.log': 'text/plain', '.sql': 'application/sql',
+  '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.zip': 'application/zip', '.gz': 'application/gzip' };
+
 export const CONFIG_FILE = path.join(os.homedir(), '.backchannel', 'config.json');
 export function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
@@ -17,6 +24,20 @@ export function hubFromEnv({ url, team } = {}) {
   const sameHub = cfg.hub && cfg.hub.replace(/\/$/, '') === hubUrl;
   return new Hub(hubUrl, process.env.HUB_TOKEN || (sameHub ? cfg.token : undefined), team || process.env.HUB_TEAM || (sameHub ? cfg.team : undefined));
 }
+
+// Downloads a file into `dir` under its own name (never overwriting: "notes (2).md"). Returns { path, info, data }.
+export async function saveFile(hub, id, dir) {
+  const [info, data] = await Promise.all([hub.fileInfo(id), hub.download(id)]);
+  fs.mkdirSync(dir, { recursive: true });
+  const name = path.basename(info.name) || 'file';
+  const { name: stem, ext } = path.parse(name);
+  let target = path.join(dir, name);
+  for (let n = 2; fs.existsSync(target); n++) target = path.join(dir, `${stem} (${n})${ext}`);
+  fs.writeFileSync(target, data);
+  return { path: target, info, data };
+}
+
+export const formatSize = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
 
 export class Hub {
   constructor(url, token, team) {
@@ -70,6 +91,23 @@ export class Hub {
   post(msg) { return this.req('POST', this.t('/messages'), msg); }
   status(id, state, threadId) { return this.req('POST', this.t(`/agents/${id}/status`), { state, threadId }); }
   requeue(id, ids) { return this.req('POST', this.t(`/agents/${id}/requeue`), { ids }); }
+  // Files: upload one from disk (returns { id, name, type, size }), read its details, or download its bytes.
+  async upload(file) {
+    const data = fs.readFileSync(file);
+    const res = await fetch(this.url + this.t(`/files?name=${encodeURIComponent(path.basename(file))}`), {
+      method: 'POST', body: data,
+      headers: { 'content-type': TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { const e = new Error(`${path.basename(file)}: ${body.error || `hub ${res.status}`}`); e.status = res.status; throw e; }
+    return body;
+  }
+  fileInfo(id) { return this.req('GET', this.t(`/files/${id}/info`)); }
+  async download(id) {
+    const res = await fetch(this.url + this.t(`/files/${id}`), { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!res.ok) { const body = await res.json().catch(() => ({})); const e = new Error(body.error || `hub ${res.status}`); e.status = res.status; throw e; }
+    return Buffer.from(await res.arrayBuffer());
+  }
   inbox(id, wait = 25) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}`)); }
 
   // Register, then long-poll the inbox forever. Re-registers if the hub restarts; backs off if it's down.

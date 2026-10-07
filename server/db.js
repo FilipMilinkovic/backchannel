@@ -40,6 +40,12 @@ const MIGRATIONS = [
      team_id TEXT NOT NULL, agent_id TEXT NOT NULL, message_id TEXT NOT NULL REFERENCES messages(id),
      PRIMARY KEY (team_id, agent_id, message_id),
      FOREIGN KEY (team_id, agent_id) REFERENCES agents(team_id, id) ON DELETE CASCADE);`,
+  // Files attached to messages. Stored in the database so backups and restores carry them.
+  `CREATE TABLE files (
+     id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+     name TEXT NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+     uploaded_by TEXT, created_at INTEGER NOT NULL, data BLOB NOT NULL);
+   CREATE INDEX files_team ON files(team_id, created_at);`,
 ];
 
 export const DB_FILE = 'backchannel.db';

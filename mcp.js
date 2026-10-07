@@ -7,7 +7,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hubFromEnv, loadConfig } from './client.js';
+import { hubFromEnv, loadConfig, saveFile, formatSize } from './client.js';
 
 const hub = hubFromEnv();
 const saved = loadConfig();
@@ -52,7 +52,8 @@ async function ensureTeam() {
 
 // Threads this session asked in (threadId -> time of the latest ask), and messages already handed to the agent.
 // Replies are also read from the thread itself: another live session with the same handle (Claude Code and Codex
-// on one account, two terminals) shares the inbox and may have taken them from it.
+// on one account, two terminals) shares the inbox and may have taken them from it. Only messages addressed to us
+// count: when the agent we asked delegates onward, that side conversation is not its answer.
 const asked = new Map();
 const returned = new Set();
 
@@ -67,7 +68,7 @@ async function threadReplies(threadId) {
   const since = asked.get(threadId);
   if (since === undefined) return [];
   try {
-    const got = (await hub.thread(threadId)).filter((m) => m.from !== id && m.ts >= since && !returned.has(m.id));
+    const got = (await hub.thread(threadId)).filter((m) => m.from !== id && m.to?.includes(id) && m.ts >= since && !returned.has(m.id));
     if (got.length) take((m) => got.some((g) => g.id === m.id));
     return got;
   } catch { return []; }
@@ -93,6 +94,39 @@ async function waitFor(filter, seconds, threadId) {
   }
 }
 
+// Requests the agent has read but not answered yet (threadId -> when it read the latest one). While there are any,
+// this session shows as working on the newest one, so the asker sees it being handled. Unanswered ones expire.
+const handling = new Map();
+const HANDLING_MS = 30 * 60_000;
+let shownStatus = 'idle:';
+async function syncStatus() {
+  for (const [t, at] of handling) if (Date.now() - at > HANDLING_MS) handling.delete(t);
+  const latest = [...handling].sort((a, b) => b[1] - a[1])[0];
+  const next = latest ? `working:${latest[0]}` : 'idle:';
+  if (next === shownStatus) return;
+  shownStatus = next;
+  await hub.status(id, latest ? 'working' : 'idle', latest?.[0]).catch((err) => log(`could not update status: ${err.message}`));
+}
+setInterval(() => { if (handling.size) syncStatus(); }, 60_000).unref();
+// Messages that ask us for something (anything but an answer to our own ask) put the thread in `handling`.
+function noteRead(msgs) {
+  for (const m of msgs) if (!m.reply && m.kind !== 'error' && m.kind !== 'declined') handling.set(m.threadId, Date.now());
+  return syncStatus();
+}
+
+// Files to attach: paths relative to the session's working directory, uploaded before the message is posted.
+async function uploadAll(files) {
+  if (files === undefined) return [];
+  if (!Array.isArray(files)) throw new Error('files must be a list of file paths');
+  const out = [];
+  for (const f of files) {
+    const file = path.resolve(String(f).replace(/^~(?=$|\/)/, os.homedir()));
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new Error(`${f} is not a file`);
+    out.push(await hub.upload(file));
+  }
+  return out;
+}
+
 // Appended to every tool result, so the agent learns about new messages whenever it touches Backchannel.
 function unreadNote() {
   if (!buffer.length) return '';
@@ -100,7 +134,9 @@ function unreadNote() {
   return `\n\n📬 ${buffer.length} unread Backchannel message${buffer.length > 1 ? 's' : ''} from ${from}. Call check_inbox to read ${buffer.length > 1 ? 'them' : 'it'}.`;
 }
 
-const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}]\n${m.text}`).join('\n\n');
+const attachments = (m) => (m.files?.length ? `\nAttached files (save with get_file):\n${m.files.map((f) => `- ${f.name} (${formatSize(f.size)}, ${f.type}), file_id ${f.id}`).join('\n')}` : '');
+const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}]\n${m.text}${attachments(m)}`).join('\n\n');
+const FILES_PARAM = { type: 'array', items: { type: 'string' }, description: 'Optional: absolute paths of local files to attach (logs, diffs, screenshots, specs). The other agent can download them.' };
 
 const tools = [
   {
@@ -122,17 +158,20 @@ const tools = [
         agent: { type: 'string', description: 'Handle of the agent, e.g. "steve" (from list_agents)' },
         message: { type: 'string', description: 'Self-contained request with all the context the other agent needs' },
         thread_id: { type: 'string', description: 'Optional: continue an existing thread' },
+        files: FILES_PARAM,
         wait_seconds: { type: 'number', description: 'How long to wait for the reply (default 240, max 900)' },
       },
       required: ['agent', 'message'],
     },
-    run: async ({ agent, message, thread_id, wait_seconds = 240 }) => {
+    run: async ({ agent, message, thread_id, files, wait_seconds = 240 }) => {
       const handle = String(agent).replace(/^@/, '').toLowerCase();
-      const sent = await hub.post({ from: id, text: `@${handle} ${message}`, threadId: thread_id });
+      const uploaded = await uploadAll(files);
+      const sent = await hub.post({ from: id, text: `@${handle} ${message}`, threadId: thread_id, files: uploaded.map((f) => f.id) });
       if (sent.note) return `Not delivered: ${sent.note}`;
       if (!sent.to.length) return `@${handle} is not on the network. Call list_agents to see who is.`;
       asked.set(sent.threadId, sent.ts);
       const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900), sent.threadId);
+      await noteRead(replies); // a question back counts as a request to us
       if (!replies.length) return `Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Call check_inbox with thread_id "${sent.threadId}" later.`;
       return `thread_id: ${sent.threadId}\n\n${fmt(replies)}`;
     },
@@ -149,20 +188,43 @@ const tools = [
     },
     run: async ({ thread_id, wait_seconds = 0 }) => {
       const msgs = await waitFor((m) => !thread_id || m.threadId === thread_id, Math.min(wait_seconds, 900), thread_id);
+      await noteRead(msgs);
       return msgs.length ? fmt(msgs) : 'Inbox is empty.';
     },
   },
   {
     name: 'reply',
-    description: 'Reply to a message from another agent (use the message id from check_inbox). The reply goes to whoever sent it.',
+    description: 'Reply to a message from another agent (use the message id from check_inbox). The reply goes to whoever sent it, and marks their request answered. Attach files with `files`.',
     inputSchema: {
       type: 'object',
-      properties: { message_id: { type: 'string' }, text: { type: 'string' } },
+      properties: { message_id: { type: 'string' }, text: { type: 'string' }, files: FILES_PARAM },
       required: ['message_id', 'text'],
     },
-    run: async ({ message_id, text }) => {
-      const sent = await hub.post({ from: id, inReplyTo: message_id, text });
-      return `Sent to ${sent.to.map((t) => '@' + t).join(', ') || 'nobody'} (thread ${sent.threadId}).`;
+    run: async ({ message_id, text, files }) => {
+      const uploaded = await uploadAll(files);
+      const sent = await hub.post({ from: id, inReplyTo: message_id, text, files: uploaded.map((f) => f.id) });
+      handling.delete(sent.threadId);
+      await syncStatus();
+      const names = uploaded.length ? ` with ${uploaded.map((f) => f.name).join(', ')}` : '';
+      return `Sent to ${sent.to.map((t) => '@' + t).join(', ') || 'nobody'}${names} (thread ${sent.threadId}).`;
+    },
+  },
+  {
+    name: 'get_file',
+    description: 'Download a file another agent attached to a message (the file_id is listed under the message). Saves it locally and returns the path; small text files are also shown inline.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string' },
+        save_to: { type: 'string', description: 'Optional: folder to save into, e.g. one in your project. Defaults to a temporary folder.' },
+      },
+      required: ['file_id'],
+    },
+    run: async ({ file_id, save_to }) => {
+      const dir = save_to ? path.resolve(String(save_to).replace(/^~(?=$|\/)/, os.homedir())) : path.join(os.tmpdir(), 'backchannel-files');
+      const { path: saved, info, data } = await saveFile(hub, String(file_id), dir);
+      const text = /^text\/|json|xml|yaml|javascript|sql|x-diff/.test(info.type) && data.length <= 50_000 && !data.includes(0) ? data.toString('utf8') : null;
+      return `Saved ${info.name} (${formatSize(info.size)}, ${info.type}) to ${saved}${text === null ? '' : `\n\n--- ${info.name} ---\n${text}`}`;
     },
   },
 ];
@@ -184,6 +246,7 @@ async function handle(req) {
           `- When the task needs information, a decision or a change that belongs to another person or their codebase, call list_agents and ask_agent their agent directly instead of stopping to ask the user to relay it. Write the request so it stands alone; the other agent can't see this conversation.`,
           `- At the start of a task, call check_inbox. Other agents may have asked you something or replied to an earlier ask.`,
           `- When a tool result says you have unread messages, read them with check_inbox. Answer requests addressed to you with reply, using what you know or can find in this workspace. Ask the user first only if answering would mean changing files, sharing secrets, or committing them to something.`,
+          `- To share a file (log, diff, screenshot, spec), pass its path in \`files\` on ask_agent or reply. Download files you receive with get_file.`,
           `- Tell the user briefly when you delegated something or answered another agent.`,
         ].join('\n'),
       } });
@@ -219,6 +282,7 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   try { if (buffer.length) await hub.requeue(id, buffer.map((m) => m.id)); } catch (err) { log(`could not requeue: ${err.message}`); }
+  if (handling.size) { handling.clear(); await syncStatus(); }
   try { fs.rmSync(STATE_FILE, { force: true }); } catch {}
   process.exit(0);
 }
