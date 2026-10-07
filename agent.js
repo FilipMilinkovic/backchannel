@@ -1,46 +1,60 @@
 #!/usr/bin/env node
-// Connector: makes an agent reachable on the network.
-//   node agent.js --id steve --backend claude-code --cwd ~/code/payments --owner Steve
+// Connector: makes an agent reachable on the network. Run it in the repo it should answer about:
+//   cd ~/code/payments && backchannel connect          (@<you>-claude, Claude Code, read-only, asks you first)
+//   backchannel connect --id steve --backend codex --cwd ~/code/payments --write --no-approve
 import { parseArgs } from 'node:util';
 import readline from 'node:readline/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { hubFromEnv, saveFile, describeWorkspace, machineInfo } from './client.js';
+import { spawnSync } from 'node:child_process';
+import { hubFromEnv, loadConfig, saveFile, describeWorkspace, machineInfo } from './client.js';
 import { backends } from './backends.js';
 
 const { values: opt } = parseArgs({
+  allowNegative: true,
   options: {
     id: { type: 'string' },
-    backend: { type: 'string', default: 'echo' },
+    backend: { type: 'string' },
     name: { type: 'string' },
     owner: { type: 'string' },
     about: { type: 'string', default: '' },
     model: { type: 'string' },
     cwd: { type: 'string', default: process.cwd() },
-    write: { type: 'boolean', default: false },   // let claude-code/codex edit files
-    approve: { type: 'boolean', default: false }, // owner confirms each request in this terminal
+    write: { type: 'boolean', default: false },  // let claude-code/codex edit files
+    approve: { type: 'boolean', default: true }, // owner confirms each request in this terminal (--no-approve to skip)
     hub: { type: 'string' },
     team: { type: 'string', default: process.env.HUB_TEAM },
+    help: { type: 'boolean', short: 'h' },
   },
 });
-if (!opt.id) { console.error('usage: node agent.js --id <handle> --backend <openai|grok|claude-code|codex|echo> [--cwd dir] [--owner name] [--team id] [--write] [--approve]\n  env: HUB_URL, HUB_TOKEN (your personal token), HUB_TEAM (if you are in several teams)'); process.exit(1); }
-const run = backends[opt.backend];
-if (!run) { console.error(`unknown backend "${opt.backend}". Options: ${Object.keys(backends).join(', ')}`); process.exit(1); }
+const USAGE = `usage: backchannel connect [--backend claude-code|codex|openai|grok|echo] [--cwd dir] [--id handle] [--write] [--no-approve]
+  Defaults: Claude Code (or Codex if that's what's installed), the current folder, @<you>-claude, read-only,
+  and it asks you in this terminal before handling each request.`;
+const die = (msg) => { console.error(msg); process.exit(1); };
+if (opt.help) { console.log(USAGE); process.exit(0); }
 
-const id = opt.id.toLowerCase();
+const onPath = (cmd) => spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd]).status === 0;
+const backend = opt.backend || (onPath('claude') ? 'claude-code' : onPath('codex') ? 'codex' : null);
+if (!backend) die(`Neither claude nor codex is on your PATH. Install one, or pick a backend with --backend.\n${USAGE}`);
+const run = backends[backend];
+if (!run) die(`unknown backend "${backend}". Options: ${Object.keys(backends).join(', ')}`);
+if (opt.approve && !process.stdin.isTTY) die('--approve asks in this terminal, but there is none. Run it in a terminal, or add --no-approve to handle requests without asking.');
+
 const cwd = path.resolve(opt.cwd.replace(/^~/, process.env.HOME));
-const isCoder = opt.backend === 'claude-code' || opt.backend === 'codex';
+const isCoder = backend === 'claude-code' || backend === 'codex';
 // Built from the owner's name, which may only be known once we've reached the hub, and the repos found in the folder.
 let workspace = null;
 const where = () => (workspace?.repos.length > 1 ? `${workspace.repos.length} repos in ${path.basename(cwd)}`
   : `the ${workspace?.repos[0]?.name || path.basename(cwd)} repo`);
 const describe = (owner) => opt.about || (isCoder
-  ? `${owner ? owner + "'s" : 'A'} ${opt.backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.`
-  : `${owner ? owner + "'s" : 'An'} ${opt.backend} assistant.`);
+  ? `${owner ? owner + "'s" : 'A'} ${backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.`
+  : `${owner ? owner + "'s" : 'An'} ${backend} assistant.`);
 let description = describe(opt.owner);
 const hub = hubFromEnv({ url: opt.hub, team: opt.team });
-const card = { id, name: opt.name || id, backend: opt.backend, model: opt.model, owner: opt.owner, description,
+// Set once we know who you are: --id, or your handle plus the backend (maya-claude, maya-codex).
+let id = opt.id?.toLowerCase();
+const card = { id, name: opt.name || id, backend, model: opt.model, owner: opt.owner, description,
   access: isCoder && opt.write ? 'write' : 'read', repo: isCoder ? path.basename(cwd) : null, approve: opt.approve, ...machineInfo() };
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
 
@@ -48,7 +62,7 @@ function systemPrompt(agents, sender) {
   const others = agents.filter((a) => a.id !== id)
     .map((a) => `- @${a.id}: ${a.name} [${a.backend}${a.owner ? `, ${a.owner}` : ''}]${a.online ? '' : ' (offline)'}: ${a.description}`)
     .join('\n') || '- (no other agents yet)';
-  return `You are @${id}${opt.owner ? `, the agent of ${opt.owner}` : ''}, on a shared Agent Network where people's AI agents message each other.
+  return `You are @${id}${card.owner ? `, the agent of ${card.owner}` : ''}, on a shared Agent Network where people's AI agents message each other.
 ${description}
 ${isCoder ? `Your working directory is ${cwd}. Use it to answer questions about this code${opt.write ? ' and to make requested changes' : ' (read-only: you cannot edit files)'}.` : ''}
 
@@ -122,7 +136,7 @@ async function approve(msg) {
 async function handle(msg) {
   console.log(`← @${msg.from}: ${msg.text.slice(0, 120)}`);
   if (!(await approve(msg))) {
-    await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, kind: 'declined', text: `${opt.owner || 'My owner'} declined this request.` });
+    await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, kind: 'declined', text: `${card.owner || 'My owner'} declined this request.` });
     await hub.status(id, 'idle', msg.threadId).catch(() => {});
     return;
   }
@@ -142,24 +156,33 @@ async function handle(msg) {
     console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${reply.slice(0, 120)}`);
   } catch (err) {
     console.error(`  backend error: ${err.message}`);
-    await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, to: [msg.from], kind: 'error', text: `${opt.backend} error: ${err.message}` }).catch(() => {});
+    await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, to: [msg.from], kind: 'error', text: `${backend} error: ${err.message}` }).catch(() => {});
   } finally {
     clearInterval(heartbeat);
     await hub.status(id, 'idle', msg.threadId).catch(() => {});
   }
 }
 
-console.log(`@${id} (${opt.backend}${isCoder ? ` in ${cwd}` : ''}) connecting to ${hub.url}…`);
 try {
   // Fail fast on bad tokens or teams; if the hub is just down, listen() keeps retrying.
   const me = await hub.resolveTeam().catch((err) => { if (err.status) throw err; return null; });
+  if (!id) {
+    const saved = loadConfig();
+    const handle = me?.user.handle || (saved.hub?.replace(/\/$/, '') === hub.url ? saved.handle : null);
+    if (!handle) die(`Can't tell who you are on ${hub.url} yet. Sign this computer in first (Connect page → Create setup command), or pass --id.`);
+    const suffix = backend === 'claude-code' ? 'claude' : backend;
+    id = `${handle.slice(0, 31 - suffix.length)}-${suffix}`;
+    card.id = id; card.name ||= id;
+  }
   if (isCoder) Object.assign(card, workspace = await describeWorkspace(cwd));
   if (me && !card.owner) card.owner = me.user.name || me.user.handle;
   card.description = description = describe(card.owner);
+  const access = isCoder ? `${opt.write ? 'can edit' : 'read-only'} in ${cwd.replace(process.env.HOME, '~')}, ` : '';
+  console.log(`@${id} (${backend}, ${access}${opt.approve ? 'asks you before each request' : 'handles requests without asking'}) connecting to ${hub.url}…`);
   await hub.listen(card, handle, (s) => console.log(s));
 } catch (err) {
   // 410: someone disconnected this agent from the hub's UI or CLI. That's a deliberate stop, not a failure.
   if (err.status === 410) process.exit(0); // listen() already said who disconnected it
-  console.error(`@${id} can't connect: ${err.message}`);
+  console.error(`@${id || 'agent'} can't connect: ${err.message}`);
   process.exit(1);
 }

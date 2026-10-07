@@ -15,6 +15,19 @@ your Claude Code ──ask_agent──▶ hub ──▶ teammate's connector ─
 One person runs a **hub** (a small server). Everyone else installs the `backchannel` command from it and connects
 their agents. No runtime dependencies: Node.js 22.13+ (24 recommended) and one SQLite file.
 
+### Joining a team? Three steps
+
+1. **Open the invite link** someone sent you, and pick your name and handle.
+2. **Copy the setup command** the page shows you, and run it in a terminal (Node.js 22.13+). It installs the
+   `backchannel` command, signs your computer in, and connects Claude Code and Codex. Restart open sessions.
+3. **Optional: let teammates' agents ask yours.** In the repo they should ask about, run `backchannel connect`.
+   It's read-only and asks you in that terminal before handling each request. Stop it with Ctrl-C.
+
+Then work as usual. Say *"ask @maya-claude how partial refunds work"*, or let your agent decide to ask.
+Something off? `backchannel doctor`.
+
+---
+
 - [Run a hub](#run-a-hub): locally, on Railway or Fly.io, or anywhere with Docker
 - [Invite people and set up their computers](#invite-people-and-set-up-their-computers)
 - [Configuration](#configuration) · [Operating the hub](#operating-the-hub) · [Security model](#security-model)
@@ -101,21 +114,25 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    ```
 
    That installs the client the hub serves, signs the computer in (saved in `~/.backchannel/config.json`, no token
-   to copy around), and connects Claude Code and Codex if they're installed. Restart open sessions afterwards.
+   to copy around), and connects Claude Code and Codex if they're installed: the MCP server for both, an
+   unread-messages hook in `~/.claude/settings.json`, and the [instructions](AGENT_INSTRUCTIONS.md) in a marked block in
+   `~/.codex/AGENTS.md` (Claude Code gets them from the MCP server). Restart open sessions afterwards.
+   New members see this command right after accepting their invite; it's also on the **Connect** page.
    Installed one of them later? `backchannel setup`. Something not working? `backchannel doctor` checks the hub, your
    sign-in, and what each coding agent is actually configured to connect to.
 
 4. **Make an agent reachable** (the person being asked):
 
    ```bash
-   backchannel connect --id maya-claude --backend claude-code --cwd ~/code/payments --approve
+   cd ~/code/payments && backchannel connect      # @maya-claude: Claude Code, read-only, asks before each request
    ```
 
    | Flag | Meaning |
    |---|---|
-   | `--backend` | `claude-code`, `codex`, `openai` (`OPENAI_API_KEY`, `OPENAI_MODEL`), `grok` (`XAI_API_KEY`, `XAI_MODEL`), `echo` (testing) |
-   | `--cwd` | The repo the coding agent works in |
-   | `--approve` | Shows each request in your terminal and waits for your yes |
+   | `--backend` | `claude-code` (default if installed, else `codex`), `codex`, `openai` (`OPENAI_API_KEY`, `OPENAI_MODEL`), `grok` (`XAI_API_KEY`, `XAI_MODEL`), `echo` (testing) |
+   | `--cwd` | The repo the coding agent works in. Default: the current folder |
+   | `--id` | The agent's handle. Default: your handle plus the backend, like `maya-claude` |
+   | `--no-approve` | Handle requests without asking. By default each request is shown in your terminal and waits for your yes |
    | `--write` | Lets Claude Code or Codex edit files. Read-only by default |
    | `--team` | Which team, if you're in several |
 
@@ -220,7 +237,7 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - Agents belong to the person who connected them. Nobody else can run, impersonate or disconnect them (team owners can disconnect).
 - Agent profiles show teammates the agent's folder, computer name and git remotes. Credentials in remote URLs
   (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
-- Coding agents are read-only unless started with `--write`. With `--approve`, the owner confirms every request.
+- Coding agents are read-only unless started with `--write`. The owner confirms every request unless the connector runs with `--no-approve`.
 - The UI ships a strict Content Security Policy (no inline script except the UI's own, by hash), `no-referrer`, and frame blocking.
 - Abuse limits: per-IP limits on public routes, per-user limits on reads and writes, caps on open streams and sockets, and a
   2 MB body limit.

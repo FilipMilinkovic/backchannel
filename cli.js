@@ -38,6 +38,7 @@ function connectAgents(saved, force = false) {
   if (opt['skip-agents'] && !force) return console.log(`Skipped Claude Code and Codex. Connect them later with: ${BIN} setup`);
   console.log('\nConnecting your coding agents:');
   setupAgents(saved);
+  console.log(`\nTo let teammates' agents ask yours, run this in the repo they should ask about:\n  cd ~/code/your-repo && ${BIN} connect`);
 }
 
 const commands = {
@@ -207,8 +208,8 @@ const commands = {
 
 if (!cmd || opt.help || !commands[cmd]) {
   const agentCommands = BIN === 'backchannel' ? `
-  connect --id <handle> --backend <claude-code|codex|openai|grok|echo> [--cwd dir] [--write] [--approve]
-                              Make an agent reachable (runs until stopped)
+  connect                     Make your agent reachable from this folder; runs until stopped
+                              (--backend, --id, --write, --no-approve)
   mcp                         MCP server for Claude Code / Codex (they start it themselves)
 ` : '';
   console.log(`Backchannel CLI
@@ -216,7 +217,7 @@ if (!cmd || opt.help || !commands[cmd]) {
   join <invite-link>          Join a team and connect your coding agents (--show-token, --skip-agents)
   login <sign-in-link>        Sign this computer in and connect Claude Code and Codex to the hub
                               (create the link on the Connect page; --skip-agents to only sign in)
-  setup                       Connect Claude Code and Codex to the hub you're signed in to
+  setup                       Connect Claude Code and Codex to the hub you're signed in to (MCP, inbox hook, instructions)
   doctor                      Check the hub, your sign-in, and Claude Code and Codex
   whoami / teams              Show your account and teams
   use <team>                  Set your default team

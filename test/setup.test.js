@@ -44,6 +44,9 @@ function home(t, { claude, codex }) {
     setup: () => run(`import { setupAgents } from './setup.js'; setupAgents({ hub: 'https://hub.example' });`),
     claude: () => JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')),
     codex: () => fs.readFileSync(path.join(dir, '.codex', 'config.toml'), 'utf8'),
+    claudeSettings: () => JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'settings.json'), 'utf8')),
+    agentsMd: () => fs.readFileSync(path.join(dir, '.codex', 'AGENTS.md'), 'utf8'),
+    write: (file, text) => { fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true }); fs.writeFileSync(path.join(dir, file), text); },
   };
 }
 
@@ -94,8 +97,18 @@ test('setup repoints Claude Code and Codex that were pinned to another hub, and 
   assert.equal(codex.match(/\[mcp_servers\.backchannel\]/g).length, 1);
   assert.equal(fs.readFileSync(path.join(h.dir, '.codex', 'config.toml.bak'), 'utf8'), LOCAL_CODEX);
 
+  const settings = h.claudeSettings();
+  assert.deepEqual(settings.hooks.UserPromptSubmit, [{ hooks: [{ type: 'command', command: `${path.join(h.dir, 'bin', 'node')} ${BIN} inbox-hook` }] }]);
+  assert.match(out.stdout, /Claude Code: added the unread-messages hook/);
+  const agents = h.agentsMd();
+  assert.ok(agents.startsWith('<!-- backchannel:start -->\n## Backchannel') && agents.trim().endsWith('<!-- backchannel:end -->'));
+  assert.match(out.stdout, /Codex: added the Backchannel instructions/);
+
   // Running it again changes nothing.
   const again = h.setup();
+  assert.doesNotMatch(again.stdout, /hook|instructions|Restart/);
+  assert.deepEqual(h.claudeSettings(), settings);
+  assert.equal(h.agentsMd(), agents);
   assert.match(again.stdout, /Claude Code: already connected/);
   assert.match(again.stdout, /Codex: already connected/);
   assert.equal(h.codex(), codex);
@@ -118,10 +131,42 @@ test('doctor names what is wrong and passes once set up', (t) => {
     const cfg = { hub: 'http://127.0.0.1:9', token: 'bc_x' }; await doctor(new Hub(cfg.hub, cfg.token), cfg);`);
   const before = doctor().stdout;
   assert.match(before, /Claude Code: HUB_URL pins it to http:\/\/127\.0\.0\.1:7777, but you're signed in to http:\/\/127\.0\.0\.1:9/);
-  assert.match(before, /Codex: .*not this install/);
+  assert.match(before, /Claude Code: .*no unread-messages hook/);
+  assert.match(before, /Codex: .*not this install; no Backchannel instructions in ~\/\.codex\/AGENTS\.md/);
   assert.match(before, /Run: backchannel setup/);
   h.setup();
   const after = doctor().stdout;
   assert.match(after, /✓ Claude Code: connected/);
   assert.match(after, /✓ Codex: connected/);
+});
+
+test('setup replaces an old inbox hook, keeps other hooks, and updates only its own block in AGENTS.md', (t) => {
+  const h = home(t, { claude: { mcpServers: { backchannel: { command: 'node', args: ['/old/clone/mcp.js'], env: { HUB_URL: 'https://hub.example', AGENT_ID: 'maya-laptop' } } } }, codex: '' });
+  h.write('.claude/settings.json', JSON.stringify({ model: 'opus', hooks: {
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node /old/clone/hooks/inbox-hook.js maya' }, { type: 'command', command: 'echo hi' }] }],
+    Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] } }));
+  h.write('.codex/AGENTS.md', '# Mine\n\n<!-- backchannel:start -->\nold text\n<!-- backchannel:end -->\n\n## After\n');
+  assert.equal(h.setup().status, 0);
+
+  const settings = h.claudeSettings();
+  assert.equal(settings.model, 'opus');
+  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: 'say done' }] }]);
+  assert.deepEqual(settings.hooks.UserPromptSubmit, [
+    { hooks: [{ type: 'command', command: 'echo hi' }] },
+    { hooks: [{ type: 'command', command: `${path.join(h.dir, 'bin', 'node')} ${BIN} inbox-hook maya-laptop` }] },
+  ], 'the hook reads the inbox of the handle the session keeps');
+  assert.ok(fs.existsSync(path.join(h.dir, '.claude', 'settings.json.bak')));
+
+  const agents = h.agentsMd();
+  assert.ok(agents.startsWith('# Mine\n\n<!-- backchannel:start -->\n## Backchannel'));
+  assert.ok(agents.endsWith('<!-- backchannel:end -->\n\n## After\n'));
+  assert.ok(!agents.includes('old text'));
+});
+
+test('setup leaves Backchannel instructions someone added by hand', (t) => {
+  const h = home(t, { codex: '' });
+  const mine = '## Backchannel\nUse it. Call check_inbox first.\n';
+  h.write('.codex/AGENTS.md', mine);
+  assert.equal(h.setup().status, 0);
+  assert.equal(h.agentsMd(), mine);
 });
