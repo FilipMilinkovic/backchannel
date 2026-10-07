@@ -24,23 +24,31 @@ let fatal = null; // set when the hub rejects our token or team; tools report it
 const log = (...a) => console.error('[backchannel]', ...a); // stdout is reserved for the protocol
 
 // Unread messages are mirrored to a small file so hooks (e.g. a Claude Code prompt hook) can tell the agent about them.
+// Every session with this handle sees the same unread messages, so they share the file.
 const STATE_DIR = path.join(os.homedir(), '.backchannel');
 const STATE_FILE = path.join(STATE_DIR, `inbox-${id}.json`);
 function writeState() {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    const unread = buffer.map((m) => ({ id: m.id, from: m.from, threadId: m.threadId, preview: m.text.slice(0, 140) }));
+    const unread = [...unclaimed.values()].map((m) => ({ id: m.id, from: m.from, threadId: m.threadId, preview: m.text.slice(0, 140) }));
     fs.writeFileSync(STATE_FILE, JSON.stringify({ id, pid: process.pid, updated: Date.now(), unread }, null, 2));
   } catch (err) { log(`could not write ${STATE_FILE}: ${err.message}`); }
 }
 
-// Messages addressed to us land here; tools read from it.
-const buffer = [];
+// Messages addressed to us that no session has read yet (id -> message), mirrored from the hub. They stay on the hub
+// until a tool hands them to the agent: the user may have several sessions open, all as this handle, and a message
+// belongs to the one whose agent reads it, not to whichever session's poll happened to see it first.
+let unclaimed = new Map();
 const wakers = new Set();
-hub.listen(
+hub.watch(
   { id, name: `${owner} (live session)`, backend: process.env.AGENT_KIND || 'claude-code', kind: 'session', owner,
     description: `${owner}'s live coding session. Messages are read when ${owner}'s agent checks its inbox.` },
-  (msg) => { buffer.push(msg); writeState(); for (const w of wakers) w(); },
+  (msgs) => {
+    const arrived = msgs.some((m) => !unclaimed.has(m.id));
+    unclaimed = new Map(msgs.map((m) => [m.id, m]));
+    writeState();
+    if (arrived) for (const w of wakers) w();
+  },
   log,
 ).catch((err) => { fatal = err.message; log(`not connected: ${err.message}`); });
 
@@ -51,17 +59,20 @@ async function ensureTeam() {
 }
 
 // Threads this session asked in (threadId -> time of the latest ask), and messages already handed to the agent.
-// Replies are also read from the thread itself: another live session with the same handle (Claude Code and Codex
-// on one account, two terminals) shares the inbox and may have taken them from it. Only messages addressed to us
-// count: when the agent we asked delegates onward, that side conversation is not its answer.
+// Replies are also read from the thread itself: another live session with the same handle (another terminal) may
+// have claimed them first. Only messages addressed to us count: when the agent we asked delegates onward, that side
+// conversation is not its answer.
 const asked = new Map();
 const returned = new Set();
 
-function take(filter) {
-  const out = [];
-  for (let i = buffer.length - 1; i >= 0; i--) if (filter(buffer[i])) out.unshift(...buffer.splice(i, 1));
-  if (out.length) writeState();
-  return out.filter((m) => !returned.has(m.id));
+// Claims the unread messages matching `filter`. Another session with this handle may have claimed some already.
+async function take(filter) {
+  const ids = [...unclaimed.values()].filter(filter).map((m) => m.id);
+  if (!ids.length) return [];
+  const got = await hub.claim(id, ids);
+  for (const i of ids) unclaimed.delete(i);
+  writeState();
+  return got.filter((m) => !returned.has(m.id));
 }
 
 async function threadReplies(threadId) {
@@ -69,16 +80,16 @@ async function threadReplies(threadId) {
   if (since === undefined) return [];
   try {
     const got = (await hub.thread(threadId)).filter((m) => m.from !== id && m.to?.includes(id) && m.ts >= since && !returned.has(m.id));
-    if (got.length) take((m) => got.some((g) => g.id === m.id));
+    if (got.length) await take((m) => got.some((g) => g.id === m.id)).catch(() => {});
     return got;
   } catch { return []; }
 }
 
-// Waits for buffered messages matching `filter`; for a thread we asked in, also checks the thread every few seconds.
+// Waits for unread messages matching `filter`; for a thread we asked in, also checks the thread every few seconds.
 async function waitFor(filter, seconds, threadId) {
   const deadline = Date.now() + seconds * 1000;
   for (;;) {
-    let got = take(filter);
+    let got = await take(filter);
     if (!got.length && threadId) got = await threadReplies(threadId);
     for (const m of got) returned.add(m.id);
     if (got.length || Date.now() >= deadline) return got;
@@ -129,9 +140,10 @@ async function uploadAll(files) {
 
 // Appended to every tool result, so the agent learns about new messages whenever it touches Backchannel.
 function unreadNote() {
-  if (!buffer.length) return '';
-  const from = [...new Set(buffer.map((m) => '@' + m.from))].join(', ');
-  return `\n\n📬 ${buffer.length} unread Backchannel message${buffer.length > 1 ? 's' : ''} from ${from}. Call check_inbox to read ${buffer.length > 1 ? 'them' : 'it'}.`;
+  const n = unclaimed.size;
+  if (!n) return '';
+  const from = [...new Set([...unclaimed.values()].map((m) => '@' + m.from))].join(', ');
+  return `\n\n📬 ${n} unread Backchannel message${n > 1 ? 's' : ''} from ${from}. Call check_inbox to read ${n > 1 ? 'them' : 'it'}.`;
 }
 
 const attachments = (m) => (m.files?.length ? `\nAttached files (save with get_file):\n${m.files.map((f) => `- ${f.name} (${formatSize(f.size)}, ${f.type}), file_id ${f.id}`).join('\n')}` : '');
@@ -276,14 +288,14 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   try { req = JSON.parse(line); } catch { return write({ id: null, error: { code: -32700, message: 'parse error' } }); }
   handle(req).catch((err) => log(err));
 });
-// On shutdown, hand unread messages back to the hub so the next session gets them.
+// Unread messages were never taken from the hub, so there is nothing to hand back on shutdown. The state file is
+// removed only if it is ours: other sessions with this handle may still be using it.
 let closing = false;
 async function shutdown() {
   if (closing) return;
   closing = true;
-  try { if (buffer.length) await hub.requeue(id, buffer.map((m) => m.id)); } catch (err) { log(`could not requeue: ${err.message}`); }
   if (handling.size) { handling.clear(); await syncStatus(); }
-  try { fs.rmSync(STATE_FILE, { force: true }); } catch {}
+  try { if (JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).pid === process.pid) fs.rmSync(STATE_FILE, { force: true }); } catch {}
   process.exit(0);
 }
 process.stdin.on('end', shutdown);

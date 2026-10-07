@@ -109,16 +109,30 @@ export class Hub {
     return Buffer.from(await res.arrayBuffer());
   }
   inbox(id, wait = 25) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}`)); }
+  pending(id, after = 0, wait = 25) { return this.req('GET', this.t(`/agents/${id}/pending?wait=${wait}&after=${after}`)); }
+  async claim(id, ids) { return (await this.req('POST', this.t(`/agents/${id}/claim`), { ids })).messages; }
 
-  // Register, then long-poll the inbox forever. Re-registers if the hub restarts; backs off if it's down.
-  // Stops on auth/permission errors, since retrying can't fix those.
-  async listen(card, onMessage, log = () => {}) {
+  // Register, then long-poll the inbox forever, taking each message (one process per agent).
+  listen(card, onMessage, log = () => {}) {
+    return this.#run(card, log, async () => { for (const msg of await this.inbox(card.id)) await onMessage(msg); });
+  }
+
+  // Like listen, but leaves messages on the hub until claim() takes them, for live sessions: several can share a
+  // handle, and each message should reach the one whose agent reads it. `onUpdate` gets every unclaimed message
+  // whenever the inbox changes, and at least every 25 s.
+  watch(card, onUpdate, log = () => {}) {
+    let after = 0;
+    return this.#run(card, log, async () => { const r = await this.pending(card.id, after); after = r.cursor; await onUpdate(r.messages); });
+  }
+
+  // Re-registers if the hub restarts; backs off if it's down. Stops on auth/permission errors, since retrying can't fix those.
+  async #run(card, log, step) {
     let registered = false, backoff = 1000;
     for (;;) {
       try {
         if (!this.team) await this.resolveTeam();
         if (!registered) { await this.register(card); registered = true; backoff = 1000; log(`@${card.id} online in team ${this.team}`); }
-        for (const msg of await this.inbox(card.id)) await onMessage(msg);
+        await step();
       } catch (err) {
         if (err.status === 401 || err.status === 403 || err.status === 409) { log(`stopped: ${err.message}`); throw err; }
         // A 404 while registered means the hub forgot the agent (restart, removal): register again right away.

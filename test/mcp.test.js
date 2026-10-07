@@ -78,3 +78,27 @@ test('mcp: sessions delegate, show as working, ignore side conversations and sha
   assert.match(answer, /Reviewed, notes attached\.[\s\S]*notes\.txt/);
   await until(async () => (await state('steve')) === 'idle');
 });
+
+test('mcp: sessions sharing a handle leave messages for the one whose agent reads them', async (t) => {
+  const h = await startHub(t);
+  const filip = await h.bootstrap('filip');
+  const steve = await h.join(filip, 'member', 'steve');
+  const p = prefix(filip);
+  // Steve has three windows open; only the last one is in use.
+  const idle = [session(t, h, steve, 'steve', tempDir(t)), session(t, h, steve, 'steve', tempDir(t))];
+  const used = session(t, h, steve, 'steve', tempDir(t));
+  await h.ok(p + '/agents', filip.token, 'POST', { id: 'filip' });
+  await until(async () => (await h.ok(p + '/agents', filip.token)).some((x) => x.id === 'steve' && x.online));
+  await delay(500); // let every session's long poll start, so the hub could hand messages to any of them
+
+  for (const n of [1, 2, 3]) await h.ok(p + '/messages', filip.token, 'POST', { from: 'filip', text: `@steve request ${n}` });
+  // Every session hears about them; none takes them until its agent reads.
+  for (const s of [...idle, used]) await until(async () => /📬 3 unread/.test(await s.call('list_agents')));
+  const got = await used.call('check_inbox');
+  for (const n of [1, 2, 3]) assert.match(got, new RegExp(`request ${n}`));
+  // Read once: the other windows stop showing them and can't read them again.
+  for (const s of idle) {
+    await until(async () => !/unread/.test(await s.call('list_agents')));
+    assert.equal(await s.call('check_inbox'), 'Inbox is empty.');
+  }
+});

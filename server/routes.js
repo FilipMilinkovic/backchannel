@@ -131,7 +131,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   }
 
   // ---------- long poll ----------
-  async function poll({ res, url, team, auth, member, id, draining }) {
+  // Shared by both ways of reading an inbox: the caller must own the agent, and polling keeps it online.
+  function checkIn({ url, team, auth, member, id }) {
     requireRole(member, ['owner', 'member']);
     ownedAgent(team, auth.user, id);
     const seconds = Number(url.searchParams.get('wait') || 0);
@@ -140,7 +141,22 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const wasOnline = rt.online(p);
     p.lastSeen = Date.now();
     if (!wasOnline) broadcastAgents(team.id);
-    const wait = Math.min(seconds, 30) * 1000;
+    return { p, wait: Math.min(seconds, 30) * 1000 };
+  }
+  // After waiting, the agent, the token and the caller's role must all still hold.
+  function recheck({ team, auth, id }, p) {
+    if (rt.currentPresence(team.id, id) !== p || !repo.agent(team.id, id)) throw httpError(404, 'agent was removed');
+    if (!stillValid(repo, auth)) throw httpError(401, 'token was rotated');
+    const now = repo.member(team.id, auth.user.id);
+    if (!now) throw httpError(404, 'unknown team');
+    requireRole(now, ['owner', 'member']);
+    p.lastSeen = Date.now();
+  }
+
+  // Takes the whole inbox (connectors: one process per agent).
+  async function poll(ctx) {
+    const { res, team, auth, id, draining } = ctx;
+    const { p, wait } = checkIn(ctx);
     let gone = res.destroyed, box = [], restored = false;
     // Messages taken for a client that disconnected before receiving them go back into the inbox.
     const restore = () => {
@@ -155,16 +171,32 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (gone) return;
       if (draining()) return send(res, 200, []);
-      if (rt.currentPresence(team.id, id) !== p || !repo.agent(team.id, id)) throw httpError(404, 'agent was removed');
-      if (!stillValid(repo, auth)) throw httpError(401, 'token was rotated');
-      const now = repo.member(team.id, auth.user.id);
-      if (!now) throw httpError(404, 'unknown team');
-      requireRole(now, ['owner', 'member']);
-      p.lastSeen = Date.now();
+      recheck(ctx, p);
       box = repo.takeInbox(team.id, id);
     }
     if (gone) { restore(); return; }
     send(res, 200, box);
+  }
+
+  // Shows the inbox without taking anything (live sessions). Several sessions can share a handle, e.g. one person's
+  // open Claude Code windows; a message stays here until the session whose agent reads it claims it, rather than
+  // going to whichever session happened to be polling. Answers at once when a message is newer than `after` (the
+  // client's cursor), otherwise when the inbox changes (new message, or another session claimed one) or `wait` ends.
+  async function pending(ctx) {
+    const { res, url, team, auth, id, draining } = ctx;
+    const after = Number(url.searchParams.get('after') || 0);
+    if (!Number.isSafeInteger(after) || after < 0) throw httpError(400, 'after must be a non-negative integer');
+    const { p, wait } = checkIn(ctx);
+    let box = repo.peekInbox(team.id, id);
+    if (!box.some((r) => r.seq > after) && wait && !res.destroyed && !draining()) {
+      const release = limits.streams.acquire(auth.user.id);
+      try { await rt.wait(team.id, id, wait, res); } finally { release(); }
+      if (res.destroyed) return;
+      if (!draining()) recheck(ctx, p);
+      box = repo.peekInbox(team.id, id);
+    }
+    if (res.destroyed) return;
+    send(res, 200, { cursor: Math.max(after, ...box.map((r) => r.seq)), messages: box.map((r) => r.message) });
   }
 
   // ---------- routes ----------
@@ -340,7 +372,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       broadcastAgents(team.id);
       return send(res, 200, publicAgent(repo.agent(team.id, id)));
     }
-    if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|status|requeue))?$/.exec(rest))) {
+    if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|pending|status|requeue|claim))?$/.exec(rest))) {
       const a = repo.agent(team.id, m[1]);
       if (!a) throw httpError(404, 'unknown agent');
       if (!m[2] && req.method === 'DELETE') {
@@ -351,8 +383,15 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       }
       if (m[2] === 'card' && req.method === 'GET') return send(res, 200, agentCard(a));
       if (m[2] === 'inbox' && req.method === 'GET') return await poll({ res, url, team, auth, member, id: a.id, draining: ctx.draining });
-      if (['status', 'requeue'].includes(m[2]) && req.method === 'POST') {
+      if (m[2] === 'pending' && req.method === 'GET') return await pending({ res, url, team, auth, member, id: a.id, draining: ctx.draining });
+      if (['status', 'requeue', 'claim'].includes(m[2]) && req.method === 'POST') {
         requireRole(member, ['owner', 'member']); ownedAgent(team, user, a.id);
+        if (m[2] === 'claim') {
+          if (!Array.isArray(b.ids) || b.ids.length > 5000 || b.ids.some((id) => typeof id !== 'string')) throw httpError(400, 'ids must be an array');
+          const messages = repo.claimInbox(team.id, a.id, b.ids);
+          if (messages.length) rt.wake(team.id, a.id); // other sessions sharing the handle drop them from their view
+          return send(res, 200, { messages });
+        }
         if (m[2] === 'requeue') {
           if (!Array.isArray(b.ids) || b.ids.length > 5000 || b.ids.some((id) => typeof id !== 'string')) throw httpError(400, 'ids must be an array');
           const queued = new Set(repo.inbox(team.id, a.id).map((x) => x.id));

@@ -162,5 +162,16 @@ export function createRepo(db) {
         return box;
       });
     },
+    // The inbox left in place, with each message's position, for sessions that claim messages only when read.
+    peekInbox: (teamId, agentId) => all(`SELECT m.seq, m.body FROM inbox i JOIN messages m ON m.id = i.message_id
+      WHERE i.team_id = ? AND i.agent_id = ? ORDER BY m.seq`, teamId, agentId).map((r) => ({ seq: r.seq, message: toMessage(r) })),
+    // Takes the given messages out of the inbox and returns the ones that were still there, in order.
+    // Several sessions sharing a handle may claim the same message; only one of them gets it.
+    claimInbox(teamId, agentId, ids) {
+      const want = new Set(ids);
+      return db.tx(() => this.peekInbox(teamId, agentId).filter(({ message: m }) => want.has(m.id)
+        && run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND message_id = ?', teamId, agentId, m.id).changes === 1)
+        .map((r) => r.message));
+    },
   };
 }
