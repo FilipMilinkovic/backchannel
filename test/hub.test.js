@@ -377,7 +377,7 @@ test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
   const db = openDb(dir);
   const repo = createRepo(db);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   const setup = repo.setupInvite();
   assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);
@@ -556,4 +556,120 @@ test("requests to someone else's agent are capped per person per hour; answers a
   const sneaky = await h.api(p + '/messages', owner.token, 'POST', { from: 'mine', inReplyTo: first.id, text: '@worker one more' });
   assert.equal(sneaky.status, 429);
   assert.equal((await h.api(p + '/messages', owner.token, 'POST', { text: '@mine still fine' })).status, 200);
+});
+
+test('threads: the hub keeps each delegation\'s status, pages them and reports agent activity', async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap('owner');
+  const maya = await h.join(owner, 'member', 'maya');
+  const p = prefix(owner);
+  await h.ok(p + '/agents', maya.token, 'POST', { id: 'worker' });
+  const ask = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker Hi! How do partial refunds work in the payments service?' });
+  const other = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker second request' });
+  const list = await h.ok(p + '/threads', owner.token);
+  assert.deepEqual(list.map((x) => x.id), [other.threadId, ask.threadId], 'newest first');
+  const first = list[1];
+  assert.equal(first.title, 'How do partial refunds work in the payments service?');
+  assert.equal(first.status, 'queued');
+  assert.deepEqual(first.waitingOn, ['worker']);
+  assert.equal(first.from, 'owner'); assert.deepEqual(first.to, ['worker']); assert.equal(first.count, 1);
+
+  // The agent working on it shows live; its answer settles it.
+  await h.ok(p + '/agents/worker/status', maya.token, 'POST', { state: 'working', threadId: ask.threadId });
+  assert.equal((await h.ok(p + '/threads?state=active', owner.token)).find((x) => x.id === ask.threadId).status, 'working');
+  await h.ok(p + '/agents/worker/status', maya.token, 'POST', { state: 'idle' });
+  await h.ok(p + '/messages', maya.token, 'POST', { from: 'worker', inReplyTo: ask.id, text: 'Like this.' });
+  const done = await h.ok(p + '/threads?state=done', owner.token);
+  assert.deepEqual(done.map((x) => [x.id, x.status, x.count]), [[ask.threadId, 'answered', 2]]);
+  assert.deepEqual((await h.ok(p + '/threads?state=active', owner.token)).map((x) => x.id), [other.threadId]);
+  assert.deepEqual(await h.ok(p + '/threads/counts', owner.token), { active: 1, done: 1, total: 2 });
+
+  // Paging by cursor.
+  const page1 = await h.ok(p + '/threads?limit=1', owner.token);
+  assert.equal(page1.length, 1);
+  const page2 = await h.ok(`${p}/threads?limit=1&before=${encodeURIComponent(page1[0].cursor)}`, owner.token);
+  assert.equal(page2.length, 1); assert.notEqual(page2[0].id, page1[0].id);
+  assert.equal((await h.ok(`${p}/threads?limit=5&before=${encodeURIComponent(page2[0].cursor)}`, owner.token)).length, 0);
+  assert.equal((await h.api(p + '/threads?limit=0', owner.token)).status, 400);
+  assert.equal((await h.api(p + '/threads?before=nope', owner.token)).status, 400);
+
+  // Activity for the profile.
+  const act = await h.ok(p + '/agents/worker/activity', owner.token);
+  assert.equal(act.received, 2); assert.equal(act.replies, 1); assert.equal(act.started, 0);
+  assert.equal(act.threads.length, 2); assert.ok(act.lastMessageAt > 0);
+  // A removed agent no longer counts as owed anything.
+  await h.ok(p + '/agents/worker', owner.token, 'DELETE');
+  assert.deepEqual(await h.ok(p + '/threads/counts', owner.token), { active: 0, done: 2, total: 2 });
+});
+
+test('inbox leases: a connector that dies before answering gets the message again', async (t) => {
+  const h = await startHub(t, null, { INBOX_LEASE_SECONDS: '1' });
+  const owner = await h.bootstrap('owner');
+  const p = prefix(owner);
+  await h.ok(p + '/agents', owner.token, 'POST', { id: 'worker' });
+  const one = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker one' });
+  const two = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker two' });
+  // Taken with a lease: hidden, but still there.
+  assert.deepEqual((await h.ok(p + '/agents/worker/inbox?lease=1', owner.token)).map((m) => m.id), [one.id, two.id]);
+  assert.deepEqual(await h.ok(p + '/agents/worker/inbox?lease=1', owner.token), []);
+  // Answering one and acknowledging nothing else: only the other comes back once the lease runs out.
+  await h.ok(p + '/messages', owner.token, 'POST', { from: 'worker', inReplyTo: one.id, text: 'done' });
+  await delay(1600);
+  assert.deepEqual((await h.ok(p + '/agents/worker/inbox?lease=1', owner.token)).map((m) => m.id), [two.id]);
+  // Reporting work keeps the lease alive; an ack ends it.
+  for (let i = 0; i < 3; i++) { await delay(500); await h.ok(p + '/agents/worker/status', owner.token, 'POST', { state: 'working', threadId: two.threadId }); }
+  assert.deepEqual(await h.ok(p + '/agents/worker/inbox?lease=1', owner.token), []);
+  assert.deepEqual(await h.ok(p + '/agents/worker/ack', owner.token, 'POST', { ids: [two.id] }), { acked: 1 });
+  await h.ok(p + '/agents/worker/status', owner.token, 'POST', { state: 'idle' });
+  await delay(1600);
+  assert.deepEqual(await h.ok(p + '/agents/worker/inbox?lease=1', owner.token), []);
+
+  // Without ?lease=1 (older connectors) taking a message removes it, as before.
+  const three = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker three' });
+  assert.deepEqual((await h.ok(p + '/agents/worker/inbox', owner.token)).map((m) => m.id), [three.id]);
+  await delay(1600);
+  assert.deepEqual(await h.ok(p + '/agents/worker/inbox', owner.token), []);
+
+  // A message that keeps failing is dropped after three takes, and a long poll is woken when a lease runs out.
+  const four = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker four' });
+  for (let i = 0; i < 3; i++) {
+    const started = Date.now();
+    const got = await h.ok(p + `/agents/worker/inbox?lease=1&wait=${i ? 5 : 0}`, owner.token);
+    assert.deepEqual(got.map((m) => m.id), [four.id]);
+    if (i) assert.ok(Date.now() - started < 4000, 'woken when the lease ran out');
+  }
+  await delay(1600);
+  assert.deepEqual(await h.ok(p + '/agents/worker/inbox?lease=1', owner.token), []);
+  assert.ok(h.logs().some((l) => l.msg === 'dropped a message nobody could answer' && l.messageId === four.id));
+
+  // Claims (live sessions) can be leased too, and requeue puts a leased message straight back.
+  const five = await h.ok(p + '/messages', owner.token, 'POST', { text: '@worker five' });
+  const claimed = await h.api(p + '/agents/worker/claim', owner.token, 'POST', { ids: [five.id], lease: 60 });
+  assert.equal(claimed.body.messages?.length, 1, JSON.stringify(claimed));
+  assert.deepEqual((await h.ok(p + '/agents/worker/pending', owner.token)).messages, []);
+  await h.ok(p + '/agents/worker/requeue', owner.token, 'POST', { ids: [five.id] });
+  assert.deepEqual((await h.ok(p + '/agents/worker/pending', owner.token)).messages.map((m) => m.id), [five.id]);
+  assert.equal((await h.api(p + '/agents/worker/claim', owner.token, 'POST', { ids: [five.id], lease: 1 })).status, 400);
+});
+
+test('db: upgrading to v5 builds summaries for existing threads', (t) => {
+  const dir = tempDir(t);
+  let db = openDb(dir);
+  let repo = createRepo(db);
+  const team = repo.createTeam('T');
+  repo.saveAgent({ teamId: team.id, id: 'worker', ownerUserId: null, registeredAt: 1, name: 'worker' });
+  const m1 = { id: 'aaa', teamId: team.id, threadId: 'aaa', from: 'sam', fromKind: 'user', text: '@worker What does refund() return for partial orders?', ts: 10, hop: 0, to: ['worker'], reply: false };
+  const m2 = { id: 'bbb', teamId: team.id, threadId: 'aaa', from: 'worker', fromKind: 'agent', inReplyTo: 'aaa', text: 'A Refund.', ts: 20, hop: 1, to: [], reply: true };
+  const m3 = { id: 'ccc', teamId: team.id, threadId: 'ccc', from: 'sam', fromKind: 'user', text: '@worker still open', ts: 30, hop: 0, to: ['worker'], reply: false };
+  for (const m of [m1, m2, m3]) repo.insertMessage(m);
+  // Back to what a v4 hub left behind.
+  db.exec('DROP TABLE threads; ALTER TABLE inbox DROP COLUMN leased_until; ALTER TABLE inbox DROP COLUMN attempts; PRAGMA user_version = 4;');
+  db.close();
+  db = openDb(dir);
+  repo = createRepo(db);
+  const rows = repo.threads(team.id);
+  assert.deepEqual(rows.map((r) => [r.id, r.count, r.title]), [['ccc', 1, 'still open'], ['aaa', 2, 'What does refund() return for partial orders?']]);
+  assert.deepEqual(rows[0].debts, [{ debtor: 'worker', creditor: 'sam' }]);
+  assert.deepEqual(rows[1].debts, []);
+  db.close();
 });

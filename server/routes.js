@@ -2,8 +2,11 @@
 import crypto from 'node:crypto';
 import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, stillValid, requireRole } from './auth.js';
 import { cleanRemote } from './util.js';
+import { buildThread, present } from './threads.js';
 
 const LOGIN_TTL_MS = 60_000;
+// After this many takes that never got an answer or an acknowledgement, a message is dropped from the inbox.
+export const MAX_ATTEMPTS = 3;
 const MAX_ATTACHMENTS = 20;
 const FILE_PATH = /^\/api\/teams\/[a-f0-9]+\/files$/;
 
@@ -19,6 +22,8 @@ const fileType = (raw) => {
 const fileView = ({ id, name, type, size }) => ({ id, name, type, size });
 
 export function createApi({ repo, rt, config, publicUrl, limits }) {
+  // A message a connector or stand-in took stays leased this long, renewed while the agent reports it's working.
+  const LEASE_MS = config.inboxLeaseSeconds * 1000;
   // ---------- views ----------
   const members = (teamId) => repo.members(teamId);
   const publicTeam = (team, userId) => ({ id: team.id, name: team.name, role: repo.member(team.id, userId)?.role,
@@ -31,6 +36,27 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       ...(a.kind === 'session' ? { standIn: repo.standIn(a.teamId, a.id) } : {}) };
   }
   const agentList = (teamId) => repo.agents(teamId).map(publicAgent);
+
+  // ---------- thread summaries ----------
+  function threadView(teamId) {
+    const agents = repo.agents(teamId);
+    const ids = new Set(agents.map((a) => a.id));
+    const live = new Map(); // threadId -> states of online agents working in it
+    for (const a of agents) {
+      const p = rt.presenceOf(teamId, a.id);
+      if (rt.online(p) && p.state !== 'idle' && p.stateThread) live.set(p.stateThread, [...(live.get(p.stateThread) || []), p.state]);
+    }
+    return (row) => present(row, { isAgent: (id) => ids.has(id), live: live.get(row.id) || [] });
+  }
+  // Rebuilds a thread's stored summary from its messages; call inside the transaction that changed them.
+  function rebuildThread(teamId, threadId) {
+    const ids = new Set(repo.agents(teamId).map((a) => a.id));
+    repo.saveThread(teamId, threadId, buildThread(repo.threadMessages(teamId, threadId), (id) => ids.has(id)));
+  }
+  const broadcastThread = (teamId, threadId) => {
+    const row = repo.thread(teamId, threadId);
+    if (row) rt.broadcast(teamId, { type: 'thread', thread: threadView(teamId)(row) });
+  };
   const broadcastAgents = (teamId) => rt.broadcast(teamId, { type: 'agents', agents: agentList(teamId) });
   const broadcastMembers = (teamId) => rt.broadcast(teamId, { type: 'members', members: members(teamId) });
   function agentCard(a) {
@@ -144,9 +170,13 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     repo.tx(() => {
       repo.insertMessage(msg);
       if (!msg.note) for (const id of targets) repo.enqueue(team.id, id, msg.id);
+      // An agent answering a message is done with it: its lease (if any) ends here.
+      if (fromKind === 'agent' && parent) repo.ack(team.id, from, [parent.id]);
+      rebuildThread(team.id, msg.threadId);
     });
     if (!msg.note) for (const id of targets) rt.wake(team.id, id);
     rt.broadcast(team.id, { type: 'message', message: msg });
+    broadcastThread(team.id, msg.threadId);
     return msg;
   }
 
@@ -174,26 +204,28 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     p.lastSeen = Date.now();
   }
 
-  // Takes the whole inbox (connectors: one process per agent).
+  // Takes the whole inbox (connectors: one process per agent). With `?lease=1` (clients from 0.5.0) the messages are
+  // leased: they stay until answered or acknowledged, and come back if the connector dies first.
   async function poll(ctx) {
-    const { res, team, auth, id, draining } = ctx;
+    const { res, url, team, auth, id, draining } = ctx;
     const { p, wait } = checkIn(ctx);
+    const leaseMs = url.searchParams.get('lease') === '1' ? LEASE_MS : 0;
     let gone = res.destroyed, box = [], restored = false;
     // Messages taken for a client that disconnected before receiving them go back into the inbox.
     const restore = () => {
       if (restored || !box.length || rt.currentPresence(team.id, id) !== p) return;
       restored = true;
-      repo.tx(() => { for (const m of box) repo.enqueue(team.id, id, m.id); });
+      repo.requeue(team.id, id, box.map((m) => m.id));
     };
     res.on('close', () => { if (!res.writableFinished) { gone = true; restore(); } });
-    box = repo.takeInbox(team.id, id);
+    box = repo.takeInbox(team.id, id, leaseMs);
     if (!box.length && wait && !gone && !draining()) {
       const release = limits.streams.acquire(auth.user.id);
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (gone) return;
       if (draining()) return send(res, 200, []);
       recheck(ctx, p);
-      box = repo.takeInbox(team.id, id);
+      box = repo.takeInbox(team.id, id, leaseMs);
     }
     if (gone) { restore(); return; }
     send(res, 200, box);
@@ -401,7 +433,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       broadcastAgents(team.id);
       return send(res, 200, publicAgent(repo.agent(team.id, id)));
     }
-    if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|pending|status|requeue|claim))?$/.exec(rest))) {
+    if ((m = /^\/agents\/([\w-]+)(?:\/(card|inbox|pending|status|requeue|claim|ack|activity))?$/.exec(rest))) {
       const a = repo.agent(team.id, m[1]);
       if (!a) throw missingAgent(team.id, m[1]);
       // Disconnect: removes the agent and stops its connector or live session. Its owner or a team owner can do it.
@@ -422,22 +454,34 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         return send(res, 200, publicAgent(repo.agent(team.id, a.id)));
       }
       if (m[2] === 'card' && req.method === 'GET') return send(res, 200, agentCard(a));
+      // For the agent's profile: what it did, and the latest delegations it took part in.
+      if (m[2] === 'activity' && req.method === 'GET') {
+        const view = threadView(team.id);
+        const rows = repo.threads(team.id).filter((t) => t.participants.includes(a.id));
+        return send(res, 200, { ...repo.agentActivity(team.id, a.id), started: rows.filter((t) => t.from === a.id).length,
+          threads: rows.slice(0, 8).map(view) });
+      }
       if (m[2] === 'inbox' && req.method === 'GET') return await poll({ res, url, team, auth, member, id: a.id, draining: ctx.draining });
       if (m[2] === 'pending' && req.method === 'GET') return await pending({ res, url, team, auth, member, id: a.id, draining: ctx.draining });
-      if (['status', 'requeue', 'claim'].includes(m[2]) && req.method === 'POST') {
+      if (['status', 'requeue', 'claim', 'ack'].includes(m[2]) && req.method === 'POST') {
         requireRole(member, ['owner', 'member']); ownedAgent(team, user, a.id);
-        if (m[2] === 'claim') {
+        const ids = () => {
           if (!Array.isArray(b.ids) || b.ids.length > 5000 || b.ids.some((id) => typeof id !== 'string')) throw httpError(400, 'ids must be an array');
-          const messages = repo.claimInbox(team.id, a.id, b.ids);
+          return [...new Set(b.ids)];
+        };
+        if (m[2] === 'claim') {
+          // `lease` (seconds): keep the messages leased instead of removing them, e.g. while a stand-in answers.
+          if (b.lease !== undefined && (!Number.isInteger(b.lease) || b.lease < 10 || b.lease > 3600)) throw httpError(400, 'lease must be a whole number of seconds from 10 to 3600');
+          const messages = repo.claimInbox(team.id, a.id, ids(), (b.lease || 0) * 1000);
           if (messages.length) rt.wake(team.id, a.id); // other sessions sharing the handle drop them from their view
           return send(res, 200, { messages });
         }
+        if (m[2] === 'ack') return send(res, 200, { acked: repo.ack(team.id, a.id, ids()) });
         if (m[2] === 'requeue') {
-          if (!Array.isArray(b.ids) || b.ids.length > 5000 || b.ids.some((id) => typeof id !== 'string')) throw httpError(400, 'ids must be an array');
           const queued = new Set(repo.inbox(team.id, a.id).map((x) => x.id));
-          const back = [...new Set(b.ids)].map((id) => repo.message(id))
+          const back = ids().map((id) => repo.message(id))
             .filter((msg) => msg?.teamId === team.id && msg.to?.includes(a.id) && !msg.note && !queued.has(msg.id));
-          repo.tx(() => { for (const msg of back) repo.enqueue(team.id, a.id, msg.id); });
+          repo.requeue(team.id, a.id, back.map((msg) => msg.id));
           rt.wake(team.id, a.id);
           return send(res, 200, { requeued: back.length });
         }
@@ -446,6 +490,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         pr.state = ['working', 'approval'].includes(b.state) ? b.state : 'idle';
         pr.stateThread = pr.state === 'idle' ? null : b.threadId || null;
         pr.lastSeen = Date.now();
+        // Reporting work keeps whatever the agent took leased.
+        if (pr.state !== 'idle') repo.extendLeases(team.id, a.id, Date.now() + LEASE_MS);
         rt.broadcast(team.id, { type: 'status', id: a.id, state: pr.state, threadId: pr.stateThread });
         return send(res, 200, { ok: true });
       }
@@ -482,7 +528,36 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       requireRole(member, ['owner', 'member']); return send(res, 200, postMessage(team, user, b));
     }
     if (rest === '/messages' && req.method === 'GET') return send(res, 200, repo.recentMessages(team.id, 5000));
-    if (rest === '/threads' && req.method === 'GET') return send(res, 200, repo.threadSummaries(team.id));
+    // Delegations, newest first: `state=active|done` filters, `agent` keeps the ones it took part in, `limit` and
+    // `before` (an item's cursor) page. Without `limit` every match is returned.
+    if (rest === '/threads' && req.method === 'GET') {
+      const q = url.searchParams;
+      const state = q.get('state') || 'all';
+      if (!['active', 'done', 'all'].includes(state)) throw httpError(400, 'state must be active, done or all');
+      const limit = q.has('limit') ? Number(q.get('limit')) : Infinity;
+      if (q.has('limit') && (!Number.isInteger(limit) || limit < 1 || limit > 500)) throw httpError(400, 'limit must be a whole number from 1 to 500');
+      const before = q.get('before');
+      const cut = before && /^(\d+):([\w-]+)$/.exec(before);
+      if (before && !cut) throw httpError(400, 'before must be a cursor from an earlier page');
+      const agent = q.get('agent');
+      const view = threadView(team.id);
+      const out = [];
+      for (const row of repo.threads(team.id)) {
+        if (cut && (row.updated > Number(cut[1]) || (row.updated === Number(cut[1]) && row.id >= cut[2]))) continue;
+        if (agent && !row.participants.includes(agent)) continue;
+        const t = view(row);
+        if (state !== 'all' && t.active !== (state === 'active')) continue;
+        out.push(t);
+        if (out.length >= limit) break;
+      }
+      return send(res, 200, out);
+    }
+    if (rest === '/threads/counts' && req.method === 'GET') {
+      const view = threadView(team.id);
+      const all = repo.threads(team.id).map(view);
+      const active = all.filter((t) => t.active).length;
+      return send(res, 200, { active, done: all.length - active, total: all.length });
+    }
     if ((m = /^\/threads\/([\w-]+)$/.exec(rest)) && req.method === 'GET') {
       const thread = repo.threadMessages(team.id, m[1]);
       if (!thread.length) throw httpError(404, 'unknown thread');
@@ -491,6 +566,13 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     throw httpError(404, 'no such endpoint');
   }
   handle.broadcastAgents = broadcastAgents;
+  // Leases that ran out put their messages back (and wake the agent); ones that keep failing are dropped.
+  handle.expireLeases = (log) => {
+    const { back, dropped } = repo.expireLeases(Date.now(), MAX_ATTEMPTS);
+    for (const k of new Set(back.map((r) => `${r.teamId}/${r.agentId}`))) { const [t, id] = k.split('/'); rt.wake(t, id); }
+    for (const r of dropped) log?.warn('dropped a message nobody could answer', { teamId: r.teamId, agentId: r.agentId, messageId: r.messageId, attempts: MAX_ATTEMPTS });
+    return { back: back.length, dropped: dropped.length };
+  };
   handle.revalidateStreams = revalidateStreams;
   return handle;
 }

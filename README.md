@@ -222,6 +222,7 @@ The hub reads environment variables only, and refuses to start with a clear mess
 | `MAX_CONNECTIONS` | `5000` | Open sockets for the whole hub |
 | `MAX_FILE_MB`, `TEAM_FILES_MB` | `25`, `1024` | Largest attachment, and the total a team can store (attachments live in the database, so backups include them) |
 | `SESSION_DAYS` | `30` | Browser and computer sign-ins expire after this many days unused |
+| `INBOX_LEASE_SECONDS` | `120` | How long a message a connector took stays hidden before it's handed out again, unless the connector answers it or reports it's still working |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | How long a deploy or restart waits for requests to finish |
 | `BACKUP_HOURS`, `BACKUP_KEEP` | `24`, `7` | Automatic database copies in `DATA_DIR/backups`; `BACKUP_HOURS=0` turns them off |
 
@@ -288,8 +289,15 @@ Agents attach files to messages: `ask_agent` and `reply` take `files` (local pat
 (small text files come back inline too). Connectors download attachments next to the request and send files back when
 the reply ends with `ATTACH: path` lines (only files in their working folder). In the web UI, use Attach or drop files
 on the message box, and click a file to download it. Files are scoped to the team and stored in the hub's database.
-- An agent's inbox is delivered in the order messages were posted. Delivery is at most once: a message handed to a connector
-  that crashes before acting on it is not redelivered (the thread still shows it, and the sender can ask again).
+
+## Delivery
+
+An agent's inbox is delivered in the order messages were posted. A connector (and a live session's stand-in) takes a
+message on a lease: it stays on the hub, hidden, until the agent answers it or says it has nothing to say. If the
+connector or session dies first, the lease runs out (`INBOX_LEASE_SECONDS`, 2 minutes; renewed while the agent reports
+it's working or waiting for its owner's approval) and the message is handed out again. A message that's been taken
+three times without an answer is dropped and logged, so one that crashes its agent can't loop forever. Connectors and
+sessions older than 0.5.0 still take messages outright.
 
 ## Development
 

@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { readLegacy, LEGACY_FILES } from './legacy.js';
+import { buildThread } from './threads.js';
 
-// Append only. Each entry moves the schema from version i to i + 1.
+// Append only. Each entry moves the schema from version i to i + 1: SQL, or a function given the database.
 const MIGRATIONS = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
    CREATE TABLE users (
@@ -57,7 +58,42 @@ const MIGRATIONS = [
      team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, id TEXT NOT NULL,
      stand_in TEXT NOT NULL CHECK (stand_in IN ('off', 'read', 'write')),
      updated_by TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (team_id, id));`,
+  // Delegation summaries kept by the hub (server/threads.js), and inbox leases: a message taken by a connector or a
+  // stand-in stays in the inbox, hidden, until it's answered or acknowledged; if the lease runs out it comes back.
+  (db) => {
+    db.exec(`CREATE TABLE threads (
+       team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, id TEXT NOT NULL, updated INTEGER NOT NULL,
+       state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'done')), closed_by TEXT, closed_at INTEGER, summary TEXT,
+       data TEXT NOT NULL, PRIMARY KEY (team_id, id));
+     CREATE INDEX threads_updated ON threads(team_id, updated);
+     ALTER TABLE inbox ADD COLUMN leased_until INTEGER;
+     ALTER TABLE inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;`);
+    rebuildThreads(db);
+  },
 ];
+
+// Summaries for every thread, from its messages. Agents are judged by who is registered now, as the UI did.
+function rebuildThreads(db) {
+  const agents = new Map();
+  for (const { team_id: t, id } of db.prepare('SELECT team_id, id FROM agents').all()) {
+    if (!agents.has(t)) agents.set(t, new Set());
+    agents.get(t).add(id);
+  }
+  const insert = db.prepare('INSERT INTO threads (team_id, id, updated, data) VALUES (?, ?, ?, ?)');
+  let key = null, msgs = [];
+  const flush = () => {
+    if (!msgs.length) return;
+    const [teamId, threadId] = key;
+    const row = buildThread(msgs, (id) => agents.get(teamId)?.has(id) || false);
+    insert.run(teamId, threadId, row.updated, JSON.stringify(row));
+    msgs = [];
+  };
+  for (const r of db.prepare('SELECT team_id, thread_id, body FROM messages ORDER BY team_id, thread_id, seq').iterate()) {
+    if (!key || key[0] !== r.team_id || key[1] !== r.thread_id) { flush(); key = [r.team_id, r.thread_id]; }
+    msgs.push(JSON.parse(r.body));
+  }
+  flush();
+}
 
 export const DB_FILE = 'backchannel.db';
 
@@ -81,7 +117,11 @@ export function openDb(dir, log) {
     throw Object.assign(new Error(`database ${file} has schema v${version}, newer than this hub (v${MIGRATIONS.length}). Upgrade the hub.`), { code: 'DB_TOO_NEW' });
   }
   for (let v = version; v < MIGRATIONS.length; v++) {
-    db.tx(() => { db.exec(MIGRATIONS[v]); db.exec(`PRAGMA user_version = ${v + 1}`); });
+    db.tx(() => {
+      const step = MIGRATIONS[v];
+      if (typeof step === 'function') step(db); else db.exec(step);
+      db.exec(`PRAGMA user_version = ${v + 1}`);
+    });
     log?.info(`database migrated to schema v${v + 1}`, { file });
   }
   importLegacy(db, dir, log);
@@ -147,6 +187,7 @@ function importLegacy(db, dir, log) {
       const [teamId, agentId] = key.split('/');
       for (const id of ids) skipped.inboxEntries += 1 - Number(inbox.run(teamId, agentId, id, teamId, agentId, id, teamId).changes);
     }
+    rebuildThreads(db); // the database was empty, so this covers exactly the imported messages
     db.prepare("INSERT INTO meta (key, value) VALUES ('json_import', ?)").run(JSON.stringify({ at: now, files: present, skipped }));
   });
   rename(present);

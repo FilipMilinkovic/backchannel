@@ -152,13 +152,22 @@ export class Hub {
     if (!res.ok) { const body = await res.json().catch(() => ({})); const e = new Error(body.error || `hub ${res.status}`); e.status = res.status; throw e; }
     return Buffer.from(await res.arrayBuffer());
   }
-  inbox(id, wait = 25) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}`)); }
+  // `lease`: messages stay on the hub until acknowledged (or answered), and come back if this process dies first.
+  inbox(id, wait = 25, lease = false) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}${lease ? '&lease=1' : ''}`)); }
+  ack(id, ids) { return this.req('POST', this.t(`/agents/${id}/ack`), { ids }); }
   pending(id, after = 0, wait = 25) { return this.req('GET', this.t(`/agents/${id}/pending?wait=${wait}&after=${after}`)); }
-  async claim(id, ids) { return (await this.req('POST', this.t(`/agents/${id}/claim`), { ids })).messages; }
+  // `lease` (seconds): keep the claimed messages leased instead of removing them, until answered or acknowledged.
+  async claim(id, ids, lease) { return (await this.req('POST', this.t(`/agents/${id}/claim`), { ids, ...(lease ? { lease } : {}) })).messages; }
 
-  // Register, then long-poll the inbox forever, taking each message (one process per agent).
+  // Register, then long-poll the inbox forever, taking each message (one process per agent). Messages are leased and
+  // acknowledged once handled, so one taken by a process that dies first is handed out again.
   listen(card, onMessage, log = () => {}) {
-    return this.#run(card, log, async () => { for (const msg of await this.inbox(card.id)) await onMessage(msg); });
+    return this.#run(card, log, async () => {
+      for (const msg of await this.inbox(card.id, 25, true)) {
+        await onMessage(msg);
+        await this.ack(card.id, [msg.id]).catch(() => {}); // usually a no-op: answering already acknowledged it
+      }
+    });
   }
 
   // Like listen, but leaves messages on the hub until claim() takes them, for live sessions: several can share a

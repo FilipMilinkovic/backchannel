@@ -142,15 +142,22 @@ export function createRepo(db) {
     recentMessages: (teamId, limit) => all(`SELECT body FROM (SELECT seq, body FROM messages WHERE team_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq`, teamId, limit).map(toMessage),
     threadMessages: (teamId, threadId) => all('SELECT body FROM messages WHERE team_id = ? AND thread_id = ? ORDER BY seq', teamId, threadId).map(toMessage),
     threadExists: (teamId, threadId) => !!get('SELECT 1 AS x FROM messages WHERE team_id = ? AND thread_id = ? LIMIT 1', teamId, threadId),
-    threadSummaries(teamId) {
-      const map = new Map();
-      for (const { threadId, ts, from, text } of all(`SELECT thread_id AS threadId, ts, json_extract(body, '$.from') AS "from",
-          json_extract(body, '$.text') AS text FROM messages WHERE team_id = ? ORDER BY seq`, teamId)) {
-        const t = map.get(threadId) || { id: threadId, title: String(text).slice(0, 80), started: ts, updated: ts, count: 0, participants: new Set() };
-        t.updated = ts; t.count++; t.participants.add(from);
-        map.set(threadId, t);
-      }
-      return [...map.values()].map((t) => ({ ...t, participants: [...t.participants] })).sort((a, b) => b.updated - a.updated);
+
+    // ---------- thread summaries (server/threads.js) ----------
+    // Newest first. Each row is the stored summary plus the thread's id and state.
+    threads: (teamId) => all(`SELECT id, state, data FROM threads WHERE team_id = ? ORDER BY updated DESC, id DESC`, teamId)
+      .map((r) => ({ ...JSON.parse(r.data), id: r.id, state: r.state })),
+    thread: (teamId, id) => { const r = get('SELECT id, state, data FROM threads WHERE team_id = ? AND id = ?', teamId, id); return r && { ...JSON.parse(r.data), id: r.id, state: r.state }; },
+    saveThread: (teamId, id, row) => run(`INSERT INTO threads (team_id, id, updated, data) VALUES (?, ?, ?, ?)
+      ON CONFLICT (team_id, id) DO UPDATE SET updated = excluded.updated, data = excluded.data`, teamId, id, row.updated, JSON.stringify(row)),
+    // What an agent did, for its profile: requests it got (threads), replies and messages it sent, the last one's time.
+    agentActivity(teamId, agentId) {
+      const sent = get(`SELECT count(*) AS n, max(ts) AS last,
+          sum(CASE WHEN coalesce(json_extract(body, '$.reply'), json_extract(body, '$.inReplyTo') IS NOT NULL) THEN 1 ELSE 0 END) AS replies
+        FROM messages WHERE team_id = ? AND json_extract(body, '$.from') = ?`, teamId, agentId);
+      const received = get(`SELECT count(DISTINCT m.thread_id) AS n FROM messages m, json_each(json_extract(m.body, '$.to')) t
+        WHERE m.team_id = ? AND t.value = ? AND json_extract(m.body, '$.from') != ?`, teamId, agentId, agentId).n;
+      return { sent: sent.n, replies: sent.replies || 0, lastMessageAt: sent.last ?? null, received };
     },
 
     // ---------- files ----------
@@ -165,26 +172,57 @@ export function createRepo(db) {
     // Inboxes are delivered in the order messages were posted. A no-op if the agent is gone.
     enqueue: (teamId, agentId, messageId) => run(`INSERT OR IGNORE INTO inbox (team_id, agent_id, message_id)
       SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?)`, teamId, agentId, messageId, teamId, agentId),
+    // Messages waiting to be taken. Leased ones (taken, not yet answered) are hidden until their lease runs out.
     inbox: (teamId, agentId) => all(`SELECT m.body FROM inbox i JOIN messages m ON m.id = i.message_id
-      WHERE i.team_id = ? AND i.agent_id = ? ORDER BY m.seq`, teamId, agentId).map(toMessage),
-    // Hands the whole inbox over and empties it.
-    takeInbox(teamId, agentId) {
+      WHERE i.team_id = ? AND i.agent_id = ? AND i.leased_until IS NULL ORDER BY m.seq`, teamId, agentId).map(toMessage),
+    // Hands the whole inbox over. With `leaseMs`, the messages stay until acknowledged (ack, or a reply to them) and
+    // come back if the lease runs out; without it they're removed, as older clients expect.
+    takeInbox(teamId, agentId, leaseMs = 0) {
       return db.tx(() => {
         const box = this.inbox(teamId, agentId);
-        if (box.length) run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ?', teamId, agentId);
+        if (!box.length) return box;
+        if (leaseMs) run(`UPDATE inbox SET leased_until = ?, attempts = attempts + 1
+          WHERE team_id = ? AND agent_id = ? AND leased_until IS NULL`, Date.now() + leaseMs, teamId, agentId);
+        else run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND leased_until IS NULL', teamId, agentId);
         return box;
       });
     },
     // The inbox left in place, with each message's position, for sessions that claim messages only when read.
     peekInbox: (teamId, agentId) => all(`SELECT m.seq, m.body FROM inbox i JOIN messages m ON m.id = i.message_id
-      WHERE i.team_id = ? AND i.agent_id = ? ORDER BY m.seq`, teamId, agentId).map((r) => ({ seq: r.seq, message: toMessage(r) })),
-    // Takes the given messages out of the inbox and returns the ones that were still there, in order.
-    // Several sessions sharing a handle may claim the same message; only one of them gets it.
-    claimInbox(teamId, agentId, ids) {
+      WHERE i.team_id = ? AND i.agent_id = ? AND i.leased_until IS NULL ORDER BY m.seq`, teamId, agentId).map((r) => ({ seq: r.seq, message: toMessage(r) })),
+    // Takes the given messages and returns the ones that were still there, in order. Several sessions sharing a handle
+    // may claim the same message; only one of them gets it. `leaseMs` works as in takeInbox.
+    claimInbox(teamId, agentId, ids, leaseMs = 0) {
       const want = new Set(ids);
-      return db.tx(() => this.peekInbox(teamId, agentId).filter(({ message: m }) => want.has(m.id)
-        && run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND message_id = ?', teamId, agentId, m.id).changes === 1)
-        .map((r) => r.message));
+      const take = (id) => (leaseMs
+        ? run(`UPDATE inbox SET leased_until = ?, attempts = attempts + 1 WHERE team_id = ? AND agent_id = ? AND message_id = ?
+            AND leased_until IS NULL`, Date.now() + leaseMs, teamId, agentId, id)
+        : run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND message_id = ? AND leased_until IS NULL', teamId, agentId, id)).changes === 1;
+      return db.tx(() => this.peekInbox(teamId, agentId).filter(({ message: m }) => want.has(m.id) && take(m.id)).map((r) => r.message));
+    },
+    // Done with these: answered, or nothing to say. Returns how many were removed.
+    ack: (teamId, agentId, ids) => db.tx(() => ids.reduce((n, id) =>
+      n + Number(run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND message_id = ?', teamId, agentId, id).changes), 0)),
+    // Puts messages back to be taken again: a lease is dropped, a removed message is queued again.
+    requeue: (teamId, agentId, ids) => db.tx(() => {
+      for (const id of ids) run(`INSERT INTO inbox (team_id, agent_id, message_id) SELECT ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM agents WHERE team_id = ? AND id = ?)
+        ON CONFLICT (team_id, agent_id, message_id) DO UPDATE SET leased_until = NULL`, teamId, agentId, id, teamId, agentId);
+    }),
+    // The agent is still working: keep its leases from running out before `until`.
+    extendLeases: (teamId, agentId, until) => run(`UPDATE inbox SET leased_until = ? WHERE team_id = ? AND agent_id = ?
+      AND leased_until IS NOT NULL AND leased_until < ?`, until, teamId, agentId, until).changes,
+    // Leases that ran out: the message goes back in the inbox, or, after `maxAttempts` takes, is dropped (something
+    // about it keeps failing). Returns { back: [{ teamId, agentId }], dropped: [{ teamId, agentId, messageId }] }.
+    expireLeases(now, maxAttempts) {
+      return db.tx(() => {
+        const due = all(`SELECT team_id AS teamId, agent_id AS agentId, message_id AS messageId, attempts FROM inbox
+          WHERE leased_until IS NOT NULL AND leased_until <= ?`, now);
+        const dropped = due.filter((r) => r.attempts >= maxAttempts);
+        for (const r of dropped) run('DELETE FROM inbox WHERE team_id = ? AND agent_id = ? AND message_id = ?', r.teamId, r.agentId, r.messageId);
+        run(`UPDATE inbox SET leased_until = NULL WHERE leased_until IS NOT NULL AND leased_until <= ? AND attempts < ?`, now, maxAttempts);
+        return { back: due.filter((r) => r.attempts < maxAttempts), dropped };
+      });
     },
   };
 }

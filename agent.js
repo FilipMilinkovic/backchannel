@@ -70,9 +70,13 @@ const self = { get id() { return id; }, get owner() { return card.owner; }, get 
 async function approve(msg) {
   if (!rl) return true;
   await hub.status(id, 'approval', msg.threadId).catch(() => {});
-  console.log(`\n── request from @${msg.from} ──\n${msg.text}${msg.files?.length ? `\n(attached: ${msg.files.map((f) => f.name).join(', ')})` : ''}\n`);
-  const a = (await rl.question(`Let @${id} handle this? [y/N] `)).trim().toLowerCase();
-  return a === 'y' || a === 'yes';
+  // However long the owner takes to answer, the request stays leased to this connector.
+  const heartbeat = setInterval(() => hub.status(id, 'approval', msg.threadId).catch(() => {}), 15_000);
+  try {
+    console.log(`\n── request from @${msg.from} ──\n${msg.text}${msg.files?.length ? `\n(attached: ${msg.files.map((f) => f.name).join(', ')})` : ''}\n`);
+    const a = (await rl.question(`Let @${id} handle this? [y/N] `)).trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  } finally { clearInterval(heartbeat); }
 }
 
 async function handle(msg) {

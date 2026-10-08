@@ -74,6 +74,9 @@ export function loadConfig(env = process.env) {
     maxFileMb: int('MAX_FILE_MB', 25, 1, 1024),
     teamFilesMb: int('TEAM_FILES_MB', 1024, 1, 1_000_000),
     sessionDays: int('SESSION_DAYS', 30, 1, 3650),
+    // How long a message a connector or stand-in took stays hidden in its inbox before it's handed out again,
+    // unless the agent answers, acknowledges it, or reports it's still working.
+    inboxLeaseSeconds: int('INBOX_LEASE_SECONDS', 120, 1, 3600),
     // Automatic copies in DATA_DIR/backups. 0 turns them off.
     backupHours: int('BACKUP_HOURS', 24, 0, 24 * 30),
     backupKeep: int('BACKUP_KEEP', 7, 1, 365),

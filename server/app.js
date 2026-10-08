@@ -193,6 +193,7 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     every(10_000, 'agent presence', () => { for (const teamId of new Set([...rt.sseClients].map((c) => c.teamId))) api.broadcastAgents(teamId); }),
     every(20_000, 'stream keepalive', () => { for (const c of rt.sseClients) rt.write(c, ': ping\n\n'); }),
     every(30_000, 'stream revalidation', () => api.revalidateStreams()),
+    every(Math.min(10_000, config.inboxLeaseSeconds * 250), 'inbox leases', () => api.expireLeases(log)),
     every(3_600_000, 'session expiry', () => {
       const n = repo.pruneSessions(Date.now() - config.sessionDays * 86_400_000);
       if (n) log.info('expired browser sessions removed', { count: n });

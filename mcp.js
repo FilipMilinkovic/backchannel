@@ -82,10 +82,10 @@ const asked = new Map();
 const returned = new Set();
 
 // Claims the unread messages matching `filter`. Another session with this handle may have claimed some already.
-async function take(filter) {
+async function take(filter, lease) {
   const ids = [...unclaimed.values()].filter(filter).map((m) => m.id);
   if (!ids.length) return [];
-  const got = await hub.claim(id, ids);
+  const got = await hub.claim(id, ids, lease);
   for (const i of ids) unclaimed.delete(i);
   writeState();
   return got.filter((m) => !returned.has(m.id));
@@ -170,6 +170,7 @@ function push(msgs) {
 // asks are left for the session. The hub hands each message to one claimer, so sessions sharing a handle can't both
 // answer it.
 const STAND_IN_DELAY = Number(process.env.BACKCHANNEL_STAND_IN_DELAY_MS || 60_000);
+const STAND_IN_LEASE = Math.min(3600, Number(process.env.CODER_TIMEOUT_MIN || 15) * 60 + 300); // seconds
 const STAND_IN_BACKEND = process.env.BACKCHANNEL_STAND_IN_BACKEND || (kind === 'codex' ? 'codex' : 'claude-code');
 const standInSent = new Set(); // replies the stand-in posted: a reply to one of them is a follow-up it should take
 const standInFailed = new Set(); // requests it couldn't answer, left for the session
@@ -189,7 +190,8 @@ async function standInTick() {
   standInBusy = true;
   try {
     await ensureTeam();
-    const [msg] = await take((m) => m.id === due.id);
+    // Leased for as long as a headless run may take: if this process dies mid-answer, the request comes back.
+    const [msg] = await take((m) => m.id === due.id, STAND_IN_LEASE);
     if (!msg) return; // the session's agent or another session took it first
     standingIn = msg;
     log(`standing in for @${id} on a request from @${msg.from}`);
@@ -199,7 +201,8 @@ async function standInTick() {
       description: `${owner}'s live ${kind === 'codex' ? 'Codex' : 'Claude Code'} session, answering while ${owner} is away${standIn === 'write' ? '' : ' (read-only)'}.` };
     try {
       const sent = await answer(hub, self, msg, log);
-      if (sent) standInSent.add(sent.id);
+      if (sent) standInSent.add(sent.id); // answering acknowledged the request
+      else await hub.ack(id, [msg.id]).catch(() => {}); // nothing to say: done with it all the same
       answered.push({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null, at: Date.now() });
     } catch (err) {
       // Put it back for the session, and don't try again.
