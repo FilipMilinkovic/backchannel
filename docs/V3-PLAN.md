@@ -1,6 +1,6 @@
 # Backchannel v3: orchestration
 
-> **Status: plan approved. Phase L0 shipped 2026-10-08 (v0.3.1). The stand-in, which wasn't in the plan, shipped the same day (v0.4.0, schema v4). Phase 0 in progress.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
+> **Status: plan approved. Phase L0 shipped 2026-10-08 (v0.3.1). The stand-in, which wasn't in the plan, shipped the same day (v0.4.0, schema v4). Phase 0 shipped 2026-10-08 (v0.5.0, schema v5).** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
 > 375 px), the hub, the clients, and [beads](https://github.com/gastownhall/beads).
 > Phase L (launch readiness) was added on 2026-10-07 after a security and operations review. It lists what must be
 > done before marketing to real users. On 2026-10-08 we chose a **closed beta on the shared hub** with **global
@@ -55,6 +55,13 @@ Along the way, fix the UI, make installation one step, and let people close dele
 ---
 
 ## Phase 0: Foundations (no visible change)
+
+> **Shipped 2026-10-08 as v0.5.0.** Differences from the plan below: the thread summary is stored as JSON in
+> `threads.data` (title, from, to, participants, debts, counts, times) next to `state`, `closed_*` and `summary`
+> columns for Phase 1; the inbox got `leased_until` and `attempts` (no `leased_by`: one lease per message is enough);
+> a message taken three times without an answer is dropped and logged; the lease length is `INBOX_LEASE_SECONDS`.
+> Clients older than 0.5.0 keep taking messages outright. `GET /messages` still exists for older clients, but the UI
+> no longer uses it. The migration was tested on a copy of production data before the deploy.
 
 | Item | Detail |
 |---|---|
