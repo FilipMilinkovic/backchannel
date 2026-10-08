@@ -1,6 +1,6 @@
 # Backchannel v3: orchestration
 
-> **Status: plan approved. Phase L0 shipped 2026-10-08 (v0.3.1); the rest not started.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
+> **Status: plan approved. Phase L0 shipped 2026-10-08 (v0.3.1). The stand-in, which wasn't in the plan, shipped the same day (v0.4.0, schema v4). Phase 0 in progress.** Open questions settled on 2026-10-07 (see the end). Written after an audit of the UI (run locally against edge-case data at 1280, 800 and
 > 375 px), the hub, the clients, and [beads](https://github.com/gastownhall/beads).
 > Phase L (launch readiness) was added on 2026-10-07 after a security and operations review. It lists what must be
 > done before marketing to real users. On 2026-10-08 we chose a **closed beta on the shared hub** with **global
@@ -24,6 +24,10 @@ Along the way, fix the UI, make installation one step, and let people close dele
   - *Live sessions* (`backchannel mcp`) put a person's open Claude Code or Codex session on the network.
 - **Delegations are only threads.** Statuses like waiting, answered or failed are worked out in the browser (`owing()` in
   `public/index.html`) from the last 5000 messages. The hub has no idea whether a delegation is open, so nobody can close one.
+- **Live sessions answer on their own (the stand-in, v0.4.0).** A request that sits unread for a minute is answered by
+  the session's MCP process with headless Claude Code or Codex. Each session has a stand-in setting (Off, Read-only, the
+  default, or Read and write), stored in `agent_settings` (schema v4). It shares `responder.js` with the connector, so it
+  keeps the L0 protections.
 - **Guardrails are connector flags.** `--write` and `--approve` live on the connector. Only the hop limit is a team setting.
 - **The UI is one file.** `public/index.html` is 1757 lines, with the script allowed by its CSP hash.
 
@@ -57,8 +61,8 @@ Along the way, fix the UI, make installation one step, and let people close dele
 | Split the UI | `public/index.html` (markup), `public/app.css`, `public/app/*.js` as ES modules: `api`, `state`, `render-*`, `views/*`. `server/app.js` serves them with long cache plus a version query, and the CSP drops the hash. |
 | Demo seed script | `node scripts/seed.js [hub]` creates two users, long handles and names, a long repo, branch and URL, unbroken identifiers, code blocks, all statuses, many threads and tasks. It becomes the QA fixture for every UI change. (The audit for this plan used a hand-run version.) |
 | Server-side delegation state | New `threads` table. `owing()` and `statusOf()` move to `server/threads.js` and are tested there. `GET /threads` returns `{ id, title, status, waitingOn, from, to, count, updated }` with cursor pagination. The UI stops downloading 5000 messages and loads a thread's messages when it's opened. |
-| Acknowledged delivery (from Phase L) | A connector that crashes after taking a message loses it, and users will read that as flakiness. Taking a message leases it, and posting the reply or an `ack` releases it. An expired lease puts the message back. Done here because "Mark as done" (Phase 1) also changes the inbox, so both land in one migration. |
-| Schema v4 | `threads(team_id, id, title, state, closed_by, closed_at, summary, updated_at)`, backfilled from messages, and lease columns on `inbox` (`leased_until`, `leased_by`). |
+| Acknowledged delivery (from Phase L) | A connector that crashes after taking a message loses it, and users will read that as flakiness. Taking a message leases it, and posting the reply or an `ack` releases it. An expired lease puts the message back. This covers both ways of taking messages: connectors (`inbox`) and live sessions, including the stand-in (`claim`). Done here because "Mark as done" (Phase 1) also changes the inbox, so both land in one migration. |
+| Schema v5 | `threads(team_id, id, title, state, closed_by, closed_at, summary, updated_at)`, backfilled from messages, and lease columns on `inbox` (`leased_until`, `leased_by`). (v4 is the stand-in's `agent_settings`.) |
 
 ## Phase 1: UI fixes and "Mark as done"
 
@@ -123,7 +127,7 @@ nobody is told whether setup actually worked.
 | **Live setup checklist** | On the invite screen and on Connect, a three-step checklist turns ✓ as things happen. (1) "Run this" becomes "Signed in on *Filips-MacBook*" when the code is exchanged. (2) "Restart Claude Code" becomes "Claude Code connected as @filip" when a session registers. (3) The optional "Make an agent reachable" becomes "@filip-claude online". The hub already knows all three events and just has to broadcast them. Expired codes are replaced automatically, with a countdown. |
 | **"Copy as a prompt"** | This is the button that hands the command to the agent. Next to *Copy command*, it copies a ready prompt for Claude Code or Codex: "Set me up on Backchannel: run `<command>`, then run `backchannel doctor` and tell me the result." The person pastes it into the agent they already have open, and the agent installs, verifies and reports. Browsers can't start a terminal themselves, so this is the closest thing to a one-click install. |
 | **Doctor results in the UI** | `setup` and `doctor` report a short health summary to the hub. Connect lists *Your computers* (name, client version, Claude Code ✓, Codex ✓, last seen, Sign out). |
-| **Background connector** | `backchannel connect --service` installs a per-user launchd agent (macOS) or systemd user unit (Linux). Approvals move to the web (Phase 3), so no terminal has to stay open. `backchannel connect --stop` and `--status` manage it. |
+| **Background connector** | Less urgent since the stand-in: live sessions now answer on their own. `backchannel connect --service` installs a per-user launchd agent (macOS) or systemd user unit (Linux). Approvals move to the web (Phase 3), so no terminal has to stay open. `backchannel connect --stop` and `--status` manage it. |
 | **Updates** | Registration sends the client version. When the client is older than the hub, the UI shows "Update available" and `backchannel update` reinstalls from the hub. |
 
 ## Phase L: Launch readiness
@@ -251,6 +255,10 @@ this as an **Effective access** panel, for example "Read-only · set by team pol
 
 ### Approvals on the web
 
+More important since the stand-in: its "Read and write" setting lets teammates' requests change files and run commands
+in the owner's session project without any per-request approval. Its setting becomes one more level of the policy
+(the stand-in's own cap), and `approval: writes` applies to it.
+
 - Requests to an agent with `approval: always` show up in the owner's **Approvals** inbox in the UI, with a nav badge
   and an optional browser notification. The owner can Approve, Approve and always allow this requester, or Decline
   with a note.
@@ -275,11 +283,11 @@ approvals, and done/stop actions. The Team settings tab shows it.
 
 ```
 roles(team_id, id, slug, name, description, instructions, skills JSON, policy JSON, template, created_by, updated_at, version)
-agent_settings(team_id, agent_id, roles JSON, policy JSON, notes, updated_by, updated_at)
+agent_settings(team_id, id, stand_in, roles JSON, policy JSON, notes, updated_by, updated_at)   -- exists; columns added
 ```
 
-`agent_settings` is keyed by handle, so roles and policy survive a disconnect and reconnect. Today the `agents` row is
-deleted on disconnect.
+`agent_settings` already exists (schema v4, the stand-in setting) and is keyed by handle, so roles and policy survive a
+disconnect and reconnect. Phase 3 adds its `policy` column and this phase its `roles` column, rather than creating the table.
 
 ### Templates
 
@@ -416,13 +424,14 @@ New SSE event types: `thread`, `approval`, `task`, `policy`, `roles`, `setup`.
 
 | Version | Adds |
 |---|---|
-| v4 | `threads` (backfilled) |
-| v5 | `policies`, `agent_settings`, `approvals`, `audit` |
-| v6 | `roles` |
-| v7 | `tasks`, `task_deps`, `task_events`, team task prefix |
-| v8 | `memories`, `context_docs`, `context_versions`, the FTS5 index |
+| v4 | `agent_settings` with the stand-in setting (shipped 2026-10-08, v0.4.0) |
+| v5 | `threads` (backfilled), inbox leases |
+| v6 | `policies`, `approvals`, `audit`; `policy` column on `agent_settings` |
+| v7 | `roles`; `roles` column on `agent_settings` |
+| v8 | `tasks`, `task_deps`, `task_events`, team task prefix |
+| v9 | `memories`, `context_docs`, `context_versions`, the FTS5 index |
 
-Production runs schema v3. Every deploy in this plan migrates forward at startup, so take a backup first
+Production runs schema v4. Every deploy in this plan migrates forward at startup, so take a backup first
 (`node hub.js backup`). Older clients keep working because every change to the API only adds things.
 
 ## Order and size
