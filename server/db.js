@@ -51,6 +51,12 @@ const MIGRATIONS = [
   `CREATE TABLE agent_disconnects (
      team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, id TEXT NOT NULL,
      by_user_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (team_id, id));`,
+  // What a live session's stand-in may do when nobody in the session picks a request up. Kept apart from the agent
+  // row so it survives re-registering and disconnecting; no row means the default.
+  `CREATE TABLE agent_settings (
+     team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE, id TEXT NOT NULL,
+     stand_in TEXT NOT NULL CHECK (stand_in IN ('off', 'read', 'write')),
+     updated_by TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (team_id, id));`,
 ];
 
 export const DB_FILE = 'backchannel.db';

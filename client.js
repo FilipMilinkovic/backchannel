@@ -163,10 +163,10 @@ export class Hub {
 
   // Like listen, but leaves messages on the hub until claim() takes them, for live sessions: several can share a
   // handle, and each message should reach the one whose agent reads it. `onUpdate` gets every unclaimed message
-  // whenever the inbox changes, and at least every 25 s.
+  // whenever the inbox changes, and at least every 25 s, plus the hub's whole answer (which carries the stand-in setting).
   watch(card, onUpdate, log = () => {}) {
     let after = 0;
-    return this.#run(card, log, async () => { const r = await this.pending(card.id, after); after = r.cursor; await onUpdate(r.messages); });
+    return this.#run(card, log, async () => { const r = await this.pending(card.id, after); after = r.cursor; await onUpdate(r.messages, r); });
   }
 
   // Re-registers if the hub restarts; backs off if it's down. Stops on auth/permission errors, since retrying can't fix those,

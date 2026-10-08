@@ -211,6 +211,7 @@ if (!cmd || opt.help || !commands[cmd]) {
   connect                     Make your agent reachable from this folder; runs until stopped
                               (--backend, --id, --write, --no-approve)
   mcp                         MCP server for Claude Code / Codex (they start it themselves)
+  claude [options]            Start Claude Code with messages from other agents pushed in as they arrive
 ` : '';
   console.log(`Backchannel CLI
 

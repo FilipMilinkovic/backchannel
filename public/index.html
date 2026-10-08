@@ -932,7 +932,28 @@ const agentStatus = (a) => (!a.online ? `Offline · seen ${a.lastSeen ? rel(a.la
 const statusDot = (a) => `<span class="dot ${a.online ? (a.state !== 'idle' ? 'busy' : 'on') : ''}" aria-hidden="true"></span>`;
 const isCoder = (a) => a.backend === 'claude-code' || a.backend === 'codex';
 // A coding agent that edits files and runs commands for anyone in the team, without its owner approving each request.
-const unguarded = (a) => a.kind !== 'session' && isCoder(a) && a.access === 'write' && a.approve === false;
+const unguarded = (a) => (a.kind === 'session' ? a.standIn === 'write' && hasStandIn(a)
+  : isCoder(a) && a.access === 'write' && a.approve === false);
+// Live sessions answer on their own after a minute when their owner allows it. Clients before 0.4.0 can't.
+function hasStandIn(a) {
+  const [major = 0, minor = 0] = String(a.client || '').split('.').map(Number);
+  return a.kind === 'session' && (major > 0 || minor >= 4);
+}
+const STAND_IN = { off: 'Off', read: 'Read-only', write: 'Read and write' };
+function standInCell(a, mine) {
+  const v = a.standIn || 'read';
+  const who = esc(ownerOf(a.id) || 'its owner');
+  const say = !hasStandIn(a) ? `Its Backchannel client is older than 0.4.0, so requests wait until ${who}’s agent checks its inbox.` : {
+    off: `Requests wait until ${who}’s agent checks its inbox.`,
+    read: 'If the session doesn’t pick a request up within a minute, a headless agent answers it from the project. It can’t change anything.',
+    write: 'If the session doesn’t pick a request up within a minute, a headless agent answers it and may change files and run commands in the project, without asking.',
+  }[v];
+  const old = !hasStandIn(a) ? ' <span class="tag">needs client 0.4.0</span>' : '';
+  if (!mine) return `<span class="tag ${v === 'write' ? 'warn' : ''}">${STAND_IN[v]}</span>${old} ${say}`;
+  return `<label class="sr-only" for="standIn">Stand-in</label><select class="input" id="standIn" data-stand-in="${esc(a.id)}" style="width:auto">
+    ${Object.entries(STAND_IN).map(([k, l]) => `<option value="${k}"${k === v ? ' selected' : ''}>${l}</option>`).join('')}</select>${old}
+    <span>${say}</span>`;
+}
 const accessTag = (a) => (unguarded(a) ? '<span class="tag warn" title="Edits files and runs commands without its owner approving each request">Edits without approval</span>'
   : `<span class="tag ${a.access === 'write' ? 'write' : ''}">${a.access === 'write' ? 'Can edit' : 'Read-only'}</span>`);
 const PLATFORM = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' };
@@ -997,7 +1018,7 @@ function renderAgentTable() {
         <td><button class="link-h" type="button" data-profile="${esc(a.id)}" aria-label="Open @${esc(a.id)}'s profile">@${esc(a.id)}</button><div class="d" title="${esc(a.description)}">${esc(a.description)}</div></td>
         <td>${esc(ownerOf(a.id))}${a.ownerUserId && S.me && a.ownerUserId === S.me.user.id ? '<span class="you-tag">you</span>' : ''}</td>
         <td class="col-hide">${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}${a.kind === 'session' ? ' <span class="tag">live session</span>' : ''}</td>
-        <td class="col-hide">${a.kind === 'session' ? '<span class="tag">asks others</span>' : !isCoder(a) ? '<span class="tag">No files</span>' : accessTag(a)}${repoLabel(a) ? ` <span class="mono" style="color:var(--ink-3)">${esc(repoLabel(a))}</span>` : ''}</td>
+        <td class="col-hide">${a.kind === 'session' ? `<span class="tag">asks others</span>${unguarded(a) ? ` ${accessTag(a)}` : ''}` : !isCoder(a) ? '<span class="tag">No files</span>' : accessTag(a)}${repoLabel(a) ? ` <span class="mono" style="color:var(--ink-3)">${esc(repoLabel(a))}</span>` : ''}</td>
         <td><span class="status-cell">${statusDot(a)}${agentStatus(a)}</span></td>
         <td><div class="actions">
           ${a.kind !== 'session' && a.online && canPost() ? `<button class="btn" type="button" data-delegate="${esc(a.id)}">Delegate</button>` : ''}
@@ -1029,10 +1050,11 @@ function renderProfile() {
   // Access
   const rows = [];
   rows.push(['Type', session
-    ? `Live session · ${esc(owner || 'its owner')}’s ${esc(BACKEND[a.backend] || a.backend)} reads requests when it checks its inbox, and delegates to others`
+    ? `Live session · ${esc(owner || 'its owner')}’s ${esc(BACKEND[a.backend] || a.backend)} handles requests and delegates to others`
     : 'Connector · answers requests on its own, in its owner’s environment']);
   rows.push(['Runs', `${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}`]);
   if (session) rows.push(['Files', `Whatever ${esc(owner || 'its owner')}’s session is allowed to touch. Their own ${esc(BACKEND[a.backend] || a.backend)} permissions apply.`]);
+  if (session) rows.push(['Stand-in', standInCell(a, mine)]);
   else if (coder) rows.push(['Files', a.access === 'write' ? `${accessTag(a)} Reads and changes files in its repositories, and runs commands`
     : a.backend === 'codex' ? '<span class="tag">Read-only</span> Can’t change files. Codex’s read-only mode can also read files outside its repositories'
     : '<span class="tag">Read-only</span> Reads files in its repositories but can’t change them']);
@@ -1425,6 +1447,17 @@ async function rotateToken(btn) {
 $('teamSelect').addEventListener('change', (e) => {
   if (e.target.value === '__new') { e.target.value = S.team; return showGate('newteam'); }
   switchTeam(e.target.value);
+});
+
+$('agentsBody').addEventListener('change', async (e) => {
+  const id = e.target.dataset.standIn;
+  if (!id) return;
+  e.target.disabled = true;
+  try {
+    const a = await post(`/agents/${encodeURIComponent(id)}`, { standIn: e.target.value }, 'PATCH');
+    S.agents = S.agents.map((x) => (x.id === a.id ? a : x));
+  } catch (err) { alert(`Couldn't change the stand-in: ${err.message}`); }
+  renderAll();
 });
 
 $('membersBody').addEventListener('change', async (e) => {

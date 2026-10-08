@@ -25,9 +25,18 @@ async function chatCompletions({ baseUrl, apiKey, model, system, prompt }) {
   return body.choices?.[0]?.message?.content ?? '';
 }
 
+// A stand-in runs inside a Claude Code session's MCP server, which marks its environment as that session's. The
+// headless run it starts is a separate session, so it doesn't inherit those markers.
+const NESTED = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT'];
+function childEnv() {
+  const env = { ...process.env };
+  for (const k of NESTED) delete env[k];
+  return env;
+}
+
 function run(cmd, args, { cwd, input, timeoutMs = Number(process.env.CODER_TIMEOUT_MIN || 15) * 60_000 }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     const name = path.basename(cmd);
     let out = '', err = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error(`${name} timed out`)); }, timeoutMs);

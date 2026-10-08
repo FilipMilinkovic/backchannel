@@ -27,7 +27,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   function publicAgent(a) {
     const p = rt.presenceOf(a.teamId, a.id);
     return { ...a, state: p.state, stateThread: p.stateThread, lastSeen: p.lastSeen,
-      ownerHandle: a.ownerUserId ? repo.userById(a.ownerUserId)?.handle || null : null, online: rt.online(p) };
+      ownerHandle: a.ownerUserId ? repo.userById(a.ownerUserId)?.handle || null : null, online: rt.online(p),
+      ...(a.kind === 'session' ? { standIn: repo.standIn(a.teamId, a.id) } : {}) };
   }
   const agentList = (teamId) => repo.agents(teamId).map(publicAgent);
   const broadcastAgents = (teamId) => rt.broadcast(teamId, { type: 'agents', agents: agentList(teamId) });
@@ -216,7 +217,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       box = repo.peekInbox(team.id, id);
     }
     if (res.destroyed) return;
-    send(res, 200, { cursor: Math.max(after, ...box.map((r) => r.seq)), messages: box.map((r) => r.message) });
+    // The stand-in setting rides along, so a change in the UI reaches the session within one poll.
+    send(res, 200, { cursor: Math.max(after, ...box.map((r) => r.seq)), messages: box.map((r) => r.message), standIn: repo.standIn(team.id, id) });
   }
 
   // ---------- routes ----------
@@ -408,6 +410,16 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         if (member.role !== 'owner') ownedAgent(team, user, a.id);
         disconnectAgent(team.id, a.id, user.id); broadcastAgents(team.id);
         return send(res, 200, { ok: true });
+      }
+      // Settings. The stand-in runs on its owner's computer, so only the owner chooses what it may do there.
+      if (!m[2] && req.method === 'PATCH') {
+        requireRole(member, ['owner', 'member']); ownedAgent(team, user, a.id);
+        if (a.kind !== 'session') throw httpError(400, 'only live sessions have a stand-in');
+        if (!['off', 'read', 'write'].includes(b.standIn)) throw httpError(400, 'standIn must be "off", "read" or "write"');
+        repo.setStandIn(team.id, a.id, b.standIn, user.id);
+        broadcastAgents(team.id);
+        rt.wake(team.id, a.id); // the session's pending poll answers now, with the new setting
+        return send(res, 200, publicAgent(repo.agent(team.id, a.id)));
       }
       if (m[2] === 'card' && req.method === 'GET') return send(res, 200, agentCard(a));
       if (m[2] === 'inbox' && req.method === 'GET') return await poll({ res, url, team, auth, member, id: a.id, draining: ctx.draining });

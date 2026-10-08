@@ -377,7 +377,7 @@ test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
   const db = openDb(dir);
   const repo = createRepo(db);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   const setup = repo.setupInvite();
   assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);

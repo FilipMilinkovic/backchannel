@@ -128,6 +128,11 @@ export function createRepo(db) {
     }),
     disconnected: (teamId, id) => get('SELECT by_user_id AS byUserId, at FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
     clearDisconnect: (teamId, id) => run('DELETE FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
+    // A live session's stand-in: 'read' unless its owner chose otherwise.
+    standIn: (teamId, id) => get('SELECT stand_in AS v FROM agent_settings WHERE team_id = ? AND id = ?', teamId, id)?.v || 'read',
+    setStandIn: (teamId, id, value, byUserId) => run(`INSERT INTO agent_settings (team_id, id, stand_in, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (team_id, id) DO UPDATE SET stand_in = excluded.stand_in, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+    teamId, id, value, byUserId, Date.now()),
     agentIdsOf: (teamId, userId) => all('SELECT id FROM agents WHERE team_id = ? AND owner_user_id = ?', teamId, userId).map((r) => r.id),
     claimOwnerless: (teamId, userId) => run('UPDATE agents SET owner_user_id = ? WHERE team_id = ? AND owner_user_id IS NULL', userId, teamId),
 

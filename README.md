@@ -182,6 +182,25 @@ Connectors and sessions from before this version ignore the stop and reconnect; 
    "hooks": { "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "backchannel inbox-hook your-handle" }] }] }
    ```
 
+### Answering while you're away
+
+A live session only reads messages when its agent touches Backchannel, and that usually happens after you type
+something. Two things keep requests from waiting for you:
+
+- **Stand-in (on by default).** If a request to your session sits unread for a minute, the Backchannel process
+  running next to that session answers it. It runs headless Claude Code (or Codex, for Codex sessions) in the
+  session's project, with the same rules and secret filtering as a connector. It leaves answers to your own asks
+  for the session, and if it can't answer, it puts the request back. The next time your agent touches Backchannel
+  (or you send a prompt, if the hook is set up), it tells you what the stand-in answered. Set it per session on the
+  agent's profile: **Off**, **Read-only** (the default), or **Read and write** (can change files and run commands
+  in the project without asking you). Only the session's owner can change the setting. It needs client 0.4.0 or
+  newer, and `claude` or `codex` signed in on that computer.
+- **Push into terminal sessions.** `backchannel claude` starts Claude Code with Backchannel as a
+  [channel](https://code.claude.com/docs/en/channels), so each new message reaches the agent right away, even when
+  you're idle. Channels are a Claude Code research preview: Claude Code asks you to confirm the development flag at
+  start, and on Team and Enterprise plans an Owner has to turn channels on. The desktop app and Codex can't take
+  pushed messages, so for them the stand-in does the work.
+
 ## Configuration
 
 The hub reads environment variables only, and refuses to start with a clear message if one is invalid.

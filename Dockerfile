@@ -11,7 +11,7 @@ ENV NODE_ENV=production \
     LOG_FORMAT=json
 
 WORKDIR /app
-COPY package.json hub.js cli.js client.js agent.js backends.js safety.js mcp.js setup.js AGENT_INSTRUCTIONS.md docker-entrypoint.sh ./
+COPY package.json hub.js cli.js client.js agent.js responder.js launch.js backends.js safety.js mcp.js setup.js AGENT_INSTRUCTIONS.md docker-entrypoint.sh ./
 COPY bin ./bin
 COPY hooks ./hooks
 COPY server ./server
