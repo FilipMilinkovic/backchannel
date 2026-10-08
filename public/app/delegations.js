@@ -1,7 +1,7 @@
 // Delegations: the list, the detail pane, the picker and both composers (with attachments).
 import { select } from './main.js';
-import { S, agentById, canPost, display, ownerOf, post, senderName } from './state.js';
-import { stripLead, threads, workingIn } from './threads.js';
+import { S, agentById, canPost, display, ownerOf, post, senderName, tapi } from './state.js';
+import { addMessage, loadMessages, putThread, stripLead, thread, threads, workingIn } from './threads.js';
 import { $, ACTIVE, BACKEND, ICON, LABEL, clock, elapsed, esc, glyph, md, rel, size, store } from './util.js';
 
 // ---------- render: list ----------
@@ -10,10 +10,14 @@ export function renderList() {
   const ts = threads();
   const nActive = ts.filter((t) => ACTIVE.has(t.status)).length;
   $('nActive').textContent = nActive || '';
-  $('nDone').textContent = (ts.length - nActive) || '';
+  // Older finished delegations may not be loaded yet; the hub's count covers them.
+  $('nDone').textContent = ((S.counts ? Math.max(S.counts.total, ts.length) : ts.length) - nActive) || '';
   document.querySelectorAll('#filters button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.filter === S.filter)));
 
   const shown = ts.filter((t) => t.id === S.selected || S.filter === 'all' || (S.filter === 'active') === ACTIVE.has(t.status));
+  const older = S.filter !== 'active' && S.olderCursor
+    ? '<li class="more" role="presentation"><button class="btn ghost" type="button" data-action="older">Show older delegations</button></li>' : '';
+  if (!shown.length && older) { $('rows').innerHTML = older; return; }
   if (!shown.length) {
     $('rows').innerHTML = `<li class="empty" role="presentation">${ts.length
       ? `<h3>${S.filter === 'active' ? 'Nothing in flight' : 'Nothing finished yet'}</h3><p>${S.filter === 'active' ? 'Every delegation has been answered.' : 'Finished delegations show up here.'}</p>`
@@ -25,22 +29,23 @@ export function renderList() {
   }
   $('rows').innerHTML = shown.map((t) => {
     const to = t.to.length ? t.to.map(display).join(', ') : 'nobody';
-    const n = t.msgs.length;
+    const n = t.count;
     return `<li class="row${S.fresh.has(t.id) ? ' fresh' : ''}" role="option" tabindex="-1" data-id="${t.id}" aria-selected="${t.id === S.selected}">
       <span class="glyph">${glyph(t.status)}</span>
       <span class="title">${esc(t.title)}</span>
       <span class="time num">${rel(t.updated)}</span>
-      <span class="route"><b>${esc(senderName(t.first))}</b> to <b>${esc(to)}</b> · ${n} ${n === 1 ? 'message' : 'messages'}</span>
+      <span class="route"><b>${esc(senderName(t))}</b> to <b>${esc(to)}</b> · ${n} ${n === 1 ? 'message' : 'messages'}</span>
       <span class="state ${t.status}">${LABEL[t.status]}</span>
     </li>`;
-  }).join('');
+  }).join('') + older;
   S.fresh.clear();
 }
 
 // ---------- render: detail ----------
 let renderedThread = null, renderedCount = 0;
+const loading = new Set();
 export function renderDetail() {
-  const t = S.selected && threads().find((x) => x.id === S.selected);
+  const t = S.selected && thread(S.selected);
   $('view-delegations').classList.toggle('show-detail', !!(t || S.composing) && S.mobileDetail);
   $('viewerNote').hidden = canPost();
   if (!t) {
@@ -51,7 +56,15 @@ export function renderDetail() {
     return;
   }
   $('newForm').hidden = true; $('detailBody').hidden = false; $('replyForm').hidden = !canPost();
-  const hops = t.last.hop || 0, max = S.config?.maxHops ?? 8;
+  // Messages are loaded the first time a thread is opened.
+  const msgs = S.msgs.get(t.id);
+  if (!msgs && !loading.has(t.id)) {
+    loading.add(t.id);
+    loadMessages(t.id).then(() => S.selected === t.id && renderDetail())
+      .catch((err) => { $('replyError').textContent = `Couldn't load this delegation: ${err.message}`; })
+      .finally(() => loading.delete(t.id));
+  }
+  const hops = t.hops || 0, max = S.config?.maxHops ?? 8;
   const live = workingIn(t.id);
   const isNew = renderedThread !== t.id;
   const timeline = $('detailBody').querySelector('.timeline');
@@ -64,13 +77,14 @@ export function renderDetail() {
       <h2>${esc(t.title)}</h2>
       <div class="facts">
         <span class="pill ${t.status}">${t.status === 'queued' && t.waiting.length ? `Waiting on ${esc(t.waiting.map(display).join(', '))}` : LABEL[t.status]}</span>
-        <span><span class="who">${esc(senderName(t.first))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
-        <span class="num">Started ${clock(t.first.ts)}</span>
+        <span><span class="who">${esc(senderName(t))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
+        <span class="num">Started ${clock(t.started)}</span>
         <span class="num" title="Agent-to-agent replies used out of the hop limit">Hops ${hops} of ${max}</span>
       </div>
     </header>
     <div class="timeline" aria-live="polite">
-      ${t.msgs.map((m, i) => {
+      ${msgs ? '' : '<p class="loading">Loading…</p>'}
+      ${(msgs || []).map((m, i) => {
         const a = m.fromKind === 'user' ? null : agentById(m.from);
         const name = senderName(m);
         const you = name === 'You';
@@ -94,17 +108,17 @@ export function renderDetail() {
     </div>`;
   const tl = $('detailBody').querySelector('.timeline');
   tl.scrollTop = keepScroll ? prevTop : tl.scrollHeight;
-  renderedThread = t.id; renderedCount = t.msgs.length;
+  if (msgs) { renderedThread = t.id; renderedCount = msgs.length; }
   updateReplyHint();
 }
 
 function defaultReplyTarget(t) {
   // Follow-ups go to the agent doing the work, not to a live session that asked.
-  const worker = [...t.msgs].reverse().find((m) => agentById(m.from)?.kind === 'agent');
+  const worker = [...(S.msgs.get(t.id) || [])].reverse().find((m) => agentById(m.from)?.kind === 'agent');
   return worker?.from || t.to.find((id) => agentById(id)?.kind === 'agent') || t.to[0];
 }
 function updateReplyHint() {
-  const t = S.selected && threads().find((x) => x.id === S.selected);
+  const t = S.selected && thread(S.selected);
   if (!t) return;
   const lead = (($('replyText').value.match(/^(\s*@[a-zA-Z][\w-]*)+/) || [''])[0].match(/@[a-zA-Z][\w-]*/g) || []).map((x) => x.slice(1).toLowerCase());
   const to = lead.length ? lead : [defaultReplyTarget(t)].filter(Boolean);
@@ -161,6 +175,10 @@ export async function downloadFile(id, name) {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
+// A stand-in summary for a delegation just started, until the hub's arrives.
+const summaryOf = (m) => ({ id: m.threadId, title: stripLead(m.text).slice(0, 80) || 'Untitled delegation', from: m.from, fromKind: m.fromKind,
+  to: m.to || [], participants: [m.from, ...(m.to || [])], waitingOn: m.to || [], count: 1, started: m.ts, updated: m.ts, hops: 0, note: !!m.note });
+
 async function submit(form, textEl, errEl, btn, body) {
   const files = pending[form.id];
   const text = textEl.value.trim() || (files.length ? `Attached ${files.map((f) => f.name).join(', ')}.` : '');
@@ -186,18 +204,23 @@ $('newForm').addEventListener('submit', async (e) => {
   const to = S.composeTo;
   if (!to) return;
   const msg = await submit($('newForm'), $('newText'), $('newError'), $('newSend'), (text) => ({ text: `@${to} ${text}` }));
-  if (msg) { S.messages.some((m) => m.id === msg.id) || S.messages.push(msg); if (S.filter === 'done') S.filter = 'active'; select(msg.threadId); }
+  if (!msg) return;
+  if (!S.msgs.has(msg.threadId)) S.msgs.set(msg.threadId, [msg]);
+  // The summary usually arrives on the event stream first; fetch it if not.
+  if (!S.threads.has(msg.threadId)) putThread(await tapi(`/threads/${encodeURIComponent(msg.threadId)}/summary`).catch(() => null) || summaryOf(msg));
+  if (S.filter === 'done') S.filter = 'active';
+  select(msg.threadId);
 });
 
 $('replyForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const t = threads().find((x) => x.id === S.selected);
+  const t = thread(S.selected);
   if (!t) return;
   const raw = $('replyText').value.trim();
   const target = defaultReplyTarget(t);
   const msg = await submit($('replyForm'), $('replyText'), $('replyError'), $('replySend'),
     (text) => ({ threadId: t.id, text: /^@[a-zA-Z]/.test(raw) || !target ? text : `@${target} ${text}` }));
-  if (msg && !S.messages.some((m) => m.id === msg.id)) { S.messages.push(msg); renderDetail(); }
+  if (msg) { addMessage(msg); renderDetail(); }
   updateReplyHint();
 });
 

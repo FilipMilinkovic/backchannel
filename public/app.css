@@ -397,3 +397,5 @@ td select.input { height: 28px; width: auto; padding: 0 6px; }
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   .g.working circle.arc { animation: none; stroke-dasharray: none; }
 }
+.rows .more { display: flex; justify-content: center; padding: 10px 12px; }
+.timeline .loading { color: var(--ink-3); font-size: var(--text-sm); padding: 18px 0; margin: 0; }

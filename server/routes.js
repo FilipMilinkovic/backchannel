@@ -558,6 +558,11 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       const active = all.filter((t) => t.active).length;
       return send(res, 200, { active, done: all.length - active, total: all.length });
     }
+    if ((m = /^\/threads\/([\w-]+)\/summary$/.exec(rest)) && req.method === 'GET') {
+      const row = repo.thread(team.id, m[1]);
+      if (!row) throw httpError(404, 'unknown thread');
+      return send(res, 200, threadView(team.id)(row));
+    }
     if ((m = /^\/threads\/([\w-]+)$/.exec(rest)) && req.method === 'GET') {
       const thread = repo.threadMessages(team.id, m[1]);
       if (!thread.length) throw httpError(404, 'unknown thread');

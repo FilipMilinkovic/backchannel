@@ -5,6 +5,7 @@ import { downloadFile, pending, renderDetail, renderList, renderPending } from '
 import { loadInvites, renderMembers } from './members.js';
 import { renderRail } from './rail.js';
 import { S, agentById, api, canPost, tapi } from './state.js';
+import { addMessage, loadMessages, loadOlder, loadThreads, putThread } from './threads.js';
 import { $, elapsed, esc, store } from './util.js';
 
 // Unexpected errors go to the hub's log (and Sentry, if it's set up). At most five per page load; codes are stripped from the URL.
@@ -66,13 +67,11 @@ function startNew(to) {
 
 // ---------- events ----------
 let es = null;
-async function refreshMessages(team) {
+// After a reconnect: fresh summaries, and the open thread's messages again.
+async function catchUp(team) {
   try {
-    const messages = await tapi('/messages');
-    if (team !== S.team) return;
-    const known = new Set(S.messages.map((m) => m.id));
-    for (const m of messages) if (!known.has(m.id)) { S.messages.push(m); S.fresh.add(m.threadId); }
-    S.messages.sort((a, b) => a.ts - b.ts);
+    if (!(await loadThreads(team))) return;
+    if (S.selected) await loadMessages(S.selected, { force: true });
     renderAll();
   } catch {}
 }
@@ -87,8 +86,8 @@ export function connect() {
     const ev = JSON.parse(e.data);
     if (team !== S.team) return;
     if (ev.type === 'hello') {
-      // After a reconnect (network blip, hub restart), catch up on messages posted while we were away.
-      if (helloSeen) refreshMessages(team);
+      // After a reconnect (network blip, hub restart), catch up on what changed while we were away.
+      if (helloSeen) catchUp(team);
       helloSeen = true;
       if (ev.agents) S.agents = ev.agents;
       if (ev.config) S.config = { ...S.config, ...ev.config };
@@ -108,9 +107,12 @@ export function connect() {
       else S.live[ev.id] = { state: ev.state, threadId: ev.threadId, since: S.live[ev.id]?.state === ev.state ? S.live[ev.id].since : Date.now() };
       const a = agentById(ev.id); if (a) a.state = ev.state;
     }
-    if (ev.type === 'message' && !S.messages.some((m) => m.id === ev.message.id)) {
-      S.messages.push(ev.message);
-      S.fresh.add(ev.message.threadId);
+    if (ev.type === 'message') addMessage(ev.message);
+    if (ev.type === 'thread') {
+      putThread(ev.thread);
+      if (ev.thread.id !== S.selected) S.fresh.add(ev.thread.id);
+      // An open profile's activity is out of date once one of its delegations moves.
+      if (S.profile && ev.thread.participants?.includes(S.profile)) delete S.activity[S.profile];
     }
     renderAll();
   };
@@ -125,6 +127,11 @@ document.addEventListener('click', async (e) => {
   if (t.dataset.goto) return setView(t.dataset.goto);
   if (t.dataset.filter) { S.filter = t.dataset.filter; store.set('bc.filter', S.filter); return renderList(); }
   if (t.dataset.action === 'new' || t.id === 'newBtn') return startNew();
+  if (t.dataset.action === 'older') {
+    t.disabled = true; t.textContent = 'Loading…';
+    try { await loadOlder(); } catch (err) { t.disabled = false; t.textContent = `Couldn't load more: ${err.message}`; return; }
+    return renderList();
+  }
   if (t.dataset.action === 'back') { S.mobileDetail = false; S.selected = null; S.composing = true; renderList(); return renderDetail(); }
   if (t.dataset.delegate) return startNew(t.dataset.delegate);
   if (t.dataset.disconnect) return disconnectAgent(t);
@@ -337,9 +344,10 @@ async function refreshAccount(fromSignin = false) {
 async function switchTeam(teamId) {
   S.team = teamId; store.set('bc.team', teamId);
   S.role = S.teams.find((t) => t.id === teamId)?.role || null;
-  Object.assign(S, { agents: [], messages: [], members: [], invites: [], live: {}, selected: null, composing: true, config: null });
-  const [team, agents, messages, members] = await Promise.all([tapi(''), tapi('/agents'), tapi('/messages'), tapi('/members')]);
-  S.config = team; S.role = team.role || S.role; S.agents = agents; S.messages = messages; S.members = members;
+  Object.assign(S, { agents: [], members: [], invites: [], live: {}, selected: null, composing: true, config: null,
+    threads: new Map(), msgs: new Map(), counts: null, olderCursor: undefined, activity: {} });
+  const [team, agents, members] = await Promise.all([tapi(''), tapi('/agents'), tapi('/members'), loadThreads(teamId)]);
+  S.config = team; S.role = team.role || S.role; S.agents = agents; S.members = members;
   for (const a of agents) if (a.state && a.state !== 'idle') S.live[a.id] = { state: a.state, threadId: a.stateThread, since: Date.now() };
   await loadInvites();
   $('gate').hidden = true; $('app').hidden = false;

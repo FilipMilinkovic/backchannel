@@ -1,76 +1,71 @@
-// Delegations, worked out from the messages this browser has loaded.
-import { S, agentById } from './state.js';
+// Delegations, as summarized by the hub (GET /threads). Who's working on one right now comes from the live event
+// stream, so the status is finished here; a thread's messages are loaded when it's opened.
+import { S, agentById, tapi } from './state.js';
 
+// The loaded summaries, newest first, with their live status.
 export function threads() {
-  const map = new Map();
-  for (const m of S.messages) {
-    let t = map.get(m.threadId);
-    if (!t) { t = { id: m.threadId, msgs: [] }; map.set(m.threadId, t); }
-    t.msgs.push(m);
-  }
-  const out = [];
-  for (const t of map.values()) {
-    t.first = t.msgs[0]; t.last = t.msgs[t.msgs.length - 1];
-    t.from = t.first.from; t.to = t.first.to || [];
-    t.title = t.first.title || summarize(t.first.text);
-    t.updated = t.last.ts;
-    t.waiting = owing(t);
-    t.status = statusOf(t);
-    out.push(t);
-  }
-  return out.sort((a, b) => b.updated - a.updated);
+  return [...S.threads.values()].map(withLive).sort((a, b) => b.updated - a.updated || (a.id < b.id ? 1 : -1));
 }
+export const thread = (id) => { const t = S.threads.get(id); return t && withLive(t); };
 
-// A delegation's title: the sender's explicit title, or the first substantial sentence of the request,
-// without markdown, greetings like "Codex here." or routing @handles, cut at a word boundary.
-function summarize(text) {
-  const plain = stripLead(text)
-    .replace(/```[\s\S]*?```/g, ' ').replace(/[*`#>]+|\b__?|__?\b(?!\w)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
-  const firstLine = plain.split(/\n/).map((l) => l.trim()).find(Boolean) || '';
-  const sentences = firstLine.split(/(?<=[.!?])\s+/);
-  const greeting = /^(hi|hey|hello|thanks|ok(ay)?|quick question)\b|\bhere[.!]?$|^(i'?m|i am|this is)\b.{0,40}\b(agent|claude|codex|code|session)[.!]?$/i;
-  let pick = sentences.map((x) => x.trim()).find((x) => x.length > 12 && !greeting.test(x)) || firstLine;
-  pick = pick.replace(/[.:;,]+$/, '');
-  if (pick.length <= 80) return pick || 'Untitled delegation';
-  const cut = pick.slice(0, 80);
-  return cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : 80).replace(/[,;:\s-]+$/, '') + '…';
+export function withLive(t) {
+  const live = workingIn(t.id);
+  const waiting = (t.waitingOn || []).filter((id) => agentById(id));
+  const status = live.some((l) => l.state === 'approval') ? 'approval' : live.some((l) => l.state === 'working') ? 'working'
+    : t.lastKind === 'error' ? 'error' : t.lastKind === 'declined' ? 'declined' : t.note ? 'stalled'
+      : waiting.length ? 'queued' : 'answered';
+  return { ...t, waiting, status };
 }
 
 export function stripLead(text) { return text.replace(/^(\s*[,:;]*\s*@[a-zA-Z][\w-]*)+[\s,:;]*/, '').trim(); }
-
-function statusOf(t) {
-  const live = workingIn(t.id);
-  if (live.some((l) => l.state === 'approval')) return 'approval';
-  if (live.some((l) => l.state === 'working')) return 'working';
-  const last = t.last;
-  if (last.kind === 'error') return 'error';
-  if (last.kind === 'declined') return 'declined';
-  if (last.note) return 'stalled';
-  return t.waiting.length ? 'queued' : 'answered';
-}
-
-// The agents a thread is still waiting on. Each message asks the agents it's addressed to, except the one it answers.
-// A reply (the sender named the message it answers) settles everything its sender owed, unless it hands work on to
-// someone else. Writing to whoever asked always settles that ask.
-// Messages from before the hub recorded `reply` count as replies when an agent sent them with inReplyTo.
-function owing(t) {
-  const byId = new Map(t.msgs.map((m) => [m.id, m]));
-  let debts = []; // { debtor, creditor }
-  for (const m of t.msgs) {
-    const parent = m.inReplyTo && byId.get(m.inReplyTo);
-    const isReply = m.kind === 'error' || m.kind === 'declined' || (m.reply ?? (m.fromKind === 'agent' && !!m.inReplyTo));
-    const answering = isReply && parent && parent.from !== m.from ? parent.from : null;
-    const to = m.to || [];
-    const asks = m.note ? [] : to.filter((r) => r !== m.from && r !== answering && agentById(r));
-    debts = debts.filter((d) => d.debtor !== m.from
-      || !((isReply && !asks.length) || to.includes(d.creditor)));
-    for (const r of asks) if (!debts.some((d) => d.debtor === r && d.creditor === m.from)) debts.push({ debtor: r, creditor: m.from });
-  }
-  return [...new Set(debts.map((d) => d.debtor))].filter((id) => agentById(id));
-}
 
 export function workingIn(threadId) {
   return Object.entries(S.live)
     .filter(([id, l]) => l.threadId === threadId && l.state !== 'idle' && agentById(id)?.online)
     .map(([id, l]) => ({ id, ...l }));
+}
+
+const PAGE = 50;
+const merge = (list) => { for (const t of list) S.threads.set(t.id, t); };
+
+// Every active delegation, the newest page of all of them, and the counts.
+export async function loadThreads(team = S.team) {
+  const [active, recent, counts] = await Promise.all([tapi('/threads?state=active'), tapi(`/threads?limit=${PAGE}`), tapi('/threads/counts')]);
+  if (team !== S.team) return false;
+  merge(active); merge(recent);
+  S.counts = counts;
+  if (S.olderCursor === undefined || S.olderCursor === null) S.olderCursor = recent.length === PAGE ? recent.at(-1).cursor : null;
+  return true;
+}
+
+// The next page of older delegations.
+export async function loadOlder() {
+  if (!S.olderCursor) return;
+  const team = S.team;
+  const page = await tapi(`/threads?limit=${PAGE}&before=${encodeURIComponent(S.olderCursor)}`);
+  if (team !== S.team) return;
+  merge(page);
+  S.olderCursor = page.length === PAGE ? page.at(-1).cursor : null;
+}
+
+// A thread's messages, loaded once and then kept current by the event stream.
+export async function loadMessages(id, { force = false } = {}) {
+  if (S.msgs.has(id) && !force) return S.msgs.get(id);
+  const team = S.team;
+  const msgs = await tapi(`/threads/${encodeURIComponent(id)}`);
+  if (team !== S.team) return null;
+  S.msgs.set(id, msgs);
+  return msgs;
+}
+
+// A message this browser posted or heard about: added to its thread if that thread is loaded.
+export function addMessage(m) {
+  const list = S.msgs.get(m.threadId);
+  if (list && !list.some((x) => x.id === m.id)) list.push(m);
+}
+
+// A summary from the event stream (or after posting). A thread we didn't know about adds to the total.
+export function putThread(t) {
+  if (!S.threads.has(t.id) && S.counts) S.counts.total++;
+  S.threads.set(t.id, t);
 }

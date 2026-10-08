@@ -584,6 +584,9 @@ test('threads: the hub keeps each delegation\'s status, pages them and reports a
   assert.deepEqual((await h.ok(p + '/threads?state=active', owner.token)).map((x) => x.id), [other.threadId]);
   assert.deepEqual(await h.ok(p + '/threads/counts', owner.token), { active: 1, done: 1, total: 2 });
 
+  const one = await h.ok(`${p}/threads/${ask.threadId}/summary`, owner.token);
+  assert.equal(one.id, ask.threadId); assert.equal(one.status, 'answered');
+  assert.equal((await h.api(`${p}/threads/nope/summary`, owner.token)).status, 404);
   // Paging by cursor.
   const page1 = await h.ok(p + '/threads?limit=1', owner.token);
   assert.equal(page1.length, 1);

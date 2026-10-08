@@ -1,7 +1,7 @@
 // Agents: the table, profiles, the stand-in setting and disconnecting.
 import { renderAll, setView } from './main.js';
 import { S, agentById, canPost, display, isOwner, ownerOf, post, senderName, tapi } from './state.js';
-import { threads } from './threads.js';
+import { withLive } from './threads.js';
 import { $, BACKEND, ICON, LABEL, esc, glyph, rel } from './util.js';
 
 // ---------- render: agents ----------
@@ -158,14 +158,18 @@ function renderProfile() {
     !a.repos && a.repo ? 'Its connector is on an older version. Restarting it with the current client adds the remote and branch.' : '',
   ].filter(Boolean);
 
-  // Activity, from the delegations this browser has loaded
-  const involved = threads().filter((t) => t.msgs.some((m) => m.from === a.id || m.to?.includes(a.id)));
-  const sent = S.messages.filter((m) => m.from === a.id);
-  const received = involved.filter((t) => t.msgs.some((m) => m.from !== a.id && m.to?.includes(a.id))).length;
-  const started = involved.filter((t) => t.first.from === a.id).length;
-  const replies = sent.filter((m) => m.reply ?? !!m.inReplyTo).length;
-  const last = sent.length ? sent[sent.length - 1].ts : null;
-  const recent = involved.slice(0, 8);
+  // Activity, from the hub. Fetched when the profile opens, and again after one of its delegations moves.
+  const act = S.activity[a.id];
+  if (!act) {
+    S.activity[a.id] = { loading: true };
+    tapi(`/agents/${encodeURIComponent(a.id)}/activity`)
+      .then((r) => { S.activity[a.id] = r; }, () => { delete S.activity[a.id]; })
+      .then(() => S.profile === a.id && renderAgents());
+  }
+  const ready = act && !act.loading;
+  const stat = (v) => (ready ? v : '–');
+  // Live status for the ones this browser has loaded; the hub's for the rest.
+  const recent = ready ? act.threads.map((t) => withLive(S.threads.get(t.id) || t)) : [];
 
   // Connection
   const conn = [];
@@ -194,15 +198,15 @@ function renderProfile() {
     <section class="block"><h2>Repositories</h2>${repoList}${repoNotes.map((n) => `<p class="note">${esc(n)}</p>`).join('')}</section>
     <section class="block"><h2>Activity</h2>
       <div class="stats">
-        <div class="stat"><b>${received}</b><span>Requests received</span></div>
-        <div class="stat"><b>${replies}</b><span>Replies sent</span></div>
-        <div class="stat"><b>${started}</b><span>Delegations started</span></div>
-        <div class="stat"><b>${last ? rel(last) : '–'}</b><span>Last message</span></div>
+        <div class="stat"><b>${stat(act?.received)}</b><span>Requests received</span></div>
+        <div class="stat"><b>${stat(act?.replies)}</b><span>Replies sent</span></div>
+        <div class="stat"><b>${stat(act?.started)}</b><span>Delegations started</span></div>
+        <div class="stat"><b>${ready && act.lastMessageAt ? rel(act.lastMessageAt) : '–'}</b><span>Last message</span></div>
       </div>
       ${recent.length ? `<ul class="rows">${recent.map((t) => `<li><button class="row" type="button" data-thread="${esc(t.id)}">
         <span class="glyph">${glyph(t.status)}</span><span class="title">${esc(t.title)}</span><span class="time num">${rel(t.updated)}</span>
-        <span class="route"><b>${esc(senderName(t.first))}</b> to <b>${esc((t.to.length ? t.to.map(display).join(', ') : 'nobody'))}</b></span>
-        <span class="state ${t.status}">${LABEL[t.status]}</span></button></li>`).join('')}</ul>` : '<p class="note" style="margin:0">No delegations yet.</p>'}
+        <span class="route"><b>${esc(senderName(t))}</b> to <b>${esc((t.to.length ? t.to.map(display).join(', ') : 'nobody'))}</b></span>
+        <span class="state ${t.status}">${LABEL[t.status]}</span></button></li>`).join('')}</ul>` : `<p class="note" style="margin:0">${ready ? 'No delegations yet.' : 'Loading…'}</p>`}
     </section>
     <section class="block"><h2>Connection</h2>${kv(conn)}
       ${a.online && canManage(a) ? `<p class="note">${a.kind === 'session' ? 'Disconnecting stops this session’s Backchannel connection. Starting a new session reconnects it.' : 'Disconnecting stops its connector and removes it from the team. Running the connect command again brings it back.'}</p>` : ''}
