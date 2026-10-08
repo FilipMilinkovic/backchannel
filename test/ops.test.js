@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
-import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
@@ -62,9 +61,16 @@ test('health, readiness, version, request ids and security headers', async (t) =
   }
   assert.equal(page.headers.get('strict-transport-security'), null, 'no HSTS without an https PUBLIC_URL');
   const csp = page.headers.get('content-security-policy');
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
-  assert.ok(csp.includes(`'sha256-${crypto.createHash('sha256').update(script).digest('base64')}'`), 'the UI script is allowed by hash');
+  assert.ok(!/<script>/.test(html), 'no inline scripts');
+  assert.match(html, /<script type="module" src="\/app\/main\.js"><\/script>/);
+  assert.match(csp, /script-src 'self'(;|$)/);
   assert.ok(!/script-src[^;]*unsafe-inline/.test(csp));
+  // Modules and the stylesheet are revalidated every load, cheaply.
+  const js = await fetch(h.base + '/app/main.js');
+  assert.equal(js.headers.get('content-type'), 'text/javascript; charset=utf-8');
+  assert.equal(js.headers.get('cache-control'), 'no-cache');
+  assert.equal((await fetch(h.base + '/app/main.js', { headers: { 'if-none-match': js.headers.get('etag') } })).status, 304);
+  assert.equal((await fetch(h.base + '/app.css')).headers.get('cache-control'), 'no-cache');
   assert.equal((await fetch(h.base + '/../package.json')).status, 404);
   assert.equal((await fetch(h.base + '/%2e%2e/package.json')).status, 404);
   assert.equal((await fetch(h.base + '/%E0%A4%A')).status, 400);

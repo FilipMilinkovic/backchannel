@@ -15,7 +15,7 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; cha
   '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8' };
 const MAX_BODY = 2_000_000;
 
-// CSP that allows exactly the inline scripts in the UI (by hash) and nothing else inline.
+// CSP that allows the UI's own script files and exactly the inline scripts in index.html (by hash; there are none now).
 // Recomputed when index.html changes, so editing the UI never needs a hub restart.
 function cspFor(publicDir) {
   const file = path.join(publicDir, 'index.html');
@@ -101,9 +101,15 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     if (!file.startsWith(publicDir + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('not found');
     }
-    const isHtml = file.endsWith('.html');
-    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream',
-      'cache-control': isHtml ? 'no-cache' : 'public, max-age=300' });
+    // The page, its modules and its stylesheet are revalidated on every load (cheap, with ETags), so a deploy never
+    // mixes an old module with a new one. Other files are cached briefly.
+    const stat = fs.statSync(file);
+    const etag = `"${stat.size.toString(36)}-${Math.floor(stat.mtimeMs).toString(36)}"`;
+    const fresh = /\.(html|js|css)$/.test(file);
+    res.setHeader('etag', etag);
+    res.setHeader('cache-control', fresh ? 'no-cache' : 'public, max-age=300');
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304); return res.end(); }
+    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
     if (req.method === 'HEAD') return res.end();
     fs.createReadStream(file).pipe(res);
   }

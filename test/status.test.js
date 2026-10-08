@@ -1,14 +1,11 @@
-// The UI's rule for whether a delegation is still waiting on someone, run against the function in public/index.html.
+// The hub's rule for whether a delegation is still waiting on someone (server/threads.js).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import { ROOT } from './helpers.js';
+import { debtsOf } from '../server/threads.js';
 
-const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
-const source = html.match(/\nfunction owing\(t\) \{[\s\S]*?\n\}\n/)[0];
 const AGENTS = { filip: 'session', steve: 'session', bob: 'agent', carol: 'agent' };
-const owing = new Function('agentById', `${source}; return owing;`)((id) => (AGENTS[id] ? { id, kind: AGENTS[id] } : undefined));
+const isAgent = (id) => !!AGENTS[id];
+const owing = ({ msgs }) => [...new Set(debtsOf(msgs, isAgent).map((d) => d.debtor))].filter(isAgent);
 
 let n = 0;
 const msg = (from, to, extra = {}) => ({ id: `m${++n}`, from, to, fromKind: AGENTS[from] ? 'agent' : 'user', reply: false, ...extra });

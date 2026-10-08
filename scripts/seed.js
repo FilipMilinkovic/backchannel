@@ -24,7 +24,7 @@ async function startHub() {
   child.stdout.on('data', (d) => { out += d; });
   child.stderr.on('data', (d) => { out += d; });
   const stop = () => { child.kill(); fs.rmSync(dir, { recursive: true, force: true }); };
-  process.on('SIGINT', () => { stop(); process.exit(0); });
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { stop(); process.exit(0); });
   process.on('exit', stop);
   for (let i = 0; i < 100 && !/#join\/[a-f0-9]+/.test(out); i++) await new Promise((r) => setTimeout(r, 50));
   const code = out.match(/#join\/([a-f0-9]+)/)?.[1];
