@@ -304,6 +304,7 @@ sessions older than 0.5.0 still take messages outright.
 ```bash
 npm test               # hub API, permissions, storage, import, operations (node --test)
 LOG_FORMAT=pretty node hub.js
+node scripts/seed.js     # a throwaway hub full of awkward demo data, for checking the UI
 ```
 
 | Path | What it does |
