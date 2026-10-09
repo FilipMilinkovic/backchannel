@@ -81,6 +81,37 @@ export function machineInfo() {
   return { host: os.hostname().split('.')[0], platform: process.platform, client };
 }
 
+// Connectors on this computer note what they handled, so their owner's own sessions can mention it (mcp.js and the
+// inbox hook): the person's session asks, and the always-on agent answers. One file per connector, the latest 20 each.
+const STATE_DIR = path.join(os.homedir(), '.backchannel');
+export const connectorFile = (id) => path.join(STATE_DIR, `connector-${id}.json`);
+const TOLD_FILE = path.join(STATE_DIR, 'activity-told.json');
+const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+const writeJson = (file, data) => {
+  try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 }); } catch {}
+};
+
+// `info` is the connector's current state ({ pid, cwd, backend, conversation, service }); `entry`, when given, is a
+// request it just handled: { from, threadId, request, reply, error }.
+export function noteConnector(id, info, entry) {
+  const prev = readJson(connectorFile(id)) || {};
+  const handled = [...(prev.handled || []), ...(entry ? [{ ...entry, at: Date.now() }] : [])].slice(-20);
+  writeJson(connectorFile(id), { ...prev, ...info, id, handled, updated: Date.now() });
+}
+
+// What this computer's connectors handled in the last day that no session has mentioned yet, oldest first, and a
+// function that marks it as mentioned.
+export function untoldActivity(now = Date.now()) {
+  const told = readJson(TOLD_FILE)?.at || 0;
+  let names = [];
+  try { names = fs.readdirSync(STATE_DIR).filter((n) => /^connector-.+\.json$/.test(n)); } catch {}
+  const items = names.flatMap((n) => {
+    const c = readJson(path.join(STATE_DIR, n));
+    return (c?.handled || []).filter((h) => h.at > told && h.at > now - 86_400_000).map((h) => ({ ...h, agent: c.id }));
+  }).sort((a, b) => a.at - b.at);
+  return { items, markTold: () => items.length && writeJson(TOLD_FILE, { at: Math.max(told, ...items.map((i) => i.at)) }) };
+}
+
 export const formatSize = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
 
 export class Hub {

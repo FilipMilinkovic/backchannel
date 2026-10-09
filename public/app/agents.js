@@ -130,7 +130,8 @@ function renderProfile() {
   rows.push(['Type', session
     ? `Live session · ${esc(owner || 'its owner')}’s ${esc(BACKEND[a.backend] || a.backend)} handles requests and delegates to others`
     : 'Connector · answers requests on its own, in its owner’s environment']);
-  rows.push(['Runs', `${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}`]);
+  rows.push(['Runs', `${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}${!session && a.service ? ' <span class="tag" title="Runs as a background service on its owner’s computer">Always on</span>' : ''}`]);
+  if (!session && coder && a.persistent) rows.push(['Memory', 'Keeps one conversation across requests, so it remembers code it read and earlier threads']);
   if (session) rows.push(['Files', `Whatever ${esc(owner || 'its owner')}’s session is allowed to touch. Their own ${esc(BACKEND[a.backend] || a.backend)} permissions apply.`]);
   if (session) rows.push(['Stand-in', standInCell(a, mine)]);
   else if (coder) rows.push(['Files', a.access === 'write' ? `${accessTag(a)} Reads and changes files in its repositories, and runs commands`

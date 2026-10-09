@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { installed } from './service.js';
 
 const HOME = os.homedir();
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
@@ -239,6 +240,11 @@ export async function doctor(hub, cfg, log = console.log) {
     for (const dir of state.shadows || []) issues.push(`${tilde(dir)} overrides it with its own project-local server (claude mcp remove backchannel --scope local, in that folder)`);
     if (issues.length) fail(`${state.name}: ${issues.join('; ')}`, 'Run: backchannel setup');
     else ok(`${state.name}: connected through this install${state.server.env.AGENT_ID ? ` as @${state.server.env.AGENT_ID}` : ''}`);
+  }
+  // Background connectors (connect --service): one that stopped is a problem; its log says why.
+  for (const svc of installed()) {
+    if (svc.running === false) fail(`Background connector @${svc.id} is installed but not running (${tilde(svc.cwd || '?')})`, `See ${tilde(svc.log)}, then run backchannel connect --service in that folder again`);
+    else ok(`Background connector @${svc.id}${svc.running ? ' is running' : ' is installed'} in ${tilde(svc.cwd || '?')}`);
   }
   log(bad ? `\n${bad} problem${bad > 1 ? 's' : ''}. After fixing, restart open Claude Code and Codex sessions.` : '\nAll good. Sessions started before a change need a restart to pick it up.');
   return bad;

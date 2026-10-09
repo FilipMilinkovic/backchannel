@@ -2,13 +2,19 @@
 // Connector: makes an agent reachable on the network. Run it in the repo it should answer about:
 //   cd ~/code/payments && backchannel connect          (@<you>-claude, Claude Code, read-only, asks you first)
 //   backchannel connect --id steve --backend codex --cwd ~/code/payments --write --no-approve
+//   cd ~/code/payments && backchannel connect --service (the same, always on in the background; --stop, --status)
+// Coding agents keep one conversation across requests (session.js), so they remember what they already learned.
 import { parseArgs } from 'node:util';
 import readline from 'node:readline/promises';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hubFromEnv, loadConfig, describeWorkspace, machineInfo } from './client.js';
+import { hubFromEnv, loadConfig, describeWorkspace, machineInfo, noteConnector, connectorFile } from './client.js';
 import { backends } from './backends.js';
-import { answer } from './responder.js';
+import { answer, systemPrompt, filesDir } from './responder.js';
+import { createSession, sessionFile, resumeHint } from './session.js';
+import * as service from './service.js';
 
 const { values: opt } = parseArgs({
   allowNegative: true,
@@ -23,30 +29,84 @@ const { values: opt } = parseArgs({
     write: { type: 'boolean', default: false },  // let claude-code/codex edit files
     approve: { type: 'boolean', default: true }, // owner confirms each request in this terminal (--no-approve to skip)
     'i-trust-this-team': { type: 'boolean', default: false }, // required for --write --no-approve
+    persistent: { type: 'boolean', default: true }, // coding agents keep one conversation across requests
+    fresh: { type: 'boolean', default: false },     // forget that conversation and start a new one
+    service: { type: 'boolean', default: false },   // install as a background service instead of running here
+    stop: { type: 'boolean', default: false },      // stop and remove a background service
+    status: { type: 'boolean', default: false },    // list background services
     hub: { type: 'string' },
     team: { type: 'string', default: process.env.HUB_TEAM },
     help: { type: 'boolean', short: 'h' },
   },
 });
 const USAGE = `usage: backchannel connect [--backend claude-code|codex|openai|grok|echo] [--cwd dir] [--id handle] [--write] [--no-approve]
+                          [--service | --stop | --status] [--no-persistent] [--fresh]
   Defaults: Claude Code (or Codex if that's what's installed), the current folder, @<you>-claude, read-only,
   and it asks you in this terminal before handling each request.
-  --write with --no-approve also needs --i-trust-this-team: anyone in the team could then run commands on this computer.`;
+  --write with --no-approve also needs --i-trust-this-team: anyone in the team could then run commands on this computer.
+  Coding agents keep one conversation across requests and pick it up again after a restart. --fresh starts a new
+  one; --no-persistent runs each request on its own, as before.
+  --service runs the connector in the background instead (launchd on macOS, systemd on Linux): it starts at login,
+  restarts if it crashes and handles requests without asking. --status lists background connectors; --stop removes one.`;
 const die = (msg) => { console.error(msg); process.exit(1); };
 if (opt.help) { console.log(USAGE); process.exit(0); }
+const SERVICE = process.env.BACKCHANNEL_SERVICE === '1'; // running as the background service
+// A service's output goes to a log file, so each line gets a time.
+if (SERVICE) for (const k of ['log', 'error']) { const f = console[k].bind(console); console[k] = (...a) => f(new Date().toISOString(), ...a); }
+const tilde = (p) => (p && (p === os.homedir() || p.startsWith(os.homedir() + path.sep)) ? '~' + p.slice(os.homedir().length) : p);
+const cwd = path.resolve(opt.cwd.replace(/^~(?=$|\/)/, os.homedir()));
+const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+const lastLines = (file, n) => { try { return fs.readFileSync(file, 'utf8').trimEnd().split('\n').slice(-n); } catch { return []; } };
+
+if (opt.status) {
+  const list = service.installed();
+  if (!list.length) console.log('No background connectors on this computer. Start one in a repo with: backchannel connect --service');
+  for (const s of list) {
+    const state = s.running === null ? 'installed' : s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : 'stopped';
+    console.log(`@${s.id}  ${state}  ${tilde(s.cwd) || ''}`);
+    const saved = readJson(sessionFile(s.id));
+    const hint = saved && resumeHint(saved.backend, saved.cwd, saved.conversation);
+    if (hint) console.log(`  conversation: ${hint}`);
+    const handled = readJson(connectorFile(s.id))?.handled || [];
+    if (handled.length) console.log(`  last request: from @${handled.at(-1).from}, ${new Date(handled.at(-1).at).toLocaleString()}${handled.at(-1).error ? ' (failed)' : ''}`);
+    console.log(`  logs: ${tilde(s.log)}`);
+    if (s.running === false) for (const l of lastLines(s.log, 3)) console.log(`    ${l}`);
+  }
+  process.exit(0);
+}
+
+if (opt.stop) {
+  const list = service.installed();
+  const want = opt.id?.toLowerCase().replace(/^@/, '');
+  const here = list.filter((s) => s.cwd === cwd);
+  const target = want ? list.find((s) => s.id === want) : here.length === 1 ? here[0] : list.length === 1 ? list[0] : null;
+  if (!list.length) die('No background connectors on this computer.');
+  if (!target) die(`${want ? `No background connector @${want}. ` : ''}Background connectors here: ${list.map((s) => `@${s.id} (${tilde(s.cwd)})`).join(', ')}. Pick one with --id.`);
+  service.uninstall(target.id);
+  console.log(`Stopped @${target.id} and removed its background service. Its conversation is kept for next time (--fresh forgets it).`);
+  process.exit(0);
+}
 
 const onPath = (cmd) => spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd]).status === 0;
 const backend = opt.backend || (onPath('claude') ? 'claude-code' : onPath('codex') ? 'codex' : null);
 if (!backend) die(`Neither claude nor codex is on your PATH. Install one, or pick a backend with --backend.\n${USAGE}`);
 if (!backends[backend]) die(`unknown backend "${backend}". Options: ${Object.keys(backends).join(', ')}`);
 const isCoder = backend === 'claude-code' || backend === 'codex';
+if (opt.service) {
+  if (!service.supported()) die(`Background connectors run on macOS and Linux. Here, keep \`backchannel connect\` open in a terminal.`);
+  if (!isCoder && backend !== 'echo') die(`The ${backend} backend needs an API key, and a background service doesn't store keys. Run it in a terminal instead.`);
+  if (process.env.HUB_TOKEN) die(`A background connector signs in with this computer's saved sign-in, not HUB_TOKEN. Unset HUB_TOKEN, and sign in with \`backchannel login\` if you haven't.`);
+  opt.approve = false; // nobody is at a terminal to ask
+}
 if (isCoder && opt.write && !opt.approve && !opt['i-trust-this-team']) {
-  die(`--write --no-approve lets anyone in your team run commands and change files on this computer without asking you.
+  die(opt.service
+    ? `A background connector can't ask you before each request, so with --write anyone in your team could run commands and change files on this computer.
+If that's really what you want, add --i-trust-this-team. Otherwise drop --write (read-only), or run \`backchannel connect --write\` in a terminal to approve each request.`
+    : `--write --no-approve lets anyone in your team run commands and change files on this computer without asking you.
 If that's really what you want, add --i-trust-this-team. Otherwise drop --no-approve, and you'll approve each request here.`);
 }
 if (opt.approve && !process.stdin.isTTY) die('--approve asks in this terminal, but there is none. Run it in a terminal, or add --no-approve to handle requests without asking.');
 
-const cwd = path.resolve(opt.cwd.replace(/^~/, process.env.HOME));
 // Built from the owner's name, which may only be known once we've reached the hub, and the repos found in the folder.
 let workspace = null;
 const where = () => (workspace?.repos.length > 1 ? `${workspace.repos.length} repos in ${path.basename(cwd)}`
@@ -65,7 +125,28 @@ const card = { id, name: opt.name || id, backend, model: opt.model, owner: opt.o
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
 // What the responder needs to know about this agent; the owner and description are filled in once we reach the hub.
 const self = { get id() { return id; }, get owner() { return card.owner; }, get description() { return description; },
-  backend, cwd, write: opt.write, model: opt.model, approved: opt.approve };
+  backend, cwd, write: opt.write, model: opt.model, approved: opt.approve, session: null };
+// What this connector is doing, for the owner's own sessions on this computer (and `--status`).
+const note = (entry) => noteConnector(id, { pid: process.pid, cwd, backend, service: SERVICE, conversation: self.session?.conversation || null }, entry);
+let shownConversation = null;
+function showConversation() {
+  const c = self.session?.conversation;
+  if (!c || c === shownConversation) return;
+  shownConversation = c;
+  console.log(`  conversation: ${resumeHint(backend, cwd, c)}`);
+}
+
+let stopping = false;
+async function stop(code) {
+  if (stopping) return;
+  stopping = true;
+  await self.session?.close().catch(() => {});
+  if (id) noteConnector(id, { pid: null });
+  process.exit(code);
+}
+process.on('SIGINT', () => stop(0));
+process.on('SIGTERM', () => stop(0));
+rl?.on('SIGINT', () => stop(0));
 
 async function approve(msg) {
   if (!rl) return true;
@@ -91,10 +172,13 @@ async function handle(msg) {
   const heartbeat = setInterval(() => hub.status(id, 'working', msg.threadId).catch(() => {}), 15_000);
   try {
     const sent = await answer(hub, self, msg, (s) => console.log(s));
+    showConversation();
+    note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null });
     if (!sent) { console.log('  (no reply)'); return; }
     console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${sent.text.slice(0, 120)}`);
   } catch (err) {
     console.error(`  backend error: ${err.message}`);
+    note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: null, error: err.message.slice(0, 200) });
     await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, to: [msg.from], kind: 'error', text: `${backend} error: ${err.message}` }).catch(() => {});
   } finally {
     clearInterval(heartbeat);
@@ -116,8 +200,8 @@ try {
   if (isCoder) Object.assign(card, workspace = await describeWorkspace(cwd));
   if (me && !card.owner) card.owner = me.user.name || me.user.handle;
   card.description = description = describe(card.owner);
-  const access = isCoder ? `${opt.write ? 'can edit' : 'read-only'} in ${cwd.replace(process.env.HOME, '~')}, ` : '';
-  console.log(`@${id} (${backend}, ${access}${opt.approve ? 'asks you before each request' : 'handles requests without asking'}) connecting to ${hub.url}…`);
+  const access = isCoder ? `${opt.write ? 'can edit' : 'read-only'} in ${tilde(cwd)}, ` : '';
+  console.log(`@${id} (${backend}, ${access}${opt.approve ? 'asks you before each request' : 'handles requests without asking'}) ${opt.service ? 'installing as a background service' : `connecting to ${hub.url}…`}`);
   if (codexReadsAll) console.log(`  Note: Codex's read-only mode can read any file you can, not just this folder. Replies are checked for secrets, but keep --approve on.`);
   if (isCoder && opt.write && me) {
     // Say plainly who can make this agent run commands here.
@@ -128,10 +212,43 @@ try {
       ? `  ${who} can ask @${id} to change files and run commands here. You approve each request in this terminal.`
       : `  ⚠ ${who} can make @${id} change files and run commands here WITHOUT asking you (--i-trust-this-team).`);
   }
+  if (opt.service) {
+    // The service runs this same command, minus --service, with everything already decided.
+    const args = ['--id', id, '--backend', backend, '--cwd', cwd, '--no-approve', '--hub', hub.url];
+    if (hub.team) args.push('--team', hub.team);
+    if (opt.write) args.push('--write');
+    if (opt['i-trust-this-team']) args.push('--i-trust-this-team');
+    if (!opt.persistent) args.push('--no-persistent');
+    for (const k of ['name', 'owner', 'about', 'model']) if (opt[k]) args.push(`--${k}`, opt[k]);
+    if (opt.fresh) fs.rmSync(sessionFile(id), { force: true }); // once, now: not on every restart
+    const { log } = service.install({ id, args, cwd });
+    console.log(`  Installed. @${id} now runs in the background: it starts when you log in, restarts if it crashes, and handles
+  requests without asking you${isCoder && opt.persistent ? ', in one conversation it keeps across requests and restarts' : ''}.
+  Your own Claude Code and Codex sessions on this computer are told what it handled.
+  Logs: ${tilde(log)}
+  Check on it: backchannel connect --status    Stop it: backchannel connect --stop${service.installed().length > 1 ? ` --id ${id}` : ''}`);
+    process.exit(0);
+  }
+  if (isCoder && opt.persistent) {
+    self.session = createSession(backend, { file: sessionFile(id), cwd, model: opt.model, write: opt.write, fresh: opt.fresh,
+      system: () => systemPrompt(self, null), dirs: [filesDir(id)], log: (s) => console.log(s) });
+    shownConversation = self.session.conversation;
+    console.log(self.session.conversation
+      ? `  Picking up its conversation from last time (--fresh starts a new one): ${resumeHint(backend, cwd, self.session.conversation)}`
+      : '  Keeps one conversation across requests, so it remembers what it learned (--no-persistent runs each on its own).');
+  }
+  card.persistent = !!self.session;
+  card.service = SERVICE;
+  note();
   await hub.listen(card, handle, (s) => console.log(s));
 } catch (err) {
   // 410: someone disconnected this agent from the hub's UI or CLI. That's a deliberate stop, not a failure.
-  if (err.status === 410) process.exit(0); // listen() already said who disconnected it
+  if (err.status === 410) {
+    // listen() already said who disconnected it. A service also removes itself, so it doesn't come back at login.
+    if (SERVICE && service.removeOwnFile(id)) console.log('Removed this background service. Bring it back with: backchannel connect --service');
+    await stop(0);
+  }
   console.error(`@${id || 'agent'} can't connect: ${err.message}`);
-  process.exit(1);
+  // Retrying can't fix a rejected sign-in, so a service exits cleanly instead of restarting every 30 seconds.
+  await stop(SERVICE && [401, 403, 409].includes(err.status) ? 0 : 1);
 }

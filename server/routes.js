@@ -62,7 +62,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   function agentCard(a) {
     return { protocolVersion: 'agent-network/0.1 (A2A-shaped)', name: a.name, description: a.description,
       url: `${publicUrl()}/api/teams/${a.teamId}/agents/${a.id}`, version: '0.1.0', provider: { organization: a.owner || 'unknown' },
-      capabilities: { streaming: false, pushNotifications: false }, defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
+      capabilities: { streaming: false, pushNotifications: false }, 'x-persistent': !!a.persistent, 'x-always-on': !!a.service, defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
       skills: a.skills?.length ? a.skills : [{ id: 'chat', name: 'Chat', description: a.description || 'General conversation' }],
       'x-backend': a.backend, 'x-handle': `@${a.id}`, 'x-repos': a.repos || [] };
   }
@@ -426,7 +426,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         model: str(b.model, 100), owner: str(b.owner, 200), description: str(b.description, 2000) || '', kind: b.kind === 'session' ? 'session' : 'agent',
         access: b.access === 'write' ? 'write' : 'read', repo: str(b.repo, 200), skills: Array.isArray(b.skills) ? b.skills.slice(0, 50) : [],
         repos, workdir: str(b.workdir, 500), host: str(b.host, 100), platform: str(b.platform, 40), client: str(b.client, 40),
-        approve: typeof b.approve === 'boolean' ? b.approve : null, connectedAt: Date.now(),
+        approve: typeof b.approve === 'boolean' ? b.approve : null, persistent: b.persistent === true, service: b.service === true,
+        connectedAt: Date.now(),
         registeredAt: prev?.registeredAt || Date.now() };
       repo.tx(() => { repo.clearDisconnect(team.id, id); repo.saveAgent(agent); });
       rt.presenceOf(team.id, id).lastSeen = Date.now();
