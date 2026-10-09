@@ -6,7 +6,7 @@ import path from 'node:path';
 import { claudeDenySettings } from './safety.js';
 
 // Codex ships inside the ChatGPT app and often isn't on PATH.
-function codexBin() {
+export function codexBin() {
   if (process.env.CODEX_BIN) return process.env.CODEX_BIN;
   const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex';
   const onPath = (process.env.PATH || '').split(path.delimiter).some((d) => fs.existsSync(path.join(d, 'codex')));
@@ -28,13 +28,16 @@ async function chatCompletions({ baseUrl, apiKey, model, system, prompt }) {
 // A stand-in runs inside a Claude Code session's MCP server, which marks its environment as that session's. The
 // headless run it starts is a separate session, so it doesn't inherit those markers.
 const NESTED = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT'];
-function childEnv() {
+export function childEnv() {
   const env = { ...process.env };
   for (const k of NESTED) delete env[k];
   return env;
 }
 
-function run(cmd, args, { cwd, input, timeoutMs = Number(process.env.CODER_TIMEOUT_MIN || 15) * 60_000 }) {
+export const turnTimeout = () => Number(process.env.CODER_TIMEOUT_MIN || 15) * 60_000;
+export const claudeBin = () => process.env.CLAUDE_BIN || 'claude';
+
+export function run(cmd, args, { cwd, input, timeoutMs = turnTimeout() }) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     const name = path.basename(cmd);
@@ -53,13 +56,41 @@ function run(cmd, args, { cwd, input, timeoutMs = Number(process.env.CODER_TIMEO
 }
 
 // Arguments for `claude -p`. Credentials (.env files, keys, ~/.ssh, …) are denied by permission rules in every mode.
-export function claudeArgs({ system, model, write, dirs = [] }) {
-  const args = ['-p', '--output-format', 'text', '--append-system-prompt', system, '--settings', claudeDenySettings()];
+// `stream` keeps the process open and takes one turn per line on stdin (session.js); `resume` continues a conversation.
+export function claudeArgs({ system, model, write, dirs = [], stream = false, resume }) {
+  const args = ['-p', '--output-format', stream ? 'stream-json' : 'text', '--append-system-prompt', system, '--settings', claudeDenySettings()];
+  if (stream) args.push('--input-format', 'stream-json', '--verbose');
+  if (resume) args.push('--resume', resume);
   for (const d of dirs) args.push('--add-dir', d); // where attached files were saved
   if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash');
   else args.push('--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep');
   if (model) args.push('--model', model);
   return args;
+}
+
+// One `codex exec` run. With `resume`, it continues that Codex thread (session.js). Returns the final message and the
+// thread id Codex reported, if any.
+export async function codexExec({ input, model, cwd, write, resume }) {
+  const outFile = path.join(os.tmpdir(), `codex-reply-${process.pid}-${Date.now()}.txt`);
+  const args = ['exec', '--json', '--skip-git-repo-check', '--sandbox', write ? 'workspace-write' : 'read-only', '--output-last-message', outFile];
+  if (model) args.push('--model', model);
+  if (resume) args.push('resume', resume);
+  args.push('-');
+  try {
+    const out = await run(codexBin(), args, { cwd, input });
+    return { reply: fs.readFileSync(outFile, 'utf8'), thread: codexThread(out) };
+  } finally { fs.rmSync(outFile, { force: true }); }
+}
+
+// The thread id in `codex exec --json` output: `thread.started` in current versions, `session_configured` in older ones.
+export function codexThread(out) {
+  for (const line of String(out).split('\n')) {
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    const id = e?.type === 'thread.started' ? e.thread_id : (e?.msg?.type === 'session_configured' ? e.msg.session_id : null);
+    if (typeof id === 'string' && id) return id;
+  }
+  return null;
 }
 
 export const backends = {
@@ -78,17 +109,10 @@ export const backends = {
   }),
 
   // Claude Code in headless mode, working inside the owner's repo.
-  'claude-code': async ({ prompt, cwd, ...o }) => run('claude', claudeArgs(o), { cwd, input: prompt }),
+  'claude-code': async ({ prompt, cwd, ...o }) => run(claudeBin(), claudeArgs(o), { cwd, input: prompt }),
 
   // Codex CLI non-interactive mode; the final message is written to a file.
-  codex: async ({ system, prompt, model, cwd, write }) => {
-    const outFile = path.join(os.tmpdir(), `codex-reply-${process.pid}-${Date.now()}.txt`);
-    const args = ['exec', '--skip-git-repo-check', '--sandbox', write ? 'workspace-write' : 'read-only', '--output-last-message', outFile];
-    if (model) args.push('--model', model);
-    args.push('-');
-    await run(codexBin(), args, { cwd, input: `${system}\n\n---\n\n${prompt}` });
-    try { return fs.readFileSync(outFile, 'utf8'); } finally { fs.rmSync(outFile, { force: true }); }
-  },
+  codex: async ({ system, prompt, ...o }) => (await codexExec({ ...o, input: `${system}\n\n---\n\n${prompt}` })).reply,
 
   // No keys needed. Useful for testing the network itself.
   echo: async ({ latest }) => `Echo: ${latest.text.replace(/@/g, '')}`,

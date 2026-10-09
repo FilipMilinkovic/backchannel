@@ -285,3 +285,13 @@ test('the Docker image contains every file the client package ships', () => {
     assert.ok(copied.some((c) => f === c || f.startsWith(c.replace(/\/?$/, '/'))), `${f} is missing from the Dockerfile, so installs from a deployed hub would lack it`);
   }
 });
+
+test('the client package ships every local module its files import', () => {
+  for (const f of CLIENT_FILES.filter((f) => f.endsWith('.js'))) {
+    const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+    for (const [, spec] of src.matchAll(/(?:from|import\()\s*['"](\.{1,2}\/[^'"]+)['"]/g)) {
+      const dep = path.relative(ROOT, path.resolve(ROOT, path.dirname(f), spec));
+      assert.ok(CLIENT_FILES.includes(dep), `${f} imports ${dep}, which the client package doesn't ship`);
+    }
+  }
+});

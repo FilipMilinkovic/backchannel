@@ -46,6 +46,11 @@ function buildConnector() {
   const coder = backend === 'claude-code' || backend === 'codex';
   $('cFolderWrap').hidden = !coder;
   $('cWrite').disabled = !coder;
+  // A background connector holds no API keys and has no terminal to ask in.
+  $('cService').disabled = !coder && backend !== 'echo';
+  const bg = $('cService').checked && !$('cService').disabled;
+  $('cApprove').disabled = bg;
+  const approve = $('cApprove').checked && !bg;
   const suffix = backend === 'claude-code' ? 'claude' : backend;
   if (S.me) { $('cHandle').placeholder = `${S.me.user.handle.slice(0, 31 - suffix.length)}-${suffix}`; $('cOwner').placeholder = S.me.user.name || S.me.user.handle; }
   const raw = $('cHandle').value.trim();
@@ -64,17 +69,18 @@ function buildConnector() {
   if (owner) args.push(`--owner ${shq(owner)}`);
   if (coder) args.push(`--cwd ${shq($('cFolder').value.trim() || '~/code/your-repo')}`);
   if (coder && $('cWrite').checked) args.push('--write');
-  if (!$('cApprove').checked) args.push('--no-approve');
+  if (bg) args.push('--service', ...(coder && $('cWrite').checked ? ['--i-trust-this-team'] : []));
+  else if (!approve) args.push('--no-approve');
   setCmd('cCmd', `${env.length ? env.join(' ') + ' ' : ''}backchannel connect${args.length ? ` \\\n  ${args.join(' ')}` : ''}`);
   const notes = {
-    'claude-code': 'Uses the <b>claude</b> CLI and the account it’s signed in to. Requests run headless in the folder.',
-    codex: 'Uses the <b>codex</b> CLI and the account it’s signed in to. Runs in Codex’s sandbox.',
+    'claude-code': 'Uses the <b>claude</b> CLI and the account it’s signed in to. Requests run headless in the folder, in one conversation it keeps across requests.',
+    codex: 'Uses the <b>codex</b> CLI and the account it’s signed in to. Runs in Codex’s sandbox, continuing one Codex thread across requests.',
     openai: 'Set <b>OPENAI_MODEL</b> to pick a model. Answers from knowledge only, with no access to files.',
     grok: 'Set <b>XAI_MODEL</b> to pick a model. Answers from knowledge only, with no access to files.',
     echo: 'Repeats each message back. Useful to check the network works before adding keys.',
   };
-  $('cNote').innerHTML = `<span>${notes[backend]}${coder && $('cWrite').checked && !$('cApprove').checked ? ' <b>Edits without approval:</b> anyone in this team can change files in that folder.' : ''}</span>`;
-  store.set('bc.connector', JSON.stringify({ h: raw, o: owner, b: backend, f: $('cFolder').value, w: $('cWrite').checked, a: $('cApprove').checked }));
+  $('cNote').innerHTML = `<span>${notes[backend]}${bg ? ' Check on it with <b>backchannel connect --status</b>; stop it with <b>--stop</b>.' : ''}${coder && $('cWrite').checked && !approve ? ' <b>Edits without approval:</b> anyone in this team can change files in that folder.' : ''}</span>`;
+  store.set('bc.connector', JSON.stringify({ h: raw, o: owner, b: backend, f: $('cFolder').value, w: $('cWrite').checked, a: $('cApprove').checked, s: $('cService').checked }));
 }
 
 S.mcpTool = store.get('bc.tool', 'claude');
@@ -119,5 +125,5 @@ $('hopsForm').addEventListener('submit', async (e) => {
   finally { $('hopsSave').disabled = false; setTimeout(() => ($('hopsMsg').textContent = ''), 2000); }
 });
 
-for (const id of ['cHandle', 'cOwner', 'cBackend', 'cFolder', 'cWrite', 'cApprove']) $(id).addEventListener('input', buildConnector);
+for (const id of ['cHandle', 'cOwner', 'cBackend', 'cFolder', 'cWrite', 'cApprove', 'cService']) $(id).addEventListener('input', buildConnector);
 for (const id of ['mHandle', 'mOwner']) $(id).addEventListener('input', buildMcp);

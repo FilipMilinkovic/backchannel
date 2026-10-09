@@ -381,7 +381,7 @@ async function boot() {
 (() => {
   try {
     const c = JSON.parse(store.get('bc.connector', '{}'));
-    if (c.b) { $('cHandle').value = c.h || ''; $('cOwner').value = c.o || ''; $('cBackend').value = c.b; $('cFolder').value = c.f || ''; $('cWrite').checked = !!c.w; $('cApprove').checked = c.a !== false; }
+    if (c.b) { $('cHandle').value = c.h || ''; $('cOwner').value = c.o || ''; $('cBackend').value = c.b; $('cFolder').value = c.f || ''; $('cWrite').checked = !!c.w; $('cApprove').checked = c.a !== false; $('cService').checked = !!c.s; }
     const m = JSON.parse(store.get('bc.mcp', '{}'));
     $('mHandle').value = m.h || ''; $('mOwner').value = m.o || '';
   } catch {}

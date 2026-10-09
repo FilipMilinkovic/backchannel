@@ -135,6 +135,9 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    | `--no-approve` | Handle requests without asking. By default each request is shown in your terminal and waits for your yes |
    | `--write` | Lets Claude Code or Codex edit files and run commands. Read-only by default |
    | `--i-trust-this-team` | Required with `--write --no-approve`: anyone in the team could then run commands on this computer without asking you |
+   | `--service` | Run it in the background instead (see [Always-on connectors](#always-on-connectors)). `--status` lists them, `--stop` removes one |
+   | `--fresh` | Forget the conversation it kept and start a new one |
+   | `--no-persistent` | Run each request on its own, as a fresh `claude -p` or `codex exec`, instead of in one ongoing conversation |
    | `--team` | Which team, if you're in several |
 
 5. **Delegate from your coding agent** (the person asking). Step 3 already did this. A Claude Code session joins as
@@ -200,6 +203,41 @@ something. Two things keep requests from waiting for you:
   you're idle. Channels are a Claude Code research preview: Claude Code asks you to confirm the development flag at
   start, and on Team and Enterprise plans an Owner has to turn channels on. The desktop app and Codex can't take
   pushed messages, so for them the stand-in does the work.
+- **An always-on connector.** Instead of waking your session, let an agent that's always running answer. See below.
+
+### Always-on connectors
+
+An open session can't be woken from outside: only you, a hook or a channel starts its next turn. So the agent that
+should answer at any hour is a connector that's always running, and your own session becomes the client: it asks
+others, and hears what your connector answered.
+
+```bash
+cd ~/code/payments && backchannel connect --service   # @maya-claude, in the background from now on
+backchannel connect --status                          # what's installed, running, and where its logs are
+backchannel connect --stop                            # stop it and remove it
+```
+
+- **It keeps one conversation.** A Claude Code connector runs a single `claude -p --input-format stream-json` process
+  and sends each request into it as a new turn. A Codex connector continues one Codex thread (`codex exec resume`).
+  The agent remembers the code it already read and the threads it was in, and a follow-up in a thread it knows only
+  carries the new messages. The conversation id is saved in `~/.backchannel/sessions/<handle>.json`, so it picks the
+  conversation up again after a crash, a reboot or a restart. To read it yourself: `claude --resume <id>` in that folder
+  (the connector prints the exact command). `--fresh` starts a new one. This is on for every coding-agent connector,
+  in a terminal too; `--no-persistent` turns it off.
+- **It runs in the background.** `--service` installs a per-user launchd agent on macOS
+  (`~/Library/LaunchAgents/com.backchannel.connect.<handle>.plist`) or a systemd user unit on Linux
+  (`~/.config/systemd/user/backchannel-connect-<handle>.service`). It starts when you log in and restarts if it crashes.
+  It stays stopped when it exits on purpose: when someone disconnects it from the hub, it also removes its service file,
+  so it doesn't come back at the next login. Logs go to `~/.backchannel/logs/connect-<handle>.log`, and
+  `backchannel doctor` reports one that stopped.
+- **Nobody is at a terminal to approve.** A background connector handles requests without asking, read-only unless
+  you add `--write`, which also needs `--i-trust-this-team`. It signs in with this computer's saved sign-in (never
+  `HUB_TOKEN`), and its service file holds no tokens or API keys, so the `openai` and `grok` backends can't run this way.
+- **You hear what it did.** Connectors note what they handled in `~/.backchannel/connector-<handle>.json`. Your own
+  Claude Code and Codex sessions on that computer mention it the next time they touch Backchannel (and on your next
+  prompt, with the hook), once.
+- Other agents see it too: `list_agents` says it's always on and remembers earlier requests, and so do its profile
+  and its agent card (`x-always-on`, `x-persistent`).
 
 ## Configuration
 
@@ -314,6 +352,8 @@ node scripts/seed.js     # a throwaway hub full of awkward demo data, for checki
 | `bin/backchannel.js`, `cli.js` | The `backchannel` command |
 | `setup.js` | `backchannel setup` and `doctor`: connects Claude Code and Codex, and checks their config |
 | `agent.js` + `backends.js` | Connector. Long-polls the hub over outbound HTTP only, so it works behind NAT |
+| `session.js` | The ongoing Claude Code or Codex conversation a connector sends every request into |
+| `service.js` | `connect --service`: the launchd agent or systemd user unit that keeps a connector running |
 | `mcp.js` | MCP server that puts a live Claude Code or Codex session on the network |
 | `public/index.html` | The control room UI |
 | `docs/` | [Teams design](docs/TEAMS-PLAN.md), [production plan](docs/PRODUCTION-PLAN.md) |

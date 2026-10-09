@@ -7,7 +7,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hubFromEnv, loadConfig, saveFile, formatSize, describeWorkspace, machineInfo } from './client.js';
+import { hubFromEnv, loadConfig, saveFile, formatSize, describeWorkspace, machineInfo, untoldActivity } from './client.js';
 import { MESSAGE_RULES, quote, redactSecrets, attachProblem } from './safety.js';
 import { answer } from './responder.js';
 
@@ -238,9 +238,16 @@ async function uploadAll(files) {
 }
 
 // Appended to every tool result, so the agent learns about new messages whenever it touches Backchannel.
-// Also reports, once, what the stand-in answered since the agent last touched Backchannel.
+// Also reports, once, what the stand-in and this computer's always-on connectors answered since it last looked.
 function unreadNote() {
   let note = '';
+  const activity = untoldActivity();
+  if (activity.items.length) {
+    activity.markTold();
+    const agents = [...new Set(activity.items.map((a) => '@' + a.agent))].join(', ');
+    note += `\n\n🛰️ Your always-on Backchannel agent${agents.includes(',') ? 's' : ''} (${agents}) handled ${activity.items.length} request${activity.items.length > 1 ? 's' : ''} on this computer. Tell the user in one line:\n`
+      + activity.items.slice(-5).map((a) => `- @${a.from} asked @${a.agent} (thread ${a.threadId}): ${quote(a.request.replace(/\s+/g, ' '), a.from)}\n  ${a.error ? `It failed: ${a.error}` : a.reply ? `Replied: ${a.reply.replace(/\s+/g, ' ')}` : 'Nothing needed a reply.'}`).join('\n');
+  }
   if (answered.length) {
     const done = answered.splice(0);
     writeState();
@@ -271,9 +278,11 @@ const tools = [
     run: async () => {
       const agents = (await hub.agents()).filter((a) => a.id !== id);
       if (!agents.length) return 'No other agents are connected.';
-      const reach = (a) => (a.kind !== 'session' ? '' : a.standIn && a.standIn !== 'off'
-        ? ` Answers within about a minute, even when ${a.owner || 'its owner'} is away.`
-        : ` Messages wait until ${a.owner || 'its owner'}'s agent checks its inbox.`);
+      const reach = (a) => (a.kind !== 'session'
+        ? `${a.service ? ' Always on: runs in the background, even when its owner is away.' : ''}${a.persistent ? ' Remembers earlier requests, so follow-ups can be short.' : ''}`
+        : a.standIn && a.standIn !== 'off'
+          ? ` Answers within about a minute, even when ${a.owner || 'its owner'} is away.`
+          : ` Messages wait until ${a.owner || 'its owner'}'s agent checks its inbox.`);
       return agents.map((a) => `@${a.id} ${a.online ? '🟢 online' : '⚪ offline'}${a.online && a.state === 'working' ? ' (busy)' : ''} | ${a.backend}${a.owner ? ` | owner: ${a.owner}` : ''}\n  ${a.description}${reach(a)}`).join('\n');
     },
   },

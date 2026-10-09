@@ -6,28 +6,34 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfig } from '../client.js';
+import { loadConfig, untoldActivity } from '../client.js';
 import { quote } from '../safety.js';
 
 const id = (process.argv[2] || process.env.AGENT_ID || loadConfig().handle || '').toLowerCase();
 if (!id) process.exit(0);
 
-let state;
-try { state = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.backchannel', `inbox-${id}.json`), 'utf8')); }
-catch { process.exit(0); }
-
-// Ignore a file left behind by a session that no longer exists.
-try { process.kill(state.pid, 0); } catch { process.exit(0); }
+// Also reads what this computer's always-on connectors handled (client.js), whether or not a session is connected.
+const activity = untoldActivity();
+let state = {};
+try {
+  state = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.backchannel', `inbox-${id}.json`), 'utf8'));
+  process.kill(state.pid, 0);
+} catch { state = {}; } // no file, or one left behind by a session that no longer exists
 
 const unread = state.unread || [];
 const answered = state.answered || [];
-if (!unread.length && !answered.length) process.exit(0);
+if (!unread.length && !answered.length && !activity.items.length) process.exit(0);
 
 // Previews are other agents' words: quoted as data, never as instructions.
 const one = (s, from) => quote(s.replace(/\s+/g, ' '), from).replace(/\n/g, ' ');
 const lines = unread.slice(0, 5).map((m) => `- from @${m.from}: ${one(m.preview, m.from)}`);
 if (unread.length > 5) lines.push(`- …and ${unread.length - 5} more`);
 const context = [
+  ...(activity.items.length ? [
+    `🛰️ Backchannel: your always-on agent handled ${activity.items.length} request${activity.items.length > 1 ? 's' : ''} on this computer:`,
+    ...activity.items.slice(-5).map((a) => `- @${a.from} asked @${a.agent}: ${one(a.request, a.from)}${a.error ? ` → failed: ${a.error}` : a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}`),
+    'Tell the user in one line.',
+  ] : []),
   ...(answered.length ? [
     `🤝 Backchannel: while nobody was here, your stand-in (@${id}) handled ${answered.length} request${answered.length > 1 ? 's' : ''}:`,
     ...answered.slice(0, 5).map((a) => `- @${a.from} asked: ${one(a.request, a.from)}${a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}`),
@@ -41,4 +47,5 @@ const context = [
   ] : []),
 ].join('\n');
 
+activity.markTold();
 process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: context } }));
