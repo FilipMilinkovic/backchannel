@@ -34,6 +34,25 @@ function must(cmd, args) {
   return r;
 }
 
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const loaded = (id) => sh('launchctl', ['print', `${domain()}/${label(id)}`]).status === 0;
+// `launchctl bootout` returns before the job is gone: a running connector takes a few seconds to close its session.
+// Bootstrapping before then fails with "5: Input/output error", so wait for it, and retry a few times all the same.
+function unload(id) {
+  if (dryRun() || !loaded(id)) return;
+  sh('launchctl', ['bootout', `${domain()}/${label(id)}`]);
+  for (let i = 0; i < 50 && loaded(id); i++) sleep(200);
+}
+function load(id, file) {
+  for (let i = 0; ; i++) {
+    const r = sh('launchctl', ['bootstrap', domain(), file]);
+    if (r.status === 0) return;
+    if (i >= 4) throw new Error(`launchctl bootstrap ${domain()} ${file} failed: ${(r.stderr || r.stdout).trim() || `exit ${r.status}`}`);
+    unload(id);
+    sleep(1000);
+  }
+}
+
 const xml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 function plist({ id, argv, cwd, env, log }) {
   const str = (s) => `<string>${xml(s)}</string>`;
@@ -94,9 +113,9 @@ export function install({ id, args, cwd }) {
   const file = serviceFile(id);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (platform() === 'darwin') {
-    sh('launchctl', ['bootout', `${domain()}/${label(id)}`]); // an older copy, if it's loaded
+    unload(id); // an older copy, if it's loaded
     fs.writeFileSync(file, plist(spec));
-    must('launchctl', ['bootstrap', domain(), file]);
+    load(id, file);
   } else {
     fs.writeFileSync(file, systemdUnit(spec));
     must('systemctl', ['--user', 'daemon-reload']);
@@ -110,7 +129,7 @@ export function install({ id, args, cwd }) {
 export function uninstall(id) {
   const file = serviceFile(id);
   if (!fs.existsSync(file)) return false;
-  if (platform() === 'darwin') sh('launchctl', ['bootout', `${domain()}/${label(id)}`]);
+  if (platform() === 'darwin') unload(id);
   else sh('systemctl', ['--user', 'disable', '--now', unit(id)]);
   fs.rmSync(file, { force: true });
   if (platform() !== 'darwin') sh('systemctl', ['--user', 'daemon-reload']);
