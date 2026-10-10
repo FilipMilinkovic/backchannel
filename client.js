@@ -50,7 +50,7 @@ const tilde = (p) => (p === os.homedir() || p.startsWith(os.homedir() + path.sep
 const git = (dir, ...args) => new Promise((resolve) => {
   execFile('git', args, { cwd: dir, encoding: 'utf8', timeout: 3000 }, (err, out) => resolve(err ? null : out.trim() || null));
 });
-async function gitRepo(dir) {
+export async function gitRepo(dir) {
   const top = await git(dir, 'rev-parse', '--show-toplevel');
   if (!top) return null;
   const [origin, branch] = await Promise.all([git(top, 'remote', 'get-url', 'origin'), git(top, 'rev-parse', '--abbrev-ref', 'HEAD')]);

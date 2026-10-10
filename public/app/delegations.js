@@ -76,7 +76,8 @@ export function renderDetail() {
       <button class="btn ghost back" type="button" data-action="back">${ICON.back} Delegations</button>
       <h2>${esc(t.title)}</h2>
       <div class="facts">
-        <span class="pill ${t.status}">${t.status === 'queued' && t.waiting.length ? `Waiting on ${esc(t.waiting.map(display).join(', '))}` : LABEL[t.status]}</span>
+        <span class="pill ${t.status}">${t.status === 'queued' && t.waiting.length ? `Waiting on ${esc(t.waiting.map(display).join(', '))}`
+          : t.status === 'owner' && t.waiting.length ? `Waiting on ${esc(t.waiting.map((id) => ownerOf(id) || display(id)).join(', '))}` : LABEL[t.status]}</span>
         <span><span class="who">${esc(senderName(t))}</span>${ownerOf(t.from) ? ` (${esc(ownerOf(t.from))})` : ''} to <span class="who">${esc(t.to.map(display).join(', ') || 'nobody')}</span>${t.to[0] && ownerOf(t.to[0]) ? ` (${esc(ownerOf(t.to[0]))})` : ''}</span>
         <span class="num">Started ${clock(t.started)}</span>
         <span class="num" title="Agent-to-agent replies used out of the hop limit">Hops ${hops} of ${max}</span>

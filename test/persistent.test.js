@@ -6,47 +6,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { once } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
-import { startHub, tempDir, prefix, delay, ROOT } from './helpers.js';
+import { startHub, tempDir, prefix, delay, ROOT, until, signedIn, connector, ask } from './helpers.js';
 
 const BIN = path.join(ROOT, 'bin', 'backchannel.js');
-const FAKE = path.join(ROOT, 'test', 'fixtures', 'fake-claude.js');
-fs.chmodSync(FAKE, 0o755);
-
-async function until(fn, ms = 8000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timed out');
-    await delay(50);
-  }
-}
-
-function signedIn(t, h, account, extra = {}) {
-  const home = tempDir(t, 'bc-persist-');
-  fs.mkdirSync(path.join(home, '.backchannel'));
-  fs.writeFileSync(path.join(home, '.backchannel', 'config.json'),
-    JSON.stringify({ hub: h.base, token: account.token, team: account.team.id, handle: account.user.handle }));
-  const env = { ...process.env, HOME: home, CLAUDE_BIN: FAKE, FAKE_CLAUDE_LOG: path.join(home, 'claude.log'), ...extra };
-  for (const k of ['HUB_URL', 'HUB_TOKEN', 'HUB_TEAM', 'BACKCHANNEL_SERVICE', 'XDG_CONFIG_HOME']) delete env[k];
-  return { home, env, claudeLog: () => fs.readFileSync(env.FAKE_CLAUDE_LOG, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) };
-}
-
-function connector(t, args, opts) {
-  const child = spawn(process.execPath, [BIN, 'connect', ...args], { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
-  let out = '';
-  child.stdout.on('data', (d) => { out += d; });
-  child.stderr.on('data', (d) => { out += d; });
-  t.after(() => child.kill());
-  return { child, out: () => out, async stop() { const done = once(child, 'exit'); child.kill('SIGTERM'); return (await done)[0]; } };
-}
-
-// Posts as `account` and returns the agent's answer in that thread.
-async function ask(h, account, agent, text, threadId) {
-  const p = prefix(account);
-  const sent = await h.ok(p + '/messages', account.token, 'POST', { text: `@${agent} ${text}`, ...(threadId ? { threadId } : {}) });
-  return until(async () => (await h.ok(`${p}/threads/${sent.threadId}`, account.token)).find((m) => m.from === agent && m.inReplyTo === sent.id));
-}
 
 test('a Claude Code connector keeps one conversation across requests and picks it up after a restart', async (t) => {
   const h = await startHub(t);
@@ -87,8 +49,7 @@ test('a Claude Code connector keeps one conversation across requests and picks i
   assert.deepEqual(restart.args.slice(restart.args.indexOf('--resume'), restart.args.indexOf('--resume') + 2), ['--resume', saved.conversation]);
 
   // What it handled is noted for the owner's own sessions.
-  const note = JSON.parse(fs.readFileSync(path.join(home, '.backchannel', 'connector-maya-claude.json'), 'utf8'));
-  assert.equal(note.handled.length, 4);
+  const note = await until(() => { const n = JSON.parse(fs.readFileSync(path.join(home, '.backchannel', 'connector-maya-claude.json'), 'utf8')); return n.handled.length === 4 && n; }); // noted just after posting
   assert.equal(note.conversation, saved.conversation);
   assert.equal(note.handled[0].request.trim(), '@maya-claude alpha-question');
 
@@ -127,7 +88,7 @@ test('a failed or crashed turn is reported, the next request still gets answered
   assert.match(crashed.text, /claude exited 3/);
   // The next request starts a new process that resumes the conversation.
   assert.match((await ask(h, maya, 'maya-claude', 'still there?')).text, /^turn 1 pid \d+ resumed yes$/);
-  const note = JSON.parse(fs.readFileSync(path.join(home, '.backchannel', 'connector-maya-claude.json'), 'utf8'));
+  const note = await until(() => { const n = JSON.parse(fs.readFileSync(path.join(home, '.backchannel', 'connector-maya-claude.json'), 'utf8')); return n.handled.length === 4 && n; });
   assert.deepEqual(note.handled.map((x) => !!x.error), [false, true, true, false]);
 });
 

@@ -1,5 +1,6 @@
 // Backends turn (system prompt, conversation) into a reply. Each one is a single async function.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,22 +56,73 @@ export function run(cmd, args, { cwd, input, timeoutMs = turnTimeout() }) {
   });
 }
 
+// Newer Claude Code options this connector uses when the installed claude has them, found once from its --help.
+let helpText = null;
+export function claudeSupports(flag) {
+  if (helpText === null) {
+    const r = spawnSync(claudeBin(), ['--help'], { encoding: 'utf8', env: childEnv(), timeout: 15_000 });
+    helpText = r.stdout || '';
+  }
+  return helpText.includes(flag);
+}
+
+const TOOLS = fileURLToPath(new URL('./tools.js', import.meta.url));
+export const READ_TOOLS = ['Read', 'Glob', 'Grep', 'mcp__backchannel-tools__git', 'mcp__backchannel-tools__list_dir'];
+
 // Arguments for `claude -p`. Credentials (.env files, keys, ~/.ssh, …) are denied by permission rules in every mode.
+// Only Backchannel's own read-only tools (tools.js) are loaded, never the owner's MCP servers (which would include
+// Backchannel itself). Read-only runs also get --restricted where claude has it: no shell, no user or project settings.
 // `stream` keeps the process open and takes one turn per line on stdin (session.js); `resume` continues a conversation.
-export function claudeArgs({ system, model, write, dirs = [], stream = false, resume }) {
-  const args = ['-p', '--output-format', stream ? 'stream-json' : 'text', '--append-system-prompt', system, '--settings', claudeDenySettings()];
-  if (stream) args.push('--input-format', 'stream-json', '--verbose');
+export function claudeArgs({ system, model, write, dirs = [], stream = false, resume, root }) {
+  const mcp = { mcpServers: { 'backchannel-tools': { command: process.execPath, args: [TOOLS], env: { BACKCHANNEL_TOOLS_ROOT: root || process.cwd() } } } };
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--append-system-prompt', system, '--settings', claudeDenySettings(),
+    '--strict-mcp-config', '--mcp-config', JSON.stringify(mcp)];
+  if (stream) args.push('--input-format', 'stream-json');
   if (resume) args.push('--resume', resume);
   for (const d of dirs) args.push('--add-dir', d); // where attached files were saved
-  if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash');
-  else args.push('--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep');
+  if (write) args.push('--permission-mode', 'acceptEdits', '--allowedTools', [...READ_TOOLS, 'Edit', 'Write', 'Bash'].join(','));
+  else {
+    if (claudeSupports('--restricted')) args.push('--restricted');
+    args.push('--permission-mode', 'dontAsk', '--allowedTools', READ_TOOLS.join(','));
+  }
   if (model) args.push('--model', model);
   return args;
+}
+
+// Files and folders a turn's tool calls touched, from claude's stream-json events: where the answer came from.
+export function toolPaths(message, cwd, root = cwd) {
+  const out = [];
+  for (const c of message?.content || []) {
+    if (c?.type !== 'tool_use' || !c.input || typeof c.input !== 'object') continue;
+    const i = c.input;
+    if (/__git$/.test(c.name)) out.push(path.resolve(root, String(i.repo || '.')));
+    else if (/__list_dir$/.test(c.name)) out.push(path.resolve(root, String(i.path || '.')));
+    else for (const k of ['file_path', 'notebook_path', 'path']) if (typeof i[k] === 'string') out.push(path.resolve(cwd, i[k]));
+    if ((c.name === 'Grep' || c.name === 'Glob') && !i.path) out.push(cwd);
+  }
+  return out;
+}
+
+// One headless claude run: the final message, and the paths its tools touched.
+async function claudeOnce({ prompt, cwd, ...o }) {
+  const out = await run(claudeBin(), claudeArgs({ ...o, root: o.root || cwd }), { cwd, input: prompt });
+  let result = null;
+  const paths = [];
+  for (const line of out.split('\n')) {
+    let m;
+    try { m = JSON.parse(line); } catch { continue; }
+    if (m.type === 'assistant') paths.push(...toolPaths(m.message, cwd, o.root || cwd));
+    if (m.type === 'result') result = m;
+  }
+  if (!result) throw new Error('claude ended without a result');
+  if (result.is_error || result.subtype !== 'success') throw new Error(String(result.result || result.subtype || 'claude failed').slice(0, 500));
+  return { text: String(result.result ?? ''), paths };
 }
 
 // One `codex exec` run. With `resume`, it continues that Codex thread (session.js). Returns the final message and the
 // thread id Codex reported, if any.
 export async function codexExec({ input, model, cwd, write, resume }) {
+  // Codex's sandbox decides what it may touch; its read-only sandbox still lets it run read-only commands like git log.
   const outFile = path.join(os.tmpdir(), `codex-reply-${process.pid}-${Date.now()}.txt`);
   const args = ['exec', '--json', '--skip-git-repo-check', '--sandbox', write ? 'workspace-write' : 'read-only', '--output-last-message', outFile];
   if (model) args.push('--model', model);
@@ -109,7 +161,7 @@ export const backends = {
   }),
 
   // Claude Code in headless mode, working inside the owner's repo.
-  'claude-code': async ({ prompt, cwd, ...o }) => run(claudeBin(), claudeArgs(o), { cwd, input: prompt }),
+  'claude-code': claudeOnce,
 
   // Codex CLI non-interactive mode; the final message is written to a file.
   codex: async ({ system, prompt, ...o }) => (await codexExec({ ...o, input: `${system}\n\n---\n\n${prompt}` })).reply,

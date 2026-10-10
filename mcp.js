@@ -203,7 +203,8 @@ async function standInTick() {
       const sent = await answer(hub, self, msg, log);
       if (sent) standInSent.add(sent.id); // answering acknowledged the request
       else await hub.ack(id, [msg.id]).catch(() => {}); // nothing to say: done with it all the same
-      answered.push({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null, at: Date.now() });
+      answered.push({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null,
+        needsOwner: sent?.needsOwner || null, requestId: msg.id, at: Date.now() });
     } catch (err) {
       // Put it back for the session, and don't try again.
       log(`stand-in could not answer: ${err.message}`);
@@ -244,15 +245,24 @@ function unreadNote() {
   const activity = untoldActivity();
   if (activity.items.length) {
     activity.markTold();
-    const agents = [...new Set(activity.items.map((a) => '@' + a.agent))].join(', ');
-    note += `\n\n🛰️ Your always-on Backchannel agent${agents.includes(',') ? 's' : ''} (${agents}) handled ${activity.items.length} request${activity.items.length > 1 ? 's' : ''} on this computer. Tell the user in one line:\n`
-      + activity.items.slice(-5).map((a) => `- @${a.from} asked @${a.agent} (thread ${a.threadId}): ${quote(a.request.replace(/\s+/g, ' '), a.from)}\n  ${a.error ? `It failed: ${a.error}` : a.reply ? `Replied: ${a.reply.replace(/\s+/g, ' ')}` : 'Nothing needed a reply.'}`).join('\n');
+    const needs = activity.items.filter((a) => a.needsOwner && a.messageId);
+    const handled = activity.items.filter((a) => !needs.includes(a));
+    // Questions only the user can answer come first: the delegation waits on them.
+    if (needs.length) {
+      note += `\n\n🙋 Your always-on Backchannel agent needs the user before it can finish ${needs.length > 1 ? `${needs.length} requests` : 'a request'}. Ask the user, then answer with reply (the message_id below); the agent then finishes the request for whoever asked:\n`
+        + needs.slice(-5).map((a) => `- @${a.agent}, for @${a.from}'s request (thread ${a.threadId}), asks: ${a.needsOwner.replace(/\s+/g, ' ')}\n  message_id ${a.messageId}`).join('\n');
+    }
+    if (handled.length) {
+      const agents = [...new Set(handled.map((a) => '@' + a.agent))].join(', ');
+      note += `\n\n🛰️ Your always-on Backchannel agent${agents.includes(',') ? 's' : ''} (${agents}) handled ${handled.length} request${handled.length > 1 ? 's' : ''} on this computer. Tell the user in one line:\n`
+        + handled.slice(-5).map((a) => `- @${a.from} asked @${a.agent} (thread ${a.threadId}): ${quote(a.request.replace(/\s+/g, ' '), a.from)}\n  ${a.error ? `It failed: ${a.error}` : a.branch ? `Made changes on branch ${a.branch} in ${a.repo}, for the user to review.` : a.reply ? `Replied: ${a.reply.replace(/\s+/g, ' ')}` : 'Nothing needed a reply.'}`).join('\n');
+    }
   }
   if (answered.length) {
     const done = answered.splice(0);
     writeState();
     note += `\n\n🤝 While nobody here was looking, your Backchannel stand-in handled ${done.length} request${done.length > 1 ? 's' : ''}. Tell the user in one line:\n`
-      + done.map((a) => `- @${a.from} (thread ${a.threadId}) asked: ${quote(a.request.replace(/\s+/g, ' '), a.from)}\n  ${a.reply ? `Stand-in replied: ${a.reply.replace(/\s+/g, ' ')}` : 'Nothing needed a reply.'}`).join('\n');
+      + done.map((a) => `- @${a.from} (thread ${a.threadId}) asked: ${quote(a.request.replace(/\s+/g, ' '), a.from)}\n  ${a.reply ? `Stand-in replied: ${a.reply.replace(/\s+/g, ' ')}` : 'Nothing needed a reply.'}${a.needsOwner ? `\n  It needs the user for: ${a.needsOwner.replace(/\s+/g, ' ')}. Ask the user, then answer @${a.from} with reply (message_id ${a.requestId}).` : ''}`).join('\n');
   }
   const n = unclaimed.size;
   if (!n) return note;
@@ -262,7 +272,19 @@ function unreadNote() {
 
 const attachments = (m) => (m.files?.length ? `\nAttached files (save with get_file):\n${m.files.map((f) => `- ${f.name} (${formatSize(f.size)}, ${f.type}), file_id ${f.id}`).join('\n')}` : '');
 // Message text is quoted as data: it comes from other people's agents.
-const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}]\n${quote(m.text, m.from)}${attachments(m)}`).join('\n\n');
+const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}${m.kind === 'needs-owner' ? `; @${m.from} is waiting on its owner, and its final answer will come in this thread` : ''}]\n${quote(m.text, m.from)}${attachments(m)}`).join('\n\n');
+
+// Agents that work in `repo`, best first: online, always on, connectors before live sessions, your own agents last.
+function byRepo(agents, repo) {
+  const want = String(repo).toLowerCase().replace(/\.git$/, '');
+  const names = (r) => [r.name, r.path && path.basename(r.path), r.remote?.replace(/\.git$/, '').split(/[/:]/).pop()];
+  const has = (a) => (a.repos || []).some((r) => names(r).some((n) => n && n.toLowerCase() === want)) || a.repo?.toLowerCase() === want;
+  const score = (a) => (a.online ? 100 : 0) + (a.service ? 20 : 0) + (a.kind !== 'session' ? 10 : 0) + (a.persistent ? 5 : 0)
+    + (a.kind === 'session' && a.standIn && a.standIn !== 'off' ? 3 : 0) - (account.handle && a.ownerHandle === account.handle ? 50 : 0);
+  return agents.filter((a) => a.id !== id && has(a)).sort((x, y) => score(y) - score(x));
+}
+const repoNames = (agents) => [...new Set(agents.filter((a) => a.id !== id).flatMap((a) => (a.repos || []).map((r) => r.name)))].sort();
+const ago = (ts) => { const m = Math.round((Date.now() - ts) / 60_000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
 // Outgoing text loses anything that looks like a credential; the agent is told when that happened.
 function outgoing(text) {
   const { text: clean, count } = redactSecrets(text);
@@ -283,35 +305,72 @@ const tools = [
         : a.standIn && a.standIn !== 'off'
           ? ` Answers within about a minute, even when ${a.owner || 'its owner'} is away.`
           : ` Messages wait until ${a.owner || 'its owner'}'s agent checks its inbox.`);
-      return agents.map((a) => `@${a.id} ${a.online ? '🟢 online' : '⚪ offline'}${a.online && a.state === 'working' ? ' (busy)' : ''} | ${a.backend}${a.owner ? ` | owner: ${a.owner}` : ''}\n  ${a.description}${reach(a)}`).join('\n');
+      const repos = (a) => (a.repos?.length ? `\n  Repos: ${a.repos.slice(0, 12).map((r) => r.name).join(', ')}${a.repos.length > 12 ? `, and ${a.repos.length - 12} more` : ''}` : '');
+      return agents.map((a) => `@${a.id} ${a.online ? '🟢 online' : '⚪ offline'}${a.online && a.state === 'working' ? ' (busy)' : ''} | ${a.backend}${a.owner ? ` | owner: ${a.owner}` : ''}\n  ${a.description}${reach(a)}${repos(a)}`).join('\n')
+        + '\n\nTo ask whoever works in a repository, call ask_agent with repo instead of agent.';
     },
   },
   {
     name: 'ask_agent',
-    description: "Delegate a question or task to another person's agent and wait for its reply. Use it instead of asking that person yourself, e.g. to ask a teammate's agent how their API works or to have it make a change in their repo. Write the message so it stands on its own: the other agent has no access to your conversation. Pass thread_id to continue an earlier conversation.",
+    description: "Delegate a question or task to another person's agent and wait for its reply. Use it instead of asking that person yourself, e.g. to ask a teammate's agent how their API works or to have it make a change in their repo. Write the message so it stands on its own: the other agent has no access to your conversation. Name the agent, or pass repo to ask whoever works in that repository. For long tasks, pass wait_seconds: 0 and keep working: the answer arrives as an unread message, and my_delegations shows where your asks stand. Pass thread_id to continue an earlier conversation.",
     inputSchema: {
       type: 'object',
       properties: {
-        agent: { type: 'string', description: 'Handle of the agent, e.g. "steve" (from list_agents)' },
+        agent: { type: 'string', description: 'Handle of the agent, e.g. "steve" (from list_agents). Optional when repo is given' },
+        repo: { type: 'string', description: 'Repository the request is about, e.g. "account-api". Without agent, the best agent that works in it is picked; with one, it tells that agent where to look or make the change' },
         message: { type: 'string', description: 'Self-contained request with all the context the other agent needs' },
         thread_id: { type: 'string', description: 'Optional: continue an existing thread' },
         files: FILES_PARAM,
-        wait_seconds: { type: 'number', description: 'How long to wait for the reply (default 240, max 900)' },
+        wait_seconds: { type: 'number', description: 'How long to wait for the reply (default 240, max 900). 0 returns right away' },
       },
-      required: ['agent', 'message'],
+      required: ['message'],
     },
-    run: async ({ agent, message, thread_id, files, wait_seconds = 240 }) => {
-      const handle = String(agent).replace(/^@/, '').toLowerCase();
+    run: async ({ agent, repo, message, thread_id, files, wait_seconds = 240 }) => {
+      let handle = agent ? String(agent).replace(/^@/, '').toLowerCase() : null;
+      let routed = '';
+      if (repo !== undefined && (String(repo).length > 200 || !/^\w[\w.-]*(?:\/\w[\w.-]*)*$/.test(String(repo)))) throw Object.assign(new Error('repo must be a repository name, like account-api'), { status: 400 });
+      if (!handle) {
+        if (!repo) throw Object.assign(new Error('pass agent (a handle from list_agents) or repo (a repository name)'), { status: 400 });
+        const agents = await hub.agents();
+        const found = byRepo(agents, repo);
+        if (!found.length) return `No agent on the network works in ${repo}. Repositories agents work in: ${repoNames(agents).join(', ') || 'none reported'}.`;
+        handle = found[0].id;
+        const whose = found[0].owner || found[0].ownerHandle;
+        routed = `Asked @${handle}, ${whose ? `${whose}'s ` : 'an '}${found[0].kind === 'session' ? 'live session' : 'agent'} in ${repo}${found[0].online ? '' : ' (offline: the request waits until it is back)'}.${found.length > 1 ? ` Others that work in ${repo}: ${found.slice(1, 4).map((a) => '@' + a.id).join(', ')}.` : ''}\n`;
+      }
       const uploaded = await uploadAll(files);
       const out = outgoing(String(message));
-      const sent = await hub.post({ from: id, text: `@${handle} ${out.text}`, threadId: thread_id, files: uploaded.map((f) => f.id) });
+      const sent = await hub.post({ from: id, text: `@${handle} ${out.text}`, threadId: thread_id, files: uploaded.map((f) => f.id), ...(repo ? { repo: String(repo) } : {}) });
       if (sent.note) return `Not delivered: ${sent.note}`;
       if (!sent.to.length) return `@${handle} is not on the network. Call list_agents to see who is.`;
       asked.set(sent.threadId, sent.ts);
+      if (wait_seconds <= 0) return `${routed}Sent to @${handle} (thread ${sent.threadId}). Carry on with your work: the answer arrives as an unread Backchannel message${channel ? ', pushed into this session,' : ''} in that thread. my_delegations shows where it stands.${out.note}`;
       const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900), sent.threadId);
       await noteRead(replies); // a question back counts as a request to us
-      if (!replies.length) return `Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Call check_inbox with thread_id "${sent.threadId}" later.${out.note}`;
-      return `thread_id: ${sent.threadId}${out.note}\n\n${fmt(replies)}`;
+      if (!replies.length) return `${routed}Sent (thread ${sent.threadId}), but no reply yet. @${handle} may still be working, or its owner has to approve. Its answer arrives as an unread message; my_delegations shows where it stands.${out.note}`;
+      return `${routed}thread_id: ${sent.threadId}${out.note}\n\n${fmt(replies)}`;
+    },
+  },
+  {
+    name: 'my_delegations',
+    description: "See what you've delegated and where each ask stands (being worked on, waiting on someone or on an agent's owner, answered), and what others are waiting on you for.",
+    inputSchema: { type: 'object', properties: { include_done: { type: 'boolean', description: 'Also list answered and closed ones (the latest 20)' } } },
+    run: async ({ include_done = false }) => {
+      const list = await hub.req('GET', hub.t(`/threads?agent=${encodeURIComponent(id)}&state=${include_done ? 'all' : 'active'}&limit=${include_done ? 20 : 50}`));
+      const agents = await hub.agents();
+      const ownerOf = (h) => agents.find((a) => a.id === h)?.owner || `@${h}'s owner`;
+      const state = (t) => ({
+        working: `@${t.waitingOn[0] || t.to[0]} is working on it`, approval: `waiting for ${ownerOf(t.waitingOn[0] || t.to[0])} to approve it`,
+        owner: `@${t.waitingOn[0]} is waiting on ${ownerOf(t.waitingOn[0])}`, queued: `waiting on ${t.waitingOn.map((h) => '@' + h).join(', ')}`,
+        answered: 'answered', error: 'failed', declined: 'declined', stalled: 'stopped at the hop limit',
+      }[t.status] || t.status);
+      const line = (t) => `- thread ${t.id}: "${t.title}" (to ${t.to.map((h) => '@' + h).join(', ') || 'nobody'}): ${state(t)}, ${ago(t.updated)}`;
+      const mine = list.filter((t) => t.from === id);
+      const owed = list.filter((t) => t.from !== id && t.waitingOn.includes(id));
+      const parts = [];
+      if (mine.length) parts.push(`Your asks:\n${mine.map(line).join('\n')}`);
+      if (owed.length) parts.push(`Waiting on you:\n${owed.map(line).join('\n')}\nRead them with check_inbox and answer with reply.`);
+      return parts.join('\n\n') || (include_done ? 'No delegations yet.' : 'Nothing in flight. Pass include_done to see finished ones.');
     },
   },
   {
@@ -394,6 +453,8 @@ async function handle(req) {
           `- At the start of a task, call check_inbox. Other agents may have asked you something or replied to an earlier ask.`,
           `- When a tool result says you have unread messages, read them with check_inbox. Answer requests addressed to you with reply, using what you know or can find by reading this workspace. Ask the user first before committing them to something.`,
           ...MESSAGE_RULES.map((r) => `- ${r}`),
+          `- If you know the repository but not whose agent works in it, call ask_agent with repo instead of agent.`,
+          `- For long tasks, call ask_agent with wait_seconds: 0 and keep working. The answer arrives as an unread message; my_delegations shows where your asks stand. An agent waiting on its owner answers later, in the same thread.`,
           `- To share a file (log, diff, screenshot, spec), pass its path in \`files\` on ask_agent or reply. Download files you receive with get_file.`,
           `- Tell the user briefly when you delegated something or answered another agent.`,
         ].join('\n'),

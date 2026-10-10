@@ -8,7 +8,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { claudeArgs, claudeBin, childEnv, codexExec, turnTimeout } from './backends.js';
+import { claudeArgs, claudeBin, childEnv, codexExec, turnTimeout, toolPaths } from './backends.js';
 
 export const sessionFile = (id) => path.join(os.homedir(), '.backchannel', 'sessions', `${id}.json`);
 const MAX_THREADS = 200, MAX_IDS = 200;
@@ -56,8 +56,9 @@ class Session {
     this.saved.seen.set(threadId, set);
     this.saved.save();
   }
-  // Runs one turn. `build(seen)` writes the prompt from what the conversation has already been shown; it's called again
-  // if the saved conversation can't be resumed and a new one starts. Turns run one at a time.
+  // Runs one turn and resolves to { text, paths }: the reply, and the files and folders its tools touched.
+  // `build(seen)` writes the prompt from what the conversation has already been shown; it's called again if the saved
+  // conversation can't be resumed and a new one starts. Turns run one at a time.
   ask(threadId, build) {
     const p = this.#queue.then(() => {
       if (!this.saved.conversation) this.saved.seen.clear(); // a new conversation has been shown nothing
@@ -90,7 +91,7 @@ export class ClaudeSession extends Session {
   #start() {
     const resume = this.saved.conversation;
     for (const d of this.o.dirs) fs.mkdirSync(d, { recursive: true });
-    const args = claudeArgs({ system: this.o.system(), model: this.o.model, write: this.o.write, dirs: this.o.dirs, stream: true, resume });
+    const args = claudeArgs({ system: this.o.system(), model: this.o.model, write: this.o.write, dirs: this.o.dirs, stream: true, resume, root: this.o.cwd });
     const child = spawn(claudeBin(), args, { cwd: this.o.cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     const proc = { child, resume, started: false, err: '' };
     this.#proc = proc;
@@ -109,6 +110,7 @@ export class ClaudeSession extends Session {
       if (m.session_id !== this.saved.conversation) { this.saved.conversation = m.session_id; this.saved.save(); }
       return;
     }
+    if (m.type === 'assistant' && this.#turn) { this.#turn.paths.push(...toolPaths(m.message, this.o.cwd)); return; }
     if (m.type !== 'result') return;
     // A conversation that can't be resumed ends in a result before any init; the exit that follows says why.
     if (proc.resume && !proc.started) return;
@@ -118,7 +120,7 @@ export class ClaudeSession extends Session {
     clearTimeout(turn.timer);
     // Failed turns still say subtype "success"; is_error is what tells them apart.
     if (m.is_error || m.subtype !== 'success') turn.reject(new Error(String(m.result || m.subtype || 'claude failed').slice(0, 500)));
-    else turn.resolve(String(m.result ?? ''));
+    else turn.resolve({ text: String(m.result ?? ''), paths: turn.paths });
   }
 
   #ended(proc, err) {
@@ -140,7 +142,7 @@ export class ClaudeSession extends Session {
         proc.child.kill('SIGTERM'); // the next turn resumes the conversation in a new process
         reject(new Error('claude timed out'));
       }, turnTimeout());
-      this.#turn = { resolve, reject, timer };
+      this.#turn = { resolve, reject, timer, paths: [] };
       proc.child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } }) + '\n');
     });
   }
@@ -176,7 +178,7 @@ export class CodexSession extends Session {
       this.saved.conversation = out.thread;
       this.saved.save();
     }
-    return out.reply;
+    return { text: out.reply, paths: [] };
   }
 }
 

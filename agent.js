@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { hubFromEnv, loadConfig, describeWorkspace, machineInfo, noteConnector, connectorFile } from './client.js';
 import { backends } from './backends.js';
-import { answer, systemPrompt, filesDir } from './responder.js';
+import { answer, systemPrompt, filesDir, view } from './responder.js';
 import { createSession, sessionFile, resumeHint } from './session.js';
 import * as service from './service.js';
 
@@ -114,7 +114,7 @@ const where = () => (workspace?.repos.length > 1 ? `${workspace.repos.length} re
 // Codex's read-only sandbox can read any file this computer's user can, not just the repo; say so.
 const codexReadsAll = backend === 'codex' && !opt.write;
 const describe = (owner) => opt.about || (isCoder
-  ? `${owner ? owner + "'s" : 'A'} ${backend} agent with ${opt.write ? 'read/write' : 'read-only'} access to ${where()}.${codexReadsAll ? ' Codex can also read files elsewhere on its computer.' : ''}`
+  ? `${owner ? owner + "'s" : 'A'} ${backend} agent with ${opt.write ? `access to ${where()}. It makes requested changes on a branch of their own, for ${owner || 'its owner'} to review` : `read-only access to ${where()}`}.${codexReadsAll ? ' Codex can also read files elsewhere on its computer.' : ''}`
   : `${owner ? owner + "'s" : 'An'} ${backend} assistant.`);
 let description = describe(opt.owner);
 const hub = hubFromEnv({ url: opt.hub, team: opt.team });
@@ -125,9 +125,24 @@ const card = { id, name: opt.name || id, backend, model: opt.model, owner: opt.o
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
 // What the responder needs to know about this agent; the owner and description are filled in once we reach the hub.
 const self = { get id() { return id; }, get owner() { return card.owner; }, get description() { return description; },
-  backend, cwd, write: opt.write, model: opt.model, approved: opt.approve, session: null };
+  ownerHandle: null, backend, cwd, write: opt.write, model: opt.model, approved: opt.approve, session: null,
+  // Threads where this agent asked its owner something (NEEDS_OWNER), kept across restarts.
+  waiting: new Map(),
+  // Write requests each get a conversation of their own, in their worktree (responder.js). A few stay open.
+  sessionFor: null };
+const writeSessions = new Map();
+function sessionFor(key, { cwd: dir, system }) {
+  let s = writeSessions.get(key);
+  if (!s) {
+    s = createSession(backend, { file: sessionFile(`${id}--${key}`), cwd: dir, model: opt.model, write: true, system, dirs: [filesDir(id)], log: (l) => console.log(l) });
+    writeSessions.set(key, s);
+    for (const [k, old] of [...writeSessions].slice(0, -4)) { writeSessions.delete(k); old.close().catch(() => {}); }
+  } else { writeSessions.delete(key); writeSessions.set(key, s); } // most recently used last
+  return s;
+}
 // What this connector is doing, for the owner's own sessions on this computer (and `--status`).
-const note = (entry) => noteConnector(id, { pid: process.pid, cwd, backend, service: SERVICE, conversation: self.session?.conversation || null }, entry);
+const note = (entry) => noteConnector(id, { pid: process.pid, cwd, backend, service: SERVICE, conversation: self.session?.conversation || null,
+  waiting: [...self.waiting].map(([threadId, w]) => ({ threadId, ...w })) }, entry);
 let shownConversation = null;
 function showConversation() {
   const c = self.session?.conversation;
@@ -140,7 +155,7 @@ let stopping = false;
 async function stop(code) {
   if (stopping) return;
   stopping = true;
-  await self.session?.close().catch(() => {});
+  await Promise.all([self.session, ...writeSessions.values()].map((s) => s?.close().catch(() => {})));
   if (id) noteConnector(id, { pid: null });
   process.exit(code);
 }
@@ -149,7 +164,7 @@ process.on('SIGTERM', () => stop(0));
 rl?.on('SIGINT', () => stop(0));
 
 async function approve(msg) {
-  if (!rl) return true;
+  if (!rl || msg.from === self.ownerHandle) return true; // the owner's own messages (answers to NEEDS_OWNER) need no approval
   await hub.status(id, 'approval', msg.threadId).catch(() => {});
   // However long the owner takes to answer, the request stays leased to this connector.
   const heartbeat = setInterval(() => hub.status(id, 'approval', msg.threadId).catch(() => {}), 15_000);
@@ -173,9 +188,13 @@ async function handle(msg) {
   try {
     const sent = await answer(hub, self, msg, (s) => console.log(s));
     showConversation();
-    note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null });
+    note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: sent ? sent.text.slice(0, 200) : null,
+      ...(sent?.needsOwner ? { needsOwner: sent.needsOwner, messageId: sent.id } : {}),
+      ...(sent?.change ? { branch: sent.change.branch, repo: sent.change.repo } : {}) });
     if (!sent) { console.log('  (no reply)'); return; }
     console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${sent.text.slice(0, 120)}`);
+    if (sent.change) console.log(`  changes on ${sent.change.branch} in ${sent.change.repo} (${sent.change.stat})`);
+    if (sent.needsOwner) console.log(`  waiting on you: ${sent.needsOwner}\n  Answer in the thread, or: backchannel reply ${sent.id} "…"`);
   } catch (err) {
     console.error(`  backend error: ${err.message}`);
     note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: null, error: err.message.slice(0, 200) });
@@ -199,8 +218,10 @@ try {
   }
   if (isCoder) Object.assign(card, workspace = await describeWorkspace(cwd));
   if (me && !card.owner) card.owner = me.user.name || me.user.handle;
+  self.ownerHandle = me?.user.handle || loadConfig().handle || null;
+  for (const w of readJson(connectorFile(id))?.waiting || []) if (w.threadId && w.requestId) self.waiting.set(w.threadId, w);
   card.description = description = describe(card.owner);
-  const access = isCoder ? `${opt.write ? 'can edit' : 'read-only'} in ${tilde(cwd)}, ` : '';
+  const access = isCoder ? `${opt.write ? 'changes on branches of' : 'read-only in'} ${tilde(cwd)}, ` : '';
   console.log(`@${id} (${backend}, ${access}${opt.approve ? 'asks you before each request' : 'handles requests without asking'}) ${opt.service ? 'installing as a background service' : `connecting to ${hub.url}…`}`);
   if (codexReadsAll) console.log(`  Note: Codex's read-only mode can read any file you can, not just this folder. Replies are checked for secrets, but keep --approve on.`);
   if (isCoder && opt.write && me) {
@@ -230,8 +251,11 @@ try {
     process.exit(0);
   }
   if (isCoder && opt.persistent) {
-    self.session = createSession(backend, { file: sessionFile(id), cwd, model: opt.model, write: opt.write, fresh: opt.fresh,
-      system: () => systemPrompt(self, null), dirs: [filesDir(id)], log: (s) => console.log(s) });
+    // Read-only even with --write: changes happen in each request's worktree, in a conversation of its own.
+    self.session = createSession(backend, { file: sessionFile(id), cwd, model: opt.model, write: false, fresh: opt.fresh,
+      system: () => systemPrompt(view(self, { write: false, ...(opt.write ? { choices: workspace?.repos || [] } : {}) }), null),
+      dirs: [filesDir(id)], log: (s) => console.log(s) });
+    self.sessionFor = sessionFor;
     shownConversation = self.session.conversation;
     console.log(self.session.conversation
       ? `  Picking up its conversation from last time (--fresh starts a new one): ${resumeHint(backend, cwd, self.session.conversation)}`

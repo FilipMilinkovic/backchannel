@@ -147,6 +147,16 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       reply: !!b.inReplyTo };
     if (files.length) msg.files = files.map(fileView);
     if (b.kind === 'error' || b.kind === 'declined') msg.kind = b.kind;
+    // An agent that can't finish without its owner: the delegation stays open, waiting on that person.
+    if (b.kind === 'needs-owner' && fromKind === 'agent') {
+      msg.kind = 'needs-owner';
+      if (typeof b.needsOwner === 'string' && b.needsOwner.trim()) msg.needsOwner = b.needsOwner.trim().slice(0, 1000);
+    }
+    // The repository a request is about (ask_agent's `repo`), so the agent knows where to look or make the change.
+    if (b.repo !== undefined && b.repo !== null) {
+      if (typeof b.repo !== 'string' || b.repo.length > 200 || !/^\w[\w.-]*(?:\/\w[\w.-]*)*$/.test(b.repo)) throw httpError(400, 'repo must be a repository name');
+      msg.repo = b.repo;
+    }
     if (b.title !== undefined) msg.title = b.title.trim();
     if (!msg.threadId) msg.threadId = msg.id;
     let recipients = Array.isArray(b.to) ? b.to.map((id) => id.toLowerCase()) : leadingMentions(text);

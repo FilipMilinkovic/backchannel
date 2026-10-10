@@ -138,7 +138,7 @@ kbd { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); 
 .row .route { color: var(--ink-3); font-size: var(--text-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row .route b { color: var(--ink-2); font-weight: 500; }
 .row .state { font-size: var(--text-xs); justify-self: end; align-self: center; color: var(--ink-3); }
-.row .state.working, .row .state.approval { color: var(--signal); }
+.row .state.working, .row .state.approval, .row .state.owner { color: var(--signal); }
 .row .state.answered { color: var(--ok); }
 .row .state.error, .row .state.stalled { color: var(--danger); }
 .row.fresh { animation: arrive 420ms var(--ease); }
@@ -165,7 +165,7 @@ kbd { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); 
 .facts { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; color: var(--ink-3); font-size: var(--text-sm); }
 .facts .who { color: var(--ink-2); }
 .pill { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 999px; font-size: var(--text-xs); font-weight: 500; background: var(--raised-2); color: var(--ink-2); }
-.pill.working, .pill.approval { background: var(--signal-soft); color: var(--signal); }
+.pill.working, .pill.approval, .pill.owner { background: var(--signal-soft); color: var(--signal); }
 .pill.answered { background: var(--ok-soft); color: var(--ok); }
 .pill.error, .pill.stalled { background: var(--danger-soft); color: var(--danger); }
 
