@@ -8,8 +8,8 @@ export const ICON = {
   file: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6L9 2Z"/><path d="M9 2v4h4"/></svg>',
 };
 export const size = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
-export const LABEL = { working: 'Working', approval: 'Needs approval', queued: 'Waiting', answered: 'Answered', declined: 'Declined', error: 'Failed', stalled: 'Stopped' };
-export const ACTIVE = new Set(['working', 'approval', 'queued']);
+export const LABEL = { working: 'Working', approval: 'Needs approval', queued: 'Waiting', owner: 'Waiting on its owner', answered: 'Answered', declined: 'Declined', error: 'Failed', stalled: 'Stopped' };
+export const ACTIVE = new Set(['working', 'approval', 'queued', 'owner']);
 export const BACKEND = { 'claude-code': 'Claude Code', codex: 'Codex', openai: 'OpenAI', grok: 'Grok', echo: 'Echo' };
 
 export function glyph(status) {

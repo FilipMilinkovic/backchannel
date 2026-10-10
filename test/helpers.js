@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -86,4 +86,59 @@ export async function startHub(t, seed, env = {}) {
     },
   };
   return hub;
+}
+
+// ---------- connectors (agent.js) run against a fake claude (test/fixtures/fake-claude.js) ----------
+export const BIN = path.join(ROOT, 'bin', 'backchannel.js');
+export const FAKE = path.join(ROOT, 'test', 'fixtures', 'fake-claude.js');
+fs.chmodSync(FAKE, 0o755);
+
+export async function until(fn, ms = 8000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > deadline) throw new Error('timed out');
+    await delay(50);
+  }
+}
+
+// A home folder signed in as `account`, with claude replaced by the fake.
+export function signedIn(t, h, account, extra = {}) {
+  const home = tempDir(t, 'bc-home-');
+  fs.mkdirSync(path.join(home, '.backchannel'));
+  fs.writeFileSync(path.join(home, '.backchannel', 'config.json'),
+    JSON.stringify({ hub: h.base, token: account.token, team: account.team.id, handle: account.user.handle }));
+  const env = { ...process.env, HOME: home, CLAUDE_BIN: FAKE, FAKE_CLAUDE_LOG: path.join(home, 'claude.log'), ...extra };
+  for (const k of ['HUB_URL', 'HUB_TOKEN', 'HUB_TEAM', 'BACKCHANNEL_SERVICE', 'XDG_CONFIG_HOME']) delete env[k];
+  return { home, env, claudeLog: () => fs.readFileSync(env.FAKE_CLAUDE_LOG, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) };
+}
+
+export function connector(t, args, opts) {
+  const child = spawn(process.execPath, [BIN, 'connect', ...args], { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  t.after(() => child.kill());
+  return { child, out: () => out, async stop() { const done = once(child, 'exit'); child.kill('SIGTERM'); return (await done)[0]; } };
+}
+
+// Posts as `account` and returns the agent's answer to that message.
+export async function ask(h, account, agent, text, threadId, extra = {}) {
+  const p = `/api/teams/${account.team.id}`;
+  const sent = await h.ok(p + '/messages', account.token, 'POST', { text: `@${agent} ${text}`, ...(threadId ? { threadId } : {}), ...extra });
+  return until(async () => (await h.ok(`${p}/threads/${sent.threadId}`, account.token)).find((m) => m.from === agent && m.inReplyTo === sent.id), 15000);
+}
+
+// A git repo with one commit on main.
+export function gitRepo(t, name = 'payments', files = { 'src/app.js': 'export const app = 1;\n' }) {
+  const parent = fs.realpathSync(tempDir(t, 'bc-repo-'));
+  const dir = path.join(parent, name);
+  fs.mkdirSync(dir);
+  const git = (...a) => { const r = spawnSync('git', a, { cwd: dir, encoding: 'utf8' }); if (r.status) throw new Error(r.stderr); return r.stdout.trim(); };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'Test');
+  for (const [f, body] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), body); }
+  git('add', '-A'); git('commit', '-q', '-m', 'first');
+  return { dir, parent, git };
 }

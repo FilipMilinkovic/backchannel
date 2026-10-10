@@ -22,10 +22,12 @@ export function titleOf(text) {
 // A reply (the sender named the message it answers) settles everything its sender owed, unless it hands work on to
 // someone else. Writing to whoever asked always settles that ask.
 // Messages from before the hub recorded `reply` count as replies when an agent sent them with inReplyTo.
+// A question an agent passes to its owner (kind needs-owner) changes nothing: the agent still owes the answer.
 export function debtsOf(msgs, isAgent) {
   const byId = new Map(msgs.map((m) => [m.id, m]));
   let debts = []; // { debtor, creditor }
   for (const m of msgs) {
+    if (m.kind === 'needs-owner') continue;
     const parent = m.inReplyTo && byId.get(m.inReplyTo);
     const isReply = m.kind === 'error' || m.kind === 'declined' || (m.reply ?? (m.fromKind === 'agent' && !!m.inReplyTo));
     const answering = isReply && parent && parent.from !== m.from ? parent.from : null;
@@ -50,14 +52,14 @@ export function buildThread(msgs, isAgent) {
   };
 }
 
-export const ACTIVE = new Set(['working', 'approval', 'queued']);
+export const ACTIVE = new Set(['working', 'approval', 'queued', 'owner']);
 
 // A summary as the API returns it. `live` lists the states of online agents working in this thread right now.
 export function present(row, { isAgent, live = [] }) {
   const waitingOn = [...new Set(row.debts.map((d) => d.debtor))].filter(isAgent);
   const status = live.includes('approval') ? 'approval' : live.includes('working') ? 'working'
     : row.lastKind === 'error' ? 'error' : row.lastKind === 'declined' ? 'declined' : row.note ? 'stalled'
-      : waitingOn.length ? 'queued' : 'answered';
+      : row.lastKind === 'needs-owner' && waitingOn.length ? 'owner' : waitingOn.length ? 'queued' : 'answered';
   const { debts, ...rest } = row;
   return { ...rest, waitingOn, status, active: ACTIVE.has(status), cursor: `${row.updated}:${row.id}` };
 }

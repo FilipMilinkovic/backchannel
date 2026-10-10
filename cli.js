@@ -19,7 +19,7 @@ const { values: opt, positionals: [cmd, ...args] } = parseArgs({
   allowPositionals: true,
   options: {
     hub: { type: 'string' }, team: { type: 'string' }, handle: { type: 'string' }, name: { type: 'string' },
-    as: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
+    as: { type: 'string' }, repo: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
     print: { type: 'boolean', default: false }, 'skip-agents': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h' },
@@ -134,15 +134,25 @@ const commands = {
 
   // Posts as you (or as one of your agents with --as) and waits for replies in the thread.
   async ask() {
-    const to = (args[0] || '').replace(/^@/, '');
-    const text = args.slice(1).join(' ');
-    if (!to || !text) die(`usage: ${BIN} ask @agent "message" [--wait seconds] [--as your-agent]`);
+    // `ask --repo payments "…"` picks an agent that works in that repo: online ones first, connectors before sessions.
+    const byRepo = opt.repo && !String(args[0] || '').startsWith('@');
+    let to = byRepo ? '' : (args[0] || '').replace(/^@/, '');
+    const text = args.slice(byRepo ? 0 : 1).join(' ');
+    if ((!to && !byRepo) || !text) die(`usage: ${BIN} ask @agent "message" [--repo name] [--wait seconds] [--as your-agent]\n       ${BIN} ask --repo name "message"`);
     await hub.resolveTeam();
     const agents = await hub.agents();
+    if (byRepo) {
+      const want = opt.repo.toLowerCase();
+      const found = agents.filter((a) => (a.repos || []).some((r) => r.name?.toLowerCase() === want) || a.repo?.toLowerCase() === want)
+        .sort((x, y) => (y.online - x.online) || ((y.kind !== 'session') - (x.kind !== 'session')) || (!!y.service - !!x.service));
+      if (!found.length) die(`No agent works in ${opt.repo}. Repositories agents work in: ${[...new Set(agents.flatMap((a) => (a.repos || []).map((r) => r.name)))].sort().join(', ') || 'none reported'}`);
+      to = found[0].id;
+      console.error(`Asking @${to}, which works in ${opt.repo}.`);
+    }
     const target = agents.find((a) => a.id === to.toLowerCase());
     if (!target) die(`@${to} isn't an agent in this team. Agents: ${agents.map((a) => '@' + a.id).join(', ') || 'none yet'}`);
     if (!target.online) console.error(`@${to} is offline; the request will wait in its inbox.`);
-    const sent = await hub.post({ ...(opt.as ? { from: opt.as } : {}), text: `@${to} ${text}` });
+    const sent = await hub.post({ ...(opt.as ? { from: opt.as } : {}), text: `@${to} ${text}`, ...(opt.repo ? { repo: opt.repo } : {}) });
     if (sent.note) die(`Not delivered: ${sent.note}`);
     console.error(`Sent to @${to} (thread ${sent.threadId}). Waiting up to ${opt.wait}s…`);
     const seen = new Set([sent.id]);
@@ -224,7 +234,8 @@ if (!cmd || opt.help || !commands[cmd]) {
   use <team>                  Set your default team
   agents                      List agents in the team
   disconnect @agent           Remove an agent and stop its connector or session (yours, or any as owner)
-  ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent)
+  ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent, --repo name)
+  ask --repo name "message"   Ask whichever agent works in that repository
   reply <messageId> "text"    Reply to a message
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
   open [view]                 Open the UI signed in (one-time link; --print to show it instead)

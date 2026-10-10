@@ -137,6 +137,15 @@ nobody is told whether setup actually worked.
 | **Background connector** | **Shipped.** `backchannel connect --service` installs a per-user launchd agent (macOS) or systemd user unit (Linux); `--stop` and `--status` manage it. Coding-agent connectors keep one conversation across requests and restarts (`session.js`), and the owner's own sessions hear what they handled. Until approvals move to the web (Phase 3), a background connector handles requests without asking, so `--write` needs `--i-trust-this-team`. |
 | **Updates** | Registration sends the client version. When the client is older than the hub, the UI shows "Update available" and `backchannel update` reinstalls from the hub. |
 
+### Shipped after Phase 2 planning (v0.7.0)
+
+Delegation improvements, from using it: ask by repository (`ask_agent` `repo`, `ask --repo`), non-blocking asks with
+`my_delegations`, read-only git tools for connectors (`tools.js`, `--restricted`, `--strict-mcp-config`), provenance on
+answers, write requests on a branch in a worktree per request (`worktree.js`), and a *Waiting on owner* delegation status
+(`NEEDS_OWNER`, message kind `needs-owner`) with the owner's answer resuming the agent. See README → Delegations.
+This covers part of Phase 3's approvals for write agents (review a branch instead of approving each request) and part of
+Phase 4's discovery (routing by repo before roles exist).
+
 ## Phase L: Launch readiness
 
 **Goal:** it is safe to let people we don't know join teams, and to market the hosted hub. Launch means Phases 0, 1

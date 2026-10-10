@@ -20,6 +20,8 @@ try {
   process.kill(state.pid, 0);
 } catch { state = {}; } // no file, or one left behind by a session that no longer exists
 
+const needs = activity.items.filter((a) => a.needsOwner && a.messageId);
+const handled = activity.items.filter((a) => !needs.includes(a));
 const unread = state.unread || [];
 const answered = state.answered || [];
 if (!unread.length && !answered.length && !activity.items.length) process.exit(0);
@@ -29,14 +31,19 @@ const one = (s, from) => quote(s.replace(/\s+/g, ' '), from).replace(/\n/g, ' ')
 const lines = unread.slice(0, 5).map((m) => `- from @${m.from}: ${one(m.preview, m.from)}`);
 if (unread.length > 5) lines.push(`- …and ${unread.length - 5} more`);
 const context = [
-  ...(activity.items.length ? [
-    `🛰️ Backchannel: your always-on agent handled ${activity.items.length} request${activity.items.length > 1 ? 's' : ''} on this computer:`,
-    ...activity.items.slice(-5).map((a) => `- @${a.from} asked @${a.agent}: ${one(a.request, a.from)}${a.error ? ` → failed: ${a.error}` : a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}`),
+  ...(needs.length ? [
+    `🙋 Backchannel: your always-on agent needs you before it can finish ${needs.length > 1 ? `${needs.length} requests` : 'a request'}:`,
+    ...needs.slice(-5).map((a) => `- @${a.agent}, for @${a.from}'s request (thread ${a.threadId}), asks: ${a.needsOwner.replace(/\s+/g, ' ')} (message_id ${a.messageId})`),
+    "Ask the user, then answer with the backchannel reply tool and that message_id; the agent then finishes the request for whoever asked.",
+  ] : []),
+  ...(handled.length ? [
+    `🛰️ Backchannel: your always-on agent handled ${handled.length} request${handled.length > 1 ? 's' : ''} on this computer:`,
+    ...handled.slice(-5).map((a) => `- @${a.from} asked @${a.agent}: ${one(a.request, a.from)}${a.error ? ` → failed: ${a.error}` : a.branch ? ` → made changes on branch ${a.branch} in ${a.repo}, for the user to review` : a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}`),
     'Tell the user in one line.',
   ] : []),
   ...(answered.length ? [
     `🤝 Backchannel: while nobody was here, your stand-in (@${id}) handled ${answered.length} request${answered.length > 1 ? 's' : ''}:`,
-    ...answered.slice(0, 5).map((a) => `- @${a.from} asked: ${one(a.request, a.from)}${a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}`),
+    ...answered.slice(0, 5).map((a) => `- @${a.from} asked: ${one(a.request, a.from)}${a.reply ? ` → replied: ${a.reply.replace(/\s+/g, ' ')}` : ''}${a.needsOwner ? ` (it needs you for: ${a.needsOwner.replace(/\s+/g, ' ')}; answer @${a.from} with reply, message_id ${a.requestId})` : ''}`),
     'Tell the user in one line. Call check_inbox to acknowledge.',
   ] : []),
   ...(unread.length ? [

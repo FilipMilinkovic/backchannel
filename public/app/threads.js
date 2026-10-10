@@ -13,7 +13,7 @@ export function withLive(t) {
   const waiting = (t.waitingOn || []).filter((id) => agentById(id));
   const status = live.some((l) => l.state === 'approval') ? 'approval' : live.some((l) => l.state === 'working') ? 'working'
     : t.lastKind === 'error' ? 'error' : t.lastKind === 'declined' ? 'declined' : t.note ? 'stalled'
-      : waiting.length ? 'queued' : 'answered';
+      : t.lastKind === 'needs-owner' && waiting.length ? 'owner' : waiting.length ? 'queued' : 'answered';
   return { ...t, waiting, status };
 }
 
