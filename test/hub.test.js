@@ -276,6 +276,103 @@ test("agent handles can't pass for a person or take over someone's disconnected 
   assert.equal((await h.ok(`/api/invites/${invite.code}`, null)).role, 'member', 'the invite is not used up');
 });
 
+test('scoped tokens run only their own agents, message only who they may, and read only their threads', async (t) => {
+  const h = await startHub(t);
+  const steve = await h.bootstrap('steve');
+  const bob = await h.join(steve, 'member', 'bob');
+  const p = prefix(steve);
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'steve', kind: 'session' });
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bob-claude' });
+  const other = await h.ok('/api/teams', steve.token, 'POST', { name: 'Other' });
+
+  // Making one: only from a full sign-in, for a team you're in, with a prefix and who it may message.
+  const make = (body, token = steve.token) => h.api('/api/me/scoped-tokens', token, 'POST', body);
+  for (const [body, error] of [
+    [{ team: 'nope', agents: 'cw-', postTo: ['steve'] }, 'team must be the id of a team you are in'],
+    [{ team: steve.team.id, agents: 'x', postTo: ['steve'] }, 'agents must be a handle prefix of 2 to 24 characters, e.g. "cw-"'],
+    [{ team: steve.team.id, agents: 'cw-', postTo: [] }, 'postTo must list 1 to 20 handles the token may message'],
+    [{ team: steve.team.id, agents: 'cw-', postTo: ['steve'], read: 'all' }, 'read must be one of own, team'],
+  ]) assert.deepEqual([(await make(body)).status, (await make(body)).body.error], [400, error]);
+  const made = await make({ team: steve.team.id, agents: 'cw-', postTo: ['@Steve'], label: 'cloud workers' });
+  assert.equal(made.status, 200, JSON.stringify(made.body));
+  const { token: cw, id } = made.body;
+  assert.deepEqual(made.body.scopes, { team: steve.team.id, agents: 'cw-', postTo: ['steve'], read: 'own' });
+  assert.equal((await make({ team: steve.team.id, agents: 'cw-', postTo: ['steve'] }, cw)).status, 403, "a scoped token can't make more");
+  const me = await h.ok('/api/me', cw);
+  assert.deepEqual([me.user.handle, me.teams.map((x) => x.id), me.scopes.agents], ['steve', [steve.team.id], 'cw-']);
+
+  // Its agents carry the prefix; it can't act as the account's other agents.
+  assert.equal((await h.api(p + '/agents', cw, 'POST', { id: 'steve-2' })).status, 403);
+  await h.ok(p + '/agents', cw, 'POST', { id: 'cw-a', kind: 'session' });
+  await h.ok(p + '/agents', cw, 'POST', { id: 'cw-b', kind: 'session' });
+  assert.equal((await h.api(p + '/agents/steve/pending', cw)).status, 403, "the owner's own inbox is off limits");
+  assert.equal((await h.api(p + '/agents/steve/claim', cw, 'POST', { ids: [] })).status, 403);
+  assert.equal((await h.api(p + '/agents/cw-a', cw, 'PATCH', { standIn: 'write' })).status, 403, 'no stand-in settings');
+  assert.equal((await h.api(p + '/agents/bob-claude', cw, 'DELETE')).status, 403);
+  // Under the prefix but someone else's: still not its own, though its account owns the team.
+  const bobs = await h.ok(p + '/agents', bob.token, 'POST', { id: 'cw-bob' });
+  assert.equal(bobs.ownerHandle, 'bob');
+  assert.equal((await h.api(p + '/agents/cw-bob', cw, 'DELETE')).status, 403);
+  assert.equal((await h.api(p + '/agents/cw-bob/inbox', cw)).status, 403);
+  assert.equal((await h.ok(p + '/agents/bob-claude/card', cw)).name, 'bob-claude');
+
+  // It posts only as its agents, and only to the handles it was given.
+  assert.equal((await h.api(p + '/messages', cw, 'POST', { text: '@steve hi' })).status, 403, 'not as the person');
+  const off = await h.api(p + '/messages', cw, 'POST', { from: 'cw-a', text: '@bob-claude hi' });
+  assert.deepEqual([off.status, off.body.error], [403, 'this token can only message @steve']);
+  const hello = await h.ok(p + '/messages', cw, 'POST', { from: 'cw-a', text: '@steve WORKER-HELLO ENGR-1' });
+  assert.equal(hello.scoped, true);
+  assert.equal(hello.by, steve.user.id);
+  const answer = await h.ok(p + '/messages', steve.token, 'POST', { from: 'steve', inReplyTo: hello.id, text: 'noted' });
+  assert.equal(answer.scoped, undefined);
+  assert.equal((await h.ok(p + '/agents/cw-a/pending', cw)).messages[0].id, answer.id);
+  await h.ok(p + '/messages', cw, 'POST', { from: 'cw-a', inReplyTo: answer.id, text: 'pr opened' });
+  // Someone else asks the worker: it can read the request, but can't answer them.
+  const ask = await h.ok(p + '/messages', bob.token, 'POST', { from: 'bob-claude', text: '@cw-b what are you doing?' });
+  assert.equal((await h.api(p + '/messages', cw, 'POST', { from: 'cw-b', inReplyTo: ask.id, text: 'ENGR-1' })).status, 403);
+
+  // It reads only threads its agents are in: not the team's other threads, not the event stream.
+  const secret = await h.ok(p + '/messages', steve.token, 'POST', { from: 'steve', text: '@bob-claude private' });
+  const visible = new Set((await h.ok(p + '/messages', cw)).map((x) => x.threadId));
+  assert.deepEqual([...visible].sort(), [hello.threadId, ask.threadId].sort());
+  assert.deepEqual((await h.ok(p + '/threads', cw)).map((x) => x.id).sort(), [hello.threadId, ask.threadId].sort());
+  assert.equal((await h.ok(p + '/threads/counts', cw)).total, 2);
+  assert.equal((await h.api(`${p}/threads/${secret.threadId}`, cw)).status, 404);
+  assert.equal((await h.api(`${p}/threads/${secret.threadId}/summary`, cw)).status, 404);
+  assert.equal((await h.api(p + '/messages', cw, 'POST', { from: 'cw-a', threadId: secret.threadId, text: '@steve hi' })).status, 404);
+  assert.equal((await h.api(p + '/events', cw)).status, 403);
+  // Files too: one attached in its own thread, not one attached elsewhere.
+  const upload = async (token, name) => (await fetch(`${h.base}${p}/files?name=${name}`, { method: 'POST', body: 'x', headers: { authorization: `Bearer ${token}`, 'content-type': 'text/plain' } })).json();
+  const mine = await upload(cw, 'mine.txt');
+  await h.ok(p + '/messages', cw, 'POST', { from: 'cw-a', inReplyTo: answer.id, text: 'log', files: [mine.id] });
+  const theirs = await upload(steve.token, 'theirs.txt');
+  await h.ok(p + '/messages', steve.token, 'POST', { from: 'steve', threadId: secret.threadId, text: 'file', files: [theirs.id] });
+  assert.equal((await h.api(`${p}/files/${mine.id}/info`, cw)).status, 200);
+  assert.equal((await h.api(`${p}/files/${theirs.id}/info`, cw)).status, 404);
+
+  // Nothing about the account or the team beyond that.
+  for (const [method, route, body] of [['POST', '/api/me/token'], ['POST', '/api/me/login-link', {}], ['POST', '/api/teams', { name: 'X' }],
+    ['GET', '/api/me/scoped-tokens'], ['GET', `/api/teams/${other.team.id}`], ['POST', p + '/invites', { role: 'member' }],
+    ['PATCH', p + '/', { name: 'Renamed' }], ['DELETE', `${p}/members/${steve.user.id}`]]) {
+    assert.ok([403, 404].includes((await h.api(route, cw, method, body)).status), `${method} ${route}`);
+  }
+  const invite = await h.ok(p + '/invites', steve.token, 'POST', { role: 'member' });
+  assert.equal((await h.api(`/api/invites/${invite.code}/accept`, cw, 'POST', {})).status, 403);
+
+  // With read: 'team' it sees everything, but still posts only as its agents to its handles.
+  const wide = (await make({ team: steve.team.id, agents: 'ci-', postTo: ['steve'], read: 'team' })).body.token;
+  assert.ok((await h.ok(p + '/messages', wide)).some((x) => x.id === secret.id));
+
+  // Listed and revoked from a full sign-in; a revoked token stops working, and so does one whose account rotates.
+  const list = await h.ok('/api/me/scoped-tokens', steve.token);
+  assert.deepEqual(list.map((x) => [x.id, x.label]), [[id, 'cloud workers'], [list[1].id, 'scoped token']]);
+  await h.ok(`/api/me/scoped-tokens/${id}`, steve.token, 'DELETE');
+  assert.equal((await h.api('/api/me', cw)).status, 401);
+  assert.equal((await h.api(`/api/me/scoped-tokens/${id}`, steve.token, 'DELETE')).status, 404);
+  await h.ok('/api/me/token', steve.token, 'POST');
+  assert.equal((await h.api('/api/me', wide)).status, 401);
+});
+
 test('agent profiles carry repos, machine and approval details without credentials', async (t) => {
   const h = await startHub(t);
   const owner = await h.bootstrap();
@@ -411,7 +508,7 @@ test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
   const db = openDb(dir);
   const repo = createRepo(db);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 7);
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   const setup = repo.setupInvite();
   assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);

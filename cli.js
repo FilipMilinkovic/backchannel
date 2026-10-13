@@ -22,6 +22,7 @@ const { values: opt, positionals: [cmd, ...args] } = parseArgs({
     as: { type: 'string' }, repo: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
     print: { type: 'boolean', default: false }, 'skip-agents': { type: 'boolean', default: false },
+    agents: { type: 'string' }, 'post-to': { type: 'string' }, read: { type: 'string' }, label: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -214,6 +215,35 @@ const commands = {
     if (!hub.token) die('No saved token. Join a team first.');
     console.log(hub.token);
   },
+
+  // Tokens for automation (cloud workers, CI) that can do less than your account: one team, agents under a prefix,
+  // messages only to the handles given, and by default only the threads their agents are in.
+  async 'scoped-token'() {
+    const [sub, id] = args;
+    if (sub === 'list') {
+      const list = await hub.req('GET', '/api/me/scoped-tokens');
+      if (!list.length) return console.log('No scoped tokens.');
+      for (const t of list) {
+        console.log(`${t.id}  ${t.label}  agents ${t.scopes.agents}…  → ${t.scopes.postTo.map((h) => '@' + h).join(', ')}  read ${t.scopes.read}  last used ${new Date(t.lastUsedAt).toLocaleString()}`);
+      }
+      return;
+    }
+    if (sub === 'revoke') {
+      if (!id) die(`usage: ${BIN} scoped-token revoke <id>   (ids from: ${BIN} scoped-token list)`);
+      await hub.req('DELETE', `/api/me/scoped-tokens/${encodeURIComponent(id)}`);
+      return console.log(`Revoked ${id}. Anything using it is signed out.`);
+    }
+    if (sub !== 'create' || !opt.agents || !opt['post-to']) {
+      die(`usage: ${BIN} scoped-token create --agents cw- --post-to steve[,other] [--read own|team] [--label "…"] [--team <team>]
+       ${BIN} scoped-token list | revoke <id>`);
+    }
+    await hub.resolveTeam();
+    const made = await hub.req('POST', '/api/me/scoped-tokens', { team: hub.team, agents: opt.agents, postTo: opt['post-to'].split(','),
+      ...(opt.read ? { read: opt.read } : {}), ...(opt.label ? { label: opt.label } : {}) });
+    console.error(`Scoped token ${made.id} (${made.label}): agents ${made.scopes.agents}…, messages ${made.scopes.postTo.map((h) => '@' + h).join(', ')}, reads ${made.scopes.read === 'own' ? 'only its own threads' : 'the whole team'}.`);
+    console.error('It is shown once. Store it where the automation reads HUB_TOKEN; revoke it with: ' + `${BIN} scoped-token revoke ${made.id}`);
+    console.log(made.token);
+  },
 };
 
 if (!cmd || opt.help || !commands[cmd]) {
@@ -240,6 +270,9 @@ if (!cmd || opt.help || !commands[cmd]) {
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
   open [view]                 Open the UI signed in (one-time link; --print to show it instead)
   rotate-token                Replace your personal token and sign out browsers (--show-token)
+  scoped-token create|list|revoke
+                              Tokens for automation that can do less than you (--agents prefix, --post-to handles,
+                              --read own|team, --label)
   token                       Print your saved token (for HUB_TOKEN on another machine)
 ${agentCommands}
 Config: ${CONFIG} (HUB_URL, HUB_TOKEN, HUB_TEAM override it)`);

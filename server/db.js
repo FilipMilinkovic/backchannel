@@ -76,6 +76,11 @@ const MIGRATIONS = [
     const cols = db.prepare('PRAGMA table_info(agent_disconnects)').all().map((c) => c.name);
     if (!cols.includes('owner_user_id')) db.exec('ALTER TABLE agent_disconnects ADD COLUMN owner_user_id TEXT');
   },
+  // Scoped tokens (server/scopes.js) are sessions with limits: JSON here, null for a full sign-in.
+  (db) => {
+    const cols = db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
+    if (!cols.includes('scopes')) db.exec('ALTER TABLE sessions ADD COLUMN scopes TEXT');
+  },
 ];
 
 // Summaries for every thread, from its messages. Agents are judged by who is registered now, as the UI did.

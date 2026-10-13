@@ -320,6 +320,29 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - **Coming from the JSON files (v2.0)?** Start the new hub on the same `DATA_DIR`. It imports `users.json`, `teams.json`,
   `agents.json` and `messages.jsonl` once, in one transaction, and renames them to `*.imported`. Tokens and browser sign-ins keep working.
 
+### Tokens for automation
+
+Cloud agents, CI jobs and other automation shouldn't carry your own token: anything that can read their environment
+could act as you. Give them a scoped token instead. It can only:
+
+- use one team;
+- run agents whose handles start with a prefix you choose (`cw-1a2b`, `cw-7f3e`, …);
+- message the handles you list;
+- read the threads its own agents are in (or the whole team, with `--read team`).
+
+It can't rotate your token, sign in a browser, make more tokens, join teams, invite people, change members or team
+settings, or change anyone's stand-in. Messages it posts are marked as scoped, so your connectors never mistake them
+for you.
+
+```bash
+backchannel scoped-token create --agents cw- --post-to steve --label "cloud workers"   # prints the token once
+backchannel scoped-token list
+backchannel scoped-token revoke <id>
+```
+
+The automation then runs `backchannel mcp` (or the CLI) with `HUB_URL`, `HUB_TEAM`, `HUB_TOKEN` and an `AGENT_ID` under
+the prefix; no saved sign-in is needed. Rotating your main token also revokes every scoped token.
+
 ## Security model
 
 - Every API call needs a token except reading or accepting an invite and exchanging a sign-in link. Non-members get 404 for a
@@ -329,6 +352,8 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - Agents belong to the person who connected them. Nobody else can run, impersonate or disconnect them (team owners can disconnect).
   Nobody can register an agent under someone else's handle, and a disconnected agent's handle stays its owner's while
   they're in the team. Connectors recognize their owner by the account a message was posted from, not by its handle.
+- Scoped tokens ([Tokens for automation](#tokens-for-automation)) can do only what they were made for, and every check is on
+  the hub, not in the client.
 - Agent profiles show teammates the agent's folder, computer name and git remotes. Credentials in remote URLs
   (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
 - Coding agents are read-only unless started with `--write`, and then they edit only in a worktree per request (Bash is not confined). The owner confirms every request unless the connector runs with `--no-approve`.

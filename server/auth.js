@@ -23,13 +23,14 @@ const TOUCH_EVERY_MS = 60_000;
 
 // A user authenticates with their main token (CLI, connectors, MCP) or a browser session token
 // (from a one-time sign-in link), so browsers never need the main token. Sessions expire after
-// `sessionDays` without use. Returns { user, sessionHash } or null when optional and no token was sent.
+// `sessionDays` without use. Returns { user, sessionHash, scopes } or null when optional and no token was sent;
+// `scopes` is null except for scoped tokens (server/scopes.js).
 export function authenticate(req, url, repo, { optional = false, sessionDays = 30 } = {}) {
   const token = tokenFrom(req, url);
   if (!req.headers.authorization && !token && optional) return null;
   const hash = token && hashToken(token);
   let user = hash && repo.userByTokenHash(hash);
-  if (user) return { user, sessionHash: null };
+  if (user) return { user, sessionHash: null, scopes: null };
   const session = hash && repo.sessionByHash(hash);
   if (session) {
     const now = Date.now();
@@ -37,7 +38,7 @@ export function authenticate(req, url, repo, { optional = false, sessionDays = 3
     else {
       if (now - session.lastUsedAt > TOUCH_EVERY_MS) repo.touchSession(hash, now);
       user = repo.userById(session.userId);
-      if (user) return { user, sessionHash: hash };
+      if (user) return { user, sessionHash: hash, scopes: session.scopes ? JSON.parse(session.scopes) : null };
     }
   }
   throw httpError(401, 'missing or invalid token');
