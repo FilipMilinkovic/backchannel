@@ -70,6 +70,12 @@ const MIGRATIONS = [
      ALTER TABLE inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;`);
     rebuildThreads(db);
   },
+  // Who a disconnected agent belonged to, so its handle stays theirs: only they can start it again.
+  // Checked first, because a database copied back from an older version may already have the column.
+  (db) => {
+    const cols = db.prepare('PRAGMA table_info(agent_disconnects)').all().map((c) => c.name);
+    if (!cols.includes('owner_user_id')) db.exec('ALTER TABLE agent_disconnects ADD COLUMN owner_user_id TEXT');
+  },
 ];
 
 // Summaries for every thread, from its messages. Agents are judged by who is registered now, as the UI did.

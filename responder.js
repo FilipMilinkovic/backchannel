@@ -1,7 +1,7 @@
 // Answers one request with a model or coding agent and posts the reply. Shared by connectors (agent.js) and by a live
 // session's stand-in (mcp.js), which answers for its owner when nobody in the session picks a request up.
 // `self` is read at call time, so the caller can fill in the owner and description once it has reached the hub:
-//   { id, owner, ownerHandle, description, backend, cwd, write, model, approved, standIn,
+//   { id, owner, ownerHandle, ownerUserId, description, backend, cwd, write, model, approved, standIn,
 //     session, sessionFor(key, { cwd, system }), waiting }
 // Read answers end with where they were read from (worktree.js). Write requests run in a worktree of their own and come
 // back as a branch. An agent that needs its owner says NEEDS_OWNER: the thread waits on the owner, and the owner's
@@ -130,14 +130,20 @@ async function tailOf(hub, cwd, reply, allowed) {
   return { text: text.trim(), files: ids, needsOwner };
 }
 
-// Is `from` this agent's owner, or one of the owner's own agents (their live sessions)?
-function fromOwner(self, from, agents) {
-  if (!self.ownerHandle || from === self.id) return false;
-  return from === self.ownerHandle || agents.find((a) => a.id === from)?.ownerHandle === self.ownerHandle;
+// Was `msg` posted by this agent's owner, as themselves or through one of their own agents (their live sessions)?
+// Decided by the account that posted it (`by`, set by the hub), never by the handle it shows: a handle is just a name.
+export function fromOwner(self, msg) {
+  if (!self.ownerUserId || msg.from === self.id) return false;
+  return msg.by === self.ownerUserId;
+}
+
+// The owner in person: posting as themselves, or from the live session that takes their handle.
+export function fromOwnerInPerson(self, msg) {
+  return fromOwner(self, msg) && (msg.fromKind === 'user' || msg.from === self.ownerHandle);
 }
 
 // `self` as it works on this request: its getters read now, with the worktree (or the repos to choose from) added.
-export const view = (self, extra) => ({ id: self.id, owner: self.owner, ownerHandle: self.ownerHandle, description: self.description,
+export const view = (self, extra) => ({ id: self.id, owner: self.owner, ownerHandle: self.ownerHandle, ownerUserId: self.ownerUserId, description: self.description,
   backend: self.backend, cwd: self.cwd, write: self.write, model: self.model, approved: self.approved, standIn: self.standIn, ...extra });
 
 const firstLine = (text) => (String(text).replace(/^(\s*[,:;]*\s*@[a-zA-Z][\w-]*)+[\s,:;]*/, '').split('\n').map((l) => l.trim()).find(Boolean) || 'Change requested over Backchannel').slice(0, 72);
@@ -154,7 +160,7 @@ export async function answer(hub, self, msg, log = () => {}) {
 
   // The owner answering what this agent asked them: finish the original request, for whoever asked it.
   const pending = self.waiting?.get(msg.threadId);
-  const ownerAnswer = !!pending && fromOwner(self, msg.from, agents);
+  const ownerAnswer = !!pending && fromOwner(self, msg);
   const request = (ownerAnswer && thread.find((m) => m.id === pending.requestId)) || msg;
 
   // Write requests get a worktree in the repo they're about; without one they're answered read-only.
@@ -172,7 +178,7 @@ export async function answer(hub, self, msg, log = () => {}) {
     }
   }
 
-  const lead = ownerAnswer ? `${msg.from === self.ownerHandle ? 'Your owner' : `Your owner's agent`} @${msg.from} answered the question you asked them (the new message below). Now finish @${request.from}'s original request (message ${request.id}); your reply goes to @${request.from}.\n\n` : '';
+  const lead = ownerAnswer ? `${fromOwnerInPerson(self, msg) ? 'Your owner' : `Your owner's agent`} @${msg.from} answered the question you asked them (the new message below). Now finish @${request.from}'s original request (message ${request.id}); your reply goes to @${request.from}.\n\n` : '';
   const out = session
     ? await session.ask(msg.threadId, (seen) => lead + turnPrompt(me, agents, thread, msg, local, seen))
     : await run({

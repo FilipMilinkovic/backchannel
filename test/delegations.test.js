@@ -8,6 +8,7 @@ import readline from 'node:readline';
 import { spawn, spawnSync } from 'node:child_process';
 import { startHub, tempDir, prefix, delay, ROOT, until, signedIn, connector, ask, gitRepo, FAKE, BIN } from './helpers.js';
 import { debtsOf, present } from '../server/threads.js';
+import { fromOwner, fromOwnerInPerson } from '../responder.js';
 
 // An MCP server over stdio (mcp.js or tools.js), driven like a client would.
 function mcpServer(t, script, { cwd, env }) {
@@ -247,4 +248,23 @@ test('backchannel ask --repo asks whichever agent works in that repository', asy
   assert.match(r.stderr, /Asking @maya-claude, which works in payments\.\nSent to @maya-claude/);
   const [msg] = (await h.ok(prefix(maya) + '/messages', maya.token)).slice(-1);
   assert.deepEqual([msg.text, msg.repo], ['@maya-claude How do refunds work?', 'payments']);
+});
+
+test("a connector knows its owner by the account a message came from, not by the handle it shows", () => {
+  const self = { id: 'maya-claude', ownerHandle: 'maya', ownerUserId: 'u-maya' };
+  const msg = (from, fromKind, by) => ({ from, fromKind, by });
+  // The owner in person, or their live session (which takes their handle).
+  assert.equal(fromOwner(self, msg('maya', 'user', 'u-maya')), true);
+  assert.equal(fromOwnerInPerson(self, msg('maya', 'user', 'u-maya')), true);
+  assert.equal(fromOwnerInPerson(self, msg('maya', 'agent', 'u-maya')), true);
+  // Another of the owner's agents answers for them, but isn't the owner in person.
+  assert.equal(fromOwner(self, msg('maya-codex', 'agent', 'u-maya')), true);
+  assert.equal(fromOwnerInPerson(self, msg('maya-codex', 'agent', 'u-maya')), false);
+  // Someone else's agent named like the owner, or a message with no account (older hubs), is not the owner.
+  assert.equal(fromOwner(self, msg('maya', 'agent', 'u-mallory')), false);
+  assert.equal(fromOwnerInPerson(self, msg('maya', 'agent', 'u-mallory')), false);
+  assert.equal(fromOwner(self, msg('maya', 'user', undefined)), false);
+  // Its own messages, and an agent that doesn't know its owner's account yet, never count.
+  assert.equal(fromOwner(self, msg('maya-claude', 'agent', 'u-maya')), false);
+  assert.equal(fromOwner({ ...self, ownerUserId: null }, msg('maya', 'user', 'u-maya')), false);
 });
