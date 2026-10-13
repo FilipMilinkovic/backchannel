@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { openDb } from '../server/db.js';
 import { createRepo } from '../server/repo.js';
 import { authenticate, hashToken, newToken } from '../server/auth.js';
@@ -371,6 +372,78 @@ test('scoped tokens run only their own agents, message only who they may, and re
   assert.equal((await h.api(`/api/me/scoped-tokens/${id}`, steve.token, 'DELETE')).status, 404);
   await h.ok('/api/me/token', steve.token, 'POST');
   assert.equal((await h.api('/api/me', wide)).status, 401);
+});
+
+test('a scoped token stays clear of its account: its prefix, agents it registered, budgets of its own, no expiry', async (t) => {
+  const h = await startHub(t, null, { RATE_READS_PER_MIN: '40', MAX_STREAMS_PER_USER: '1' });
+  const steve = await h.bootstrap('steve');
+  const p = prefix(steve);
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'steve', kind: 'session' });
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'cw-old' });
+  const make = (agents) => h.api('/api/me/scoped-tokens', steve.token, 'POST', { team: steve.team.id, agents, postTo: ['steve'] });
+
+  // The prefix can't reach the account's handle or the agents it already runs.
+  assert.deepEqual((await make('ste')).body.error, 'the prefix "ste" covers your own handle @steve; pick one that doesn\'t, e.g. "cw-"');
+  assert.deepEqual((await make('cw-')).body.error, 'the prefix "cw-" covers agents you already run (@cw-old); pick another');
+  const a = (await make('bot-')).body.token;
+  const b = (await make('bot-')).body.token; // made before any bot- agent exists
+
+  // A token uses only agents it registered: not another token's, not one a full sign-in registered under its prefix.
+  await h.ok(p + '/agents', a, 'POST', { id: 'bot-a', kind: 'session' });
+  for (const [token, method, route, body] of [[b, 'POST', '/agents', { id: 'bot-a' }], [b, 'GET', '/agents/bot-a/pending'], [b, 'DELETE', '/agents/bot-a']]) {
+    const r = await h.api(p + route, token, method, body);
+    assert.deepEqual([r.status, r.body.error], [403, 'this token can only use agents it registered'], `${method} ${route}`);
+  }
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'bot-manual' });
+  for (const [method, route, body] of [['GET', '/agents/bot-manual/pending'], ['POST', '/agents/bot-manual/claim', { ids: [] }],
+    ['DELETE', '/agents/bot-manual'], ['POST', '/agents', { id: 'bot-manual' }], ['POST', '/messages', { from: 'bot-manual', text: '@steve hi' }]]) {
+    assert.equal((await h.api(p + route, a, method, body)).status, 403, `${method} ${route}`);
+  }
+  const listed = await h.ok(p + '/agents', steve.token);
+  assert.equal(listed.find((x) => x.id === 'bot-a').scoped, true);
+  assert.equal(listed.find((x) => x.id === 'bot-manual').scoped, undefined);
+  assert.ok(listed.every((x) => !('scopedBy' in x)), 'the token id stays on the hub');
+  // A full sign-in registering it again takes it back.
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'bot-a' });
+  assert.equal((await h.api(p + '/agents/bot-a/pending', a)).status, 403);
+  await h.ok(p + '/agents', a, 'POST', { id: 'bot-a2', kind: 'session' });
+
+  // It reads only its own agents' threads, reports work only on those, and always addresses someone.
+  const theirs = await h.ok(p + '/messages', steve.token, 'POST', { text: '@bot-manual hi' });
+  const mine = await h.ok(p + '/messages', a, 'POST', { from: 'bot-a2', text: '@steve hello' });
+  assert.deepEqual((await h.ok(p + '/threads', a)).map((x) => x.id), [mine.threadId]);
+  assert.equal((await h.api(p + '/agents/bot-a2/status', a, 'POST', { state: 'working', threadId: mine.threadId })).status, 200);
+  assert.equal((await h.api(p + '/agents/bot-a2/status', a, 'POST', { state: 'working', threadId: theirs.threadId })).status, 404);
+  const nobody = await h.api(p + '/messages', a, 'POST', { from: 'bot-a2', text: 'to nobody' });
+  assert.deepEqual([nobody.status, nobody.body.error], [400, "a scoped token's message must be addressed to someone it may message"]);
+
+  // Open long polls are counted per token: the token's one doesn't take the account's (cap 1 here).
+  const held = http.get(`${h.base}${p}/agents/bot-a2/pending?wait=30`, { headers: { authorization: `Bearer ${a}` } });
+  held.on('error', () => {});
+  await delay(100);
+  assert.equal((await h.api(p + '/agents/cw-old/pending?wait=1', steve.token)).status, 200, "the account's own poll still gets through");
+  assert.equal((await h.api(p + '/agents/bot-a2/pending?wait=1', a)).status, 429, "the token's second one doesn't");
+  held.destroy();
+  // So are reads: using up the token's budget leaves the account's alone.
+  let limited = false;
+  for (let i = 0; i < 45 && !limited; i++) limited = (await h.api('/api/me', a)).status === 429;
+  assert.ok(limited, 'the token hits its own read limit');
+  assert.equal((await h.api('/api/me', steve.token)).status, 200);
+
+  // Unused sign-ins expire; scoped tokens last until revoked, and the hourly sweep keeps them too.
+  const link = await h.ok('/api/me/login-link', steve.token, 'POST', {});
+  const cli = (await h.ok(`/api/login/${link.code}`, null, 'POST', { kind: 'cli' })).token;
+  const db = new DatabaseSync(path.join(h.dir, 'backchannel.db'));
+  db.exec('UPDATE sessions SET last_used_at = 0');
+  db.close();
+  assert.equal((await h.api('/api/me', cli)).status, 401, 'an idle sign-in expires');
+  assert.equal((await h.api('/api/me', b)).status, 200, 'an idle scoped token does not');
+  const sweep = createRepo(openDb(tempDir(t)));
+  const u = sweep.createUser({ handle: 'u', name: 'u', tokenHash: 'h' });
+  sweep.createSession(u.id, 's1', 'browser');
+  sweep.createSession(u.id, 's2', 'ci', 'cli', { team: 't', agents: 'ci-', postTo: ['u'], read: 'own' });
+  assert.equal(sweep.pruneSessions(Date.now() + 1), 1);
+  assert.deepEqual(sweep.scopedTokens(u.id).map((x) => x.label), ['ci']);
 });
 
 test('agent profiles carry repos, machine and approval details without credentials', async (t) => {

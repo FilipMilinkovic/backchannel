@@ -334,6 +334,13 @@ It can't rotate your token, sign in a browser, make more tokens, join teams, inv
 settings, or change anyone's stand-in. Messages it posts are marked as scoped, so your connectors never mistake them
 for you.
 
+- **Its agents are its own.** It can use only agents it registered itself, never your other agents, even ones under
+  the same prefix. The prefix can't cover your handle or agents you already run.
+- **Its own budgets.** Rate limits and open long polls are counted per scoped token, so automation can't use up
+  yours. (Messages to your own agents still don't count against the hourly request quota.)
+- **No expiry.** Unlike sign-ins, a scoped token doesn't lapse when unused: revoke it when the automation is retired.
+  Rotating your main token revokes them all.
+
 ```bash
 backchannel scoped-token create --agents cw- --post-to steve --label "cloud workers"   # prints the token once
 backchannel scoped-token list

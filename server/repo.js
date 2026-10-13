@@ -60,7 +60,8 @@ export function createRepo(db) {
     deleteScopedToken: (userId, id) => run('DELETE FROM sessions WHERE user_id = ? AND scopes IS NOT NULL AND substr(hash, 1, 16) = ?', userId, id).changes,
     touchSession: (hash, at) => run('UPDATE sessions SET last_used_at = ? WHERE hash = ?', at, hash),
     deleteSession: (hash) => run('DELETE FROM sessions WHERE hash = ?', hash),
-    pruneSessions: (usedBefore) => run('DELETE FROM sessions WHERE last_used_at < ?', usedBefore).changes,
+    // Scoped tokens are kept: they last until revoked.
+    pruneSessions: (usedBefore) => run('DELETE FROM sessions WHERE last_used_at < ? AND scopes IS NULL', usedBefore).changes,
 
     // One-time sign-in codes are stored hashed; taking one deletes it.
     createLoginCode: (codeHash, userId, expiresAt) => {
@@ -177,7 +178,8 @@ export function createRepo(db) {
     file: (teamId, id) => get(`SELECT id, name, type, size, sha256, uploaded_by AS uploadedBy, created_at AS createdAt
       FROM files WHERE team_id = ? AND id = ?`, teamId, id),
     fileData: (teamId, id) => get('SELECT data FROM files WHERE team_id = ? AND id = ?', teamId, id)?.data,
-    // Threads a file is attached in (a scoped token may read a file only through a thread it can read).
+    // Threads a file is attached in (a scoped token may read a file only through a thread it can read). Scans the
+    // team's messages; fine at today's sizes, and the place for an index on attachments if that changes.
     fileThreadIds: (teamId, fileId) => all(`SELECT DISTINCT m.thread_id AS id FROM messages m, json_each(json_extract(m.body, '$.files')) f
       WHERE m.team_id = ? AND json_extract(f.value, '$.id') = ?`, teamId, fileId).map((r) => r.id),
     teamFileBytes: (teamId) => get('SELECT coalesce(sum(size), 0) AS n FROM files WHERE team_id = ?', teamId).n,

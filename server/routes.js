@@ -30,9 +30,9 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   const publicTeam = (team, userId) => ({ id: team.id, name: team.name, role: repo.member(team.id, userId)?.role,
     maxHops: team.maxHops, members: members(team.id) });
   const teamConfig = (team) => ({ name: team.name, maxHops: team.maxHops, tokenRequired: true });
-  function publicAgent(a) {
+  function publicAgent({ scopedBy, ...a }) {
     const p = rt.presenceOf(a.teamId, a.id);
-    return { ...a, state: p.state, stateThread: p.stateThread, lastSeen: p.lastSeen,
+    return { ...a, ...(scopedBy ? { scoped: true } : {}), state: p.state, stateThread: p.stateThread, lastSeen: p.lastSeen,
       ownerHandle: a.ownerUserId ? repo.userById(a.ownerUserId)?.handle || null : null, online: rt.online(p),
       ...(a.kind === 'session' ? { standIn: repo.standIn(a.teamId, a.id) } : {}) };
   }
@@ -104,12 +104,14 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     return agent;
   }
 
-  // What a scoped token may read in `team`: every thread (read: 'team'), or only those its own agents took part in.
-  function scopeFor(team, user, scopes) {
-    if (scopes.read === 'team') return { scopes, canReadRow: () => true, canRead: () => true };
-    let own = null; // the account's agents under the prefix, looked up once per request
+  // A scoped token in `team`. Its agents are the ones it registered itself (`scopedBy` is the token's id), never the
+  // account's other agents, even under the same prefix. It reads every thread (read: 'team') or only its agents'.
+  function scopeFor(team, user, scopes, tokenId) {
+    const owns = (a) => !!a && a.ownerUserId === user.id && a.scopedBy === tokenId && ownsHandle(scopes, a.id);
+    if (scopes.read === 'team') return { scopes, tokenId, owns, canReadRow: () => true, canRead: () => true };
+    let own = null; // its agents, looked up once per request
     const canReadRow = (row) => {
-      own ||= new Set(repo.agentIdsOf(team.id, user.id).filter((id) => ownsHandle(scopes, id)));
+      own ||= new Set(repo.agents(team.id).filter(owns).map((a) => a.id));
       return row.participants.some((h) => own.has(h));
     };
     const seen = new Map();
@@ -117,7 +119,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       if (!seen.has(threadId)) { const row = repo.thread(team.id, threadId); seen.set(threadId, !!row && canReadRow(row)); }
       return seen.get(threadId);
     };
-    return { scopes, canReadRow, canRead };
+    return { scopes, tokenId, owns, canReadRow, canRead };
   }
 
   // ---------- messages ----------
@@ -139,7 +141,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const fromKind = b.from === undefined ? 'user' : 'agent';
     const from = fromKind === 'user' ? user.handle : String(b.from).toLowerCase();
     if (fromKind === 'agent') ownedAgent(team, user, from);
-    if (scope && (fromKind !== 'agent' || !ownsHandle(scope.scopes, from))) {
+    if (scope && (fromKind !== 'agent' || !scope.owns(repo.agent(team.id, from)))) {
       throw httpError(403, `this token posts only as its own agents (${scope.scopes.agents}…)`);
     }
     if (b.to !== undefined && (!Array.isArray(b.to) || b.to.length > 50 || b.to.some((id) => typeof id !== 'string' || !HANDLE.test(id.toLowerCase())))) {
@@ -190,6 +192,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       if (msg.to.some((id) => !scope.scopes.postTo.includes(id))) {
         throw httpError(403, `this token can only message ${scope.scopes.postTo.map((h) => '@' + h).join(', ')}`);
       }
+      if (!msg.to.length) throw httpError(400, 'a scoped token\'s message must be addressed to someone it may message');
       // Marks it for connectors: posted by the account, but not by its owner in person (responder.js fromOwner).
       msg.scoped = true;
     }
@@ -261,7 +264,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     res.on('close', () => { if (!res.writableFinished) { gone = true; restore(); } });
     box = repo.takeInbox(team.id, id, leaseMs);
     if (!box.length && wait && !gone && !draining()) {
-      const release = limits.streams.acquire(auth.user.id);
+      const release = limits.streams.acquire(limitKey(auth));
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (gone) return;
       if (draining()) return send(res, 200, []);
@@ -283,7 +286,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const { p, wait } = checkIn(ctx);
     let box = repo.peekInbox(team.id, id);
     if (!box.some((r) => r.seq > after) && wait && !res.destroyed && !draining()) {
-      const release = limits.streams.acquire(auth.user.id);
+      const release = limits.streams.acquire(limitKey(auth));
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (res.destroyed) return;
       if (!draining()) recheck(ctx, p);
@@ -293,6 +296,10 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     // The stand-in setting rides along, so a change in the UI reaches the session within one poll.
     send(res, 200, { cursor: Math.max(after, ...box.map((r) => r.seq)), messages: box.map((r) => r.message), standIn: repo.standIn(team.id, id) });
   }
+
+  // Rate limits and open long polls are counted per person, except that each scoped token has budgets of its own,
+  // so automation running on someone's account can't use up theirs.
+  const limitKey = (auth) => (auth.scopes ? `token:${auth.sessionHash}` : `user:${auth.user.id}`);
 
   // ---------- routes ----------
   // ctx: { req, res, url, path, readBody, draining }
@@ -305,7 +312,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     if (isPublic) limits.public.take(`ip:${ctx.ip}`);
     // Authenticate before reading bodies, then again after the await to honor revocations.
     let auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
-    if (auth) (req.method === 'GET' ? limits.reads : limits.writes).take(`user:${auth.user.id}`);
+    if (auth) (req.method === 'GET' ? limits.reads : limits.writes).take(limitKey(auth));
     const upload = req.method === 'POST' && FILE_PATH.test(p); // raw bytes, read once the team and role are checked
     const b = ['POST', 'PATCH'].includes(req.method) && !upload ? await ctx.readBody() : {};
     auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
@@ -374,7 +381,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     }
     // Scoped tokens, for automation (server/scopes.js). Only a full sign-in can make, list or revoke them.
     if (p === '/api/me/scoped-tokens' && req.method === 'POST') {
-      const wanted = parseScopes(b, repo.teamsForUser(user.id));
+      const wanted = parseScopes(b, repo.teamsForUser(user.id), { handle: user.handle, agentIdsIn: (teamId) => repo.agentIdsOf(teamId, user.id) });
       if (repo.scopedTokens(user.id).length >= MAX_SCOPED_TOKENS) throw httpError(409, `you have ${MAX_SCOPED_TOKENS} scoped tokens; revoke one first`);
       const label = typeof b.label === 'string' && b.label.trim() ? b.label.trim().slice(0, 60) : 'scoped token';
       const token = newToken();
@@ -426,11 +433,11 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const rest = route[2] || '/';
     let m;
     // A scoped token: only the routes it's allowed (server/scopes.js), as its own agents, reading what it may read.
-    const scope = scopes && scopeFor(team, user, scopes);
+    const scope = scopes && scopeFor(team, user, scopes, auth.sessionHash.slice(0, 16));
     if (scope) {
       const { agent } = scopedRoute(scopes, req.method, rest);
       const acting = agent && repo.agent(team.id, agent);
-      if (acting && acting.ownerUserId !== user.id) throw httpError(403, 'agent belongs to another user');
+      if (acting && !scope.owns(acting)) throw httpError(403, 'this token can only use agents it registered');
     }
 
     if (rest === '/' && req.method === 'GET') return send(res, 200, publicTeam(team, user.id));
@@ -499,6 +506,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       if (scope && !ownsHandle(scopes, id)) throw httpError(403, `this token only runs agents named ${scopes.agents}…`);
       const prev = repo.agent(team.id, id);
       if (prev && prev.ownerUserId !== user.id) throw httpError(409, 'agent belongs to another user');
+      if (scope && prev && !scope.owns(prev)) throw httpError(403, 'this token can only use agents it registered');
       // A person's handle is theirs: as an agent id it would pass for them in threads, and to older connectors, which match their owner by handle.
       const person = repo.userByHandle(id);
       if (person && person.id !== user.id) throw httpError(409, `@${id} is someone's handle; pick another id`);
@@ -519,6 +527,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         repos, workdir: str(b.workdir, 500), host: str(b.host, 100), platform: str(b.platform, 40), client: str(b.client, 40),
         approve: typeof b.approve === 'boolean' ? b.approve : null, persistent: b.persistent === true, service: b.service === true,
         connectedAt: Date.now(),
+        // Which scoped token runs it, if one does (registering again with a full sign-in takes it back).
+        ...(scope ? { scopedBy: scope.tokenId } : {}),
         registeredAt: prev?.registeredAt || Date.now() };
       repo.tx(() => { repo.clearDisconnect(team.id, id); repo.saveAgent(agent); });
       rt.presenceOf(team.id, id).lastSeen = Date.now();
@@ -578,6 +588,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
           return send(res, 200, { requeued: back.length });
         }
         if (b.threadId && (typeof b.threadId !== 'string' || !repo.threadExists(team.id, b.threadId))) throw httpError(404, 'unknown thread');
+        if (b.threadId && scope && !scope.canRead(b.threadId)) throw httpError(404, 'unknown thread');
         const pr = rt.presenceOf(team.id, a.id);
         pr.state = ['working', 'approval'].includes(b.state) ? b.state : 'idle';
         pr.stateThread = pr.state === 'idle' ? null : b.threadId || null;

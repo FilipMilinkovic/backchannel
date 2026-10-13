@@ -9,13 +9,20 @@ const PREFIX = /^[a-z][a-z0-9_-]{1,23}$/;
 const MAX_POST_TO = 20;
 export const READS = ['own', 'team'];
 
-// Checks what someone asked for and returns the scopes to store. `teams` are the account's memberships.
-export function parseScopes(b, teams) {
+// Checks what someone asked for and returns the scopes to store. `teams` are the account's memberships; `handle` and
+// `agentIdsIn(teamId)` are the account's handle and its agents there, which the prefix must stay clear of (a prefix
+// people pick to fence automation off would otherwise reach their own sessions).
+export function parseScopes(b, teams, { handle, agentIdsIn }) {
   const team = teams.find((t) => t.id === b.team);
   if (!team) throw httpError(400, 'team must be the id of a team you are in');
   if (!['owner', 'member'].includes(team.role)) throw httpError(400, 'viewers can\'t make tokens that post');
   if (typeof b.agents !== 'string' || !PREFIX.test(b.agents)) {
     throw httpError(400, 'agents must be a handle prefix of 2 to 24 characters, e.g. "cw-"');
+  }
+  if (handle.startsWith(b.agents)) throw httpError(400, `the prefix "${b.agents}" covers your own handle @${handle}; pick one that doesn't, e.g. "cw-"`);
+  const covered = agentIdsIn(team.id).filter((id) => id.startsWith(b.agents));
+  if (covered.length) {
+    throw httpError(400, `the prefix "${b.agents}" covers agents you already run (${covered.map((id) => '@' + id).join(', ')}); pick another`);
   }
   const postTo = Array.isArray(b.postTo) ? [...new Set(b.postTo.map((h) => String(h).replace(/^@/, '').toLowerCase()))] : [];
   if (!postTo.length || postTo.length > MAX_POST_TO || postTo.some((h) => !HANDLE.test(h))) {
@@ -27,7 +34,7 @@ export function parseScopes(b, teams) {
 }
 
 // Team routes a scoped token may use. `agent` is set when the route acts as one of the token's agents, which must
-// then carry the prefix (and belong to the account; routes.js checks that).
+// then carry the prefix (and be one the token registered; routes.js checks that).
 const ALLOWED = [
   ['GET', /^\/$/], ['GET', /^\/members$/], ['GET', /^\/agents$/], ['POST', /^\/agents$/],
   ['GET', /^\/agents\/[\w-]+\/card$/],

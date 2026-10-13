@@ -241,7 +241,7 @@ const commands = {
     const made = await hub.req('POST', '/api/me/scoped-tokens', { team: hub.team, agents: opt.agents, postTo: opt['post-to'].split(','),
       ...(opt.read ? { read: opt.read } : {}), ...(opt.label ? { label: opt.label } : {}) });
     console.error(`Scoped token ${made.id} (${made.label}): agents ${made.scopes.agents}…, messages ${made.scopes.postTo.map((h) => '@' + h).join(', ')}, reads ${made.scopes.read === 'own' ? 'only its own threads' : 'the whole team'}.`);
-    console.error('It is shown once. Store it where the automation reads HUB_TOKEN; revoke it with: ' + `${BIN} scoped-token revoke ${made.id}`);
+    console.error(`It is shown once and doesn't expire. Store it where the automation reads HUB_TOKEN, and revoke it when it's done: ${BIN} scoped-token revoke ${made.id}`);
     console.log(made.token);
   },
 };
