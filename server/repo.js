@@ -120,13 +120,16 @@ export function createRepo(db) {
       teamId, id, ownerUserId, JSON.stringify(card), registeredAt);
     },
     deleteAgent: (teamId, id) => run('DELETE FROM agents WHERE team_id = ? AND id = ?', teamId, id),
-    // Removes the agent and remembers who disconnected it, so its running process stops instead of re-registering.
+    // Removes the agent and remembers who disconnected it, so its running process stops instead of re-registering,
+    // and who owned it, so nobody else can take its handle.
     disconnectAgent: (teamId, id, byUserId) => db.tx(() => {
+      const ownerUserId = get('SELECT owner_user_id AS o FROM agents WHERE team_id = ? AND id = ?', teamId, id)?.o ?? null;
       run('DELETE FROM agents WHERE team_id = ? AND id = ?', teamId, id);
-      run(`INSERT INTO agent_disconnects (team_id, id, by_user_id, at) VALUES (?, ?, ?, ?)
-        ON CONFLICT (team_id, id) DO UPDATE SET by_user_id = excluded.by_user_id, at = excluded.at`, teamId, id, byUserId, Date.now());
+      run(`INSERT INTO agent_disconnects (team_id, id, by_user_id, at, owner_user_id) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (team_id, id) DO UPDATE SET by_user_id = excluded.by_user_id, at = excluded.at, owner_user_id = excluded.owner_user_id`,
+      teamId, id, byUserId, Date.now(), ownerUserId);
     }),
-    disconnected: (teamId, id) => get('SELECT by_user_id AS byUserId, at FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
+    disconnected: (teamId, id) => get('SELECT by_user_id AS byUserId, owner_user_id AS ownerUserId, at FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
     clearDisconnect: (teamId, id) => run('DELETE FROM agent_disconnects WHERE team_id = ? AND id = ?', teamId, id),
     // A live session's stand-in: 'read' unless its owner chose otherwise.
     standIn: (teamId, id) => get('SELECT stand_in AS v FROM agent_settings WHERE team_id = ? AND id = ?', teamId, id)?.v || 'read',

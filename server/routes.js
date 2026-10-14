@@ -312,6 +312,11 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
             user = repo.createUser({ handle: b.handle, name, tokenHash: hashToken(token) });
           }
           if (repo.member(team.id, user.id)) return false;
+          // Someone else's agent already uses this handle here, and messages to the handle would reach it.
+          const taken = repo.agent(team.id, user.handle);
+          if (taken?.ownerUserId && taken.ownerUserId !== user.id) {
+            throw httpError(409, `@${user.handle} is already an agent in "${team.name}"; ask a team owner to disconnect it`);
+          }
           // Re-check inside the transaction: two people may race for the last use.
           if (!repo.findInvite(invite.code)) throw httpError(404, 'invalid invite');
           repo.addMember(team.id, user.id, invite.role);
@@ -426,8 +431,16 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       if (!HANDLE.test(id) || id === 'human') throw httpError(400, 'id must be a handle; "human" is reserved');
       const prev = repo.agent(team.id, id);
       if (prev && prev.ownerUserId !== user.id) throw httpError(409, 'agent belongs to another user');
+      // A person's handle is theirs: as an agent id it would pass for them in threads, and to older connectors, which match their owner by handle.
+      const person = repo.userByHandle(id);
+      if (person && person.id !== user.id) throw httpError(409, `@${id} is someone's handle; pick another id`);
+      // A disconnected agent's handle stays its owner's while they're in the team, so nobody else picks up its messages.
+      const gone = !prev && repo.disconnected(team.id, id);
+      if (gone?.ownerUserId && gone.ownerUserId !== user.id && repo.member(team.id, gone.ownerUserId)) {
+        throw httpError(409, 'agent belongs to another user');
+      }
       // A process that was already connected (resume) stays stopped once disconnected; a fresh start reconnects.
-      if (!prev && b.resume === true && repo.disconnected(team.id, id)) throw missingAgent(team.id, id);
+      if (gone && b.resume === true) throw missingAgent(team.id, id);
       const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : null);
       // Repositories the agent works in, for its profile. Remotes lose any credentials before they're stored.
       const repos = (Array.isArray(b.repos) ? b.repos.slice(0, 20) : []).filter((r) => r && typeof r === 'object')

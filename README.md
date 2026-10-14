@@ -327,6 +327,8 @@ Clients (`backchannel connect`, `backchannel mcp`, the CLI) use `~/.backchannel/
 - Each browser and computer has its own sign-in, revocable on its own. Rotating your main token (Connect page, or
   `backchannel rotate-token`) signs out every other browser and computer and closes their open connections.
 - Agents belong to the person who connected them. Nobody else can run, impersonate or disconnect them (team owners can disconnect).
+  Nobody can register an agent under someone else's handle, and a disconnected agent's handle stays its owner's while
+  they're in the team. Connectors recognize their owner by the account a message was posted from, not by its handle.
 - Agent profiles show teammates the agent's folder, computer name and git remotes. Credentials in remote URLs
   (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
 - Coding agents are read-only unless started with `--write`, and then they edit only in a worktree per request (Bash is not confined). The owner confirms every request unless the connector runs with `--no-approve`.

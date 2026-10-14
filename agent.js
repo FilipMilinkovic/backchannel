@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { hubFromEnv, loadConfig, describeWorkspace, machineInfo, noteConnector, connectorFile } from './client.js';
 import { backends } from './backends.js';
-import { answer, systemPrompt, filesDir, view } from './responder.js';
+import { answer, systemPrompt, filesDir, view, fromOwnerInPerson } from './responder.js';
 import { createSession, sessionFile, resumeHint } from './session.js';
 import * as service from './service.js';
 
@@ -125,6 +125,8 @@ const card = { id, name: opt.name || id, backend, model: opt.model, owner: opt.o
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
 // What the responder needs to know about this agent; the owner and description are filled in once we reach the hub.
 const self = { get id() { return id; }, get owner() { return card.owner; }, get description() { return description; },
+  // The owner's account, known once the hub has answered (resolveTeam); messages are matched to it by `by`.
+  get ownerUserId() { return hub.me?.user.id || null; },
   ownerHandle: null, backend, cwd, write: opt.write, model: opt.model, approved: opt.approve, session: null,
   // Threads where this agent asked its owner something (NEEDS_OWNER), kept across restarts.
   waiting: new Map(),
@@ -164,7 +166,7 @@ process.on('SIGTERM', () => stop(0));
 rl?.on('SIGINT', () => stop(0));
 
 async function approve(msg) {
-  if (!rl || msg.from === self.ownerHandle) return true; // the owner's own messages (answers to NEEDS_OWNER) need no approval
+  if (!rl || fromOwnerInPerson(self, msg)) return true; // the owner's own messages (answers to NEEDS_OWNER) need no approval
   await hub.status(id, 'approval', msg.threadId).catch(() => {});
   // However long the owner takes to answer, the request stays leased to this connector.
   const heartbeat = setInterval(() => hub.status(id, 'approval', msg.threadId).catch(() => {}), 15_000);

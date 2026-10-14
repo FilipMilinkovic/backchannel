@@ -242,6 +242,40 @@ test('disconnect stops the running process; a fresh start reconnects', async (t)
   assert.equal((await h.api(p + '/agents/nobody/inbox', bob.token)).status, 404);
 });
 
+test("agent handles can't pass for a person or take over someone's disconnected agent", async (t) => {
+  const h = await startHub(t);
+  const owner = await h.bootstrap();
+  const bob = await h.join(owner, 'member', 'bob');
+  const mallory = await h.join(owner, 'member', 'mallory');
+  const p = prefix(owner);
+  // A person's handle is theirs alone, whether or not they have an agent by that name.
+  for (const id of ['bob', 'alice']) {
+    const taken = await h.api(p + '/agents', mallory.token, 'POST', { id });
+    assert.equal(taken.status, 409, id);
+    assert.equal(taken.body.error, `@${id} is someone's handle; pick another id`);
+  }
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bob', kind: 'session' }); // their own handle is fine
+  // Disconnected (by its owner or a team owner), the handle stays bob's; bob starting it again reconnects it.
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobbot' });
+  await h.ok(p + '/agents/bobbot', owner.token, 'DELETE');
+  assert.equal((await h.api(p + '/agents', mallory.token, 'POST', { id: 'bobbot' })).status, 409);
+  assert.equal((await h.api(p + '/agents', owner.token, 'POST', { id: 'bobbot' })).status, 409, 'team owners included');
+  assert.equal((await h.ok(p + '/agents', bob.token, 'POST', { id: 'bobbot' })).ownerHandle, 'bob');
+  await h.ok(p + '/agents/bobbot', bob.token, 'DELETE');
+  assert.equal((await h.api(p + '/agents', mallory.token, 'POST', { id: 'bobbot' })).status, 409);
+  // Once bob has left the team, the handle is free again.
+  await h.ok(`${p}/members/${bob.user.id}`, owner.token, 'DELETE');
+  await h.ok(p + '/agents', mallory.token, 'POST', { id: 'bobbot' });
+  // An agent named like a handle nobody has yet keeps that handle from joining the team, so it can't catch their messages.
+  await h.ok(p + '/agents', mallory.token, 'POST', { id: 'carol' });
+  const invite = await h.ok(p + '/invites', owner.token, 'POST', { role: 'member' });
+  const carol = await h.api(`/api/invites/${invite.code}/accept`, null, 'POST', { handle: 'carol' });
+  assert.equal(carol.status, 409);
+  assert.match(carol.body.error, /^@carol is already an agent in ".+"; ask a team owner to disconnect it$/);
+  assert.equal(query(h.dir, "SELECT count(*) AS n FROM users WHERE handle = 'carol'")[0].n, 0, 'the account is not created');
+  assert.equal((await h.ok(`/api/invites/${invite.code}`, null)).role, 'member', 'the invite is not used up');
+});
+
 test('agent profiles carry repos, machine and approval details without credentials', async (t) => {
   const h = await startHub(t);
   const owner = await h.bootstrap();
@@ -377,7 +411,7 @@ test('db: schema migrations, setup invite reuse and expiry', (t) => {
   const dir = tempDir(t);
   const db = openDb(dir);
   const repo = createRepo(db);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   const setup = repo.setupInvite();
   assert.equal(setup.role, 'owner'); assert.equal(setup.createdBy, null);
