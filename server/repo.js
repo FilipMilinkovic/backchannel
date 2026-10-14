@@ -31,7 +31,7 @@ export function createRepo(db) {
     userById: (id) => get(`${USER} WHERE id = ?`, id),
     userByHandle: (handle) => get(`${USER} WHERE handle = ?`, handle),
     userByTokenHash: (hash) => get(`${USER} WHERE token_hash = ?`, hash),
-    sessionByHash: (hash) => get('SELECT hash, user_id AS userId, label, created_at AS createdAt, last_used_at AS lastUsedAt FROM sessions WHERE hash = ?', hash),
+    sessionByHash: (hash) => get('SELECT hash, user_id AS userId, label, scopes, created_at AS createdAt, last_used_at AS lastUsedAt FROM sessions WHERE hash = ?', hash),
     createUser({ handle, name, tokenHash }) {
       const user = { id: newId(), handle, name, tokenHash, createdAt: Date.now() };
       run('INSERT INTO users (id, handle, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)', user.id, handle, name, tokenHash, user.createdAt);
@@ -44,16 +44,24 @@ export function createRepo(db) {
       run('DELETE FROM login_codes WHERE user_id = ?', userId);
     }),
     // Browsers and computers (`backchannel login`) are capped separately, and the least recently used one goes first,
-    // so opening many browsers never signs out a computer that runs connectors.
-    createSession: (userId, hash, label, kind = 'browser') => db.tx(() => {
+    // so opening many browsers never signs out a computer that runs connectors. Scoped tokens are never pushed out:
+    // they're capped when they're made (MAX_SCOPED_TOKENS), and automation would break without warning.
+    createSession: (userId, hash, label, kind = 'browser', scopes = null) => db.tx(() => {
       const now = Date.now();
-      run('INSERT INTO sessions (hash, user_id, label, kind, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?)', hash, userId, label, kind, now, now);
-      run(`DELETE FROM sessions WHERE user_id = ? AND kind = ? AND hash NOT IN
-             (SELECT hash FROM sessions WHERE user_id = ? AND kind = ? ORDER BY last_used_at DESC, rowid DESC LIMIT ${MAX_SESSIONS})`, userId, kind, userId, kind);
+      run('INSERT INTO sessions (hash, user_id, label, kind, created_at, last_used_at, scopes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        hash, userId, label, kind, now, now, scopes && JSON.stringify(scopes));
+      if (scopes) return;
+      run(`DELETE FROM sessions WHERE user_id = ? AND kind = ? AND scopes IS NULL AND hash NOT IN
+             (SELECT hash FROM sessions WHERE user_id = ? AND kind = ? AND scopes IS NULL ORDER BY last_used_at DESC, rowid DESC LIMIT ${MAX_SESSIONS})`, userId, kind, userId, kind);
     }),
+    // An account's scoped tokens, by their public id (the first 16 characters of the stored hash).
+    scopedTokens: (userId) => all(`SELECT substr(hash, 1, 16) AS id, label, scopes, created_at AS createdAt, last_used_at AS lastUsedAt
+      FROM sessions WHERE user_id = ? AND scopes IS NOT NULL ORDER BY created_at, rowid`, userId).map((r) => ({ ...r, scopes: JSON.parse(r.scopes) })),
+    deleteScopedToken: (userId, id) => run('DELETE FROM sessions WHERE user_id = ? AND scopes IS NOT NULL AND substr(hash, 1, 16) = ?', userId, id).changes,
     touchSession: (hash, at) => run('UPDATE sessions SET last_used_at = ? WHERE hash = ?', at, hash),
     deleteSession: (hash) => run('DELETE FROM sessions WHERE hash = ?', hash),
-    pruneSessions: (usedBefore) => run('DELETE FROM sessions WHERE last_used_at < ?', usedBefore).changes,
+    // Scoped tokens are kept: they last until revoked.
+    pruneSessions: (usedBefore) => run('DELETE FROM sessions WHERE last_used_at < ? AND scopes IS NULL', usedBefore).changes,
 
     // One-time sign-in codes are stored hashed; taking one deletes it.
     createLoginCode: (codeHash, userId, expiresAt) => {
@@ -170,6 +178,10 @@ export function createRepo(db) {
     file: (teamId, id) => get(`SELECT id, name, type, size, sha256, uploaded_by AS uploadedBy, created_at AS createdAt
       FROM files WHERE team_id = ? AND id = ?`, teamId, id),
     fileData: (teamId, id) => get('SELECT data FROM files WHERE team_id = ? AND id = ?', teamId, id)?.data,
+    // Threads a file is attached in (a scoped token may read a file only through a thread it can read). Scans the
+    // team's messages; fine at today's sizes, and the place for an index on attachments if that changes.
+    fileThreadIds: (teamId, fileId) => all(`SELECT DISTINCT m.thread_id AS id FROM messages m, json_each(json_extract(m.body, '$.files')) f
+      WHERE m.team_id = ? AND json_extract(f.value, '$.id') = ?`, teamId, fileId).map((r) => r.id),
     teamFileBytes: (teamId) => get('SELECT coalesce(sum(size), 0) AS n FROM files WHERE team_id = ?', teamId).n,
 
     // Inboxes are delivered in the order messages were posted. A no-op if the agent is gone.

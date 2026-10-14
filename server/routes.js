@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { HANDLE, ROLES, newId, newToken, hashToken, publicUser, httpError, authenticate, stillValid, requireRole } from './auth.js';
 import { cleanRemote } from './util.js';
 import { buildThread, present } from './threads.js';
+import { parseScopes, scopedRoute, ownsHandle, MAX_SCOPED_TOKENS } from './scopes.js';
 
 const LOGIN_TTL_MS = 60_000;
 // After this many takes that never got an answer or an acknowledgement, a message is dropped from the inbox.
@@ -29,9 +30,9 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
   const publicTeam = (team, userId) => ({ id: team.id, name: team.name, role: repo.member(team.id, userId)?.role,
     maxHops: team.maxHops, members: members(team.id) });
   const teamConfig = (team) => ({ name: team.name, maxHops: team.maxHops, tokenRequired: true });
-  function publicAgent(a) {
+  function publicAgent({ scopedBy, ...a }) {
     const p = rt.presenceOf(a.teamId, a.id);
-    return { ...a, state: p.state, stateThread: p.stateThread, lastSeen: p.lastSeen,
+    return { ...a, ...(scopedBy ? { scoped: true } : {}), state: p.state, stateThread: p.stateThread, lastSeen: p.lastSeen,
       ownerHandle: a.ownerUserId ? repo.userById(a.ownerUserId)?.handle || null : null, online: rt.online(p),
       ...(a.kind === 'session' ? { standIn: repo.standIn(a.teamId, a.id) } : {}) };
   }
@@ -103,6 +104,24 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     return agent;
   }
 
+  // A scoped token in `team`. Its agents are the ones it registered itself (`scopedBy` is the token's id), never the
+  // account's other agents, even under the same prefix. It reads every thread (read: 'team') or only its agents'.
+  function scopeFor(team, user, scopes, tokenId) {
+    const owns = (a) => !!a && a.ownerUserId === user.id && a.scopedBy === tokenId && ownsHandle(scopes, a.id);
+    if (scopes.read === 'team') return { scopes, tokenId, owns, canReadRow: () => true, canRead: () => true };
+    let own = null; // its agents, looked up once per request
+    const canReadRow = (row) => {
+      own ||= new Set(repo.agents(team.id).filter(owns).map((a) => a.id));
+      return row.participants.some((h) => own.has(h));
+    };
+    const seen = new Map();
+    const canRead = (threadId) => {
+      if (!seen.has(threadId)) { const row = repo.thread(team.id, threadId); seen.set(threadId, !!row && canReadRow(row)); }
+      return seen.get(threadId);
+    };
+    return { scopes, tokenId, owns, canReadRow, canRead };
+  }
+
   // ---------- messages ----------
   function leadingMentions(text) {
     const out = [];
@@ -111,7 +130,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     while ((m = rest.match(re))) { out.push(m[1].toLowerCase()); rest = rest.slice(m[0].length); }
     return [...new Set(out)];
   }
-  function postMessage(team, user, b) {
+  // `scope` is set for scoped tokens: { scopes, canRead(threadId) }.
+  function postMessage(team, user, b, scope = null) {
     if (typeof b.text !== 'string' || !b.text.trim()) throw httpError(400, 'text is required');
     if (b.text.length > 200_000) throw httpError(413, 'text is too long (max 200000 characters)');
     if (b.title !== undefined && (typeof b.title !== 'string' || b.title.trim().length > 120)) {
@@ -121,6 +141,9 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const fromKind = b.from === undefined ? 'user' : 'agent';
     const from = fromKind === 'user' ? user.handle : String(b.from).toLowerCase();
     if (fromKind === 'agent') ownedAgent(team, user, from);
+    if (scope && (fromKind !== 'agent' || !scope.owns(repo.agent(team.id, from)))) {
+      throw httpError(403, `this token posts only as its own agents (${scope.scopes.agents}…)`);
+    }
     if (b.to !== undefined && (!Array.isArray(b.to) || b.to.length > 50 || b.to.some((id) => typeof id !== 'string' || !HANDLE.test(id.toLowerCase())))) {
       throw httpError(400, 'to must be an array of handles');
     }
@@ -135,6 +158,9 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const thread = b.threadId ? repo.threadMessages(team.id, b.threadId) : null;
     if (b.threadId && !thread.length) throw httpError(404, 'unknown thread');
     if (parent && b.threadId && parent.threadId !== b.threadId) throw httpError(400, 'parent is in another thread');
+    // A scoped token writes only into threads it can read.
+    const into = b.threadId || parent?.threadId;
+    if (scope && into && !scope.canRead(into)) throw httpError(404, b.threadId ? 'unknown thread' : 'unknown parent message');
     if (!parent && b.threadId) {
       parent = [...thread].reverse().find((m) => m.fromKind === 'agent'
         && repo.agent(team.id, m.from) && (fromKind !== 'agent' || m.from !== from)) || null;
@@ -162,6 +188,14 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     let recipients = Array.isArray(b.to) ? b.to.map((id) => id.toLowerCase()) : leadingMentions(text);
     if (!Array.isArray(b.to) && !recipients.length && parent?.fromKind === 'agent') recipients = [parent.from];
     msg.to = [...new Set(recipients)].filter((id) => fromKind !== 'agent' || id !== from);
+    if (scope) {
+      if (msg.to.some((id) => !scope.scopes.postTo.includes(id))) {
+        throw httpError(403, `this token can only message ${scope.scopes.postTo.map((h) => '@' + h).join(', ')}`);
+      }
+      if (!msg.to.length) throw httpError(400, 'a scoped token\'s message must be addressed to someone it may message');
+      // Marks it for connectors: posted by the account, but not by its owner in person (responder.js fromOwner).
+      msg.scoped = true;
+    }
     const targets = msg.to.filter((id) => repo.agent(team.id, id));
     if (msg.hop >= team.maxHops && targets.length) {
       msg.note = `hop limit (${team.maxHops}) reached; not delivered. Post a new message to continue.`;
@@ -230,7 +264,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     res.on('close', () => { if (!res.writableFinished) { gone = true; restore(); } });
     box = repo.takeInbox(team.id, id, leaseMs);
     if (!box.length && wait && !gone && !draining()) {
-      const release = limits.streams.acquire(auth.user.id);
+      const release = limits.streams.acquire(limitKey(auth));
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (gone) return;
       if (draining()) return send(res, 200, []);
@@ -252,7 +286,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const { p, wait } = checkIn(ctx);
     let box = repo.peekInbox(team.id, id);
     if (!box.some((r) => r.seq > after) && wait && !res.destroyed && !draining()) {
-      const release = limits.streams.acquire(auth.user.id);
+      const release = limits.streams.acquire(limitKey(auth));
       try { await rt.wait(team.id, id, wait, res); } finally { release(); }
       if (res.destroyed) return;
       if (!draining()) recheck(ctx, p);
@@ -262,6 +296,10 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     // The stand-in setting rides along, so a change in the UI reaches the session within one poll.
     send(res, 200, { cursor: Math.max(after, ...box.map((r) => r.seq)), messages: box.map((r) => r.message), standIn: repo.standIn(team.id, id) });
   }
+
+  // Rate limits and open long polls are counted per person, except that each scoped token has budgets of its own,
+  // so automation running on someone's account can't use up theirs.
+  const limitKey = (auth) => (auth.scopes ? `token:${auth.sessionHash}` : `user:${auth.user.id}`);
 
   // ---------- routes ----------
   // ctx: { req, res, url, path, readBody, draining }
@@ -274,12 +312,13 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     if (isPublic) limits.public.take(`ip:${ctx.ip}`);
     // Authenticate before reading bodies, then again after the await to honor revocations.
     let auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
-    if (auth) (req.method === 'GET' ? limits.reads : limits.writes).take(`user:${auth.user.id}`);
+    if (auth) (req.method === 'GET' ? limits.reads : limits.writes).take(limitKey(auth));
     const upload = req.method === 'POST' && FILE_PATH.test(p); // raw bytes, read once the team and role are checked
     const b = ['POST', 'PATCH'].includes(req.method) && !upload ? await ctx.readBody() : {};
     auth = authenticate(req, url, repo, { optional: isPublic, sessionDays });
     let user = auth?.user || null;
     ctx.userId = user?.id;
+    const scopes = auth?.scopes || null;
 
     // Exchange a one-time sign-in link for a browser session token.
     if (publicLogin && req.method === 'POST') {
@@ -302,6 +341,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         teamName: team.name, role: invite.role, invitedBy: invite.createdBy ? repo.userById(invite.createdBy)?.handle || null : null, expiresAt: invite.expiresAt,
       });
       if (publicInvite[2] && req.method === 'POST') {
+        if (scopes) throw httpError(403, "a scoped token can't join teams");
         let token;
         const joined = repo.tx(() => {
           if (!user) {
@@ -330,7 +370,33 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       throw httpError(404, 'no such endpoint');
     }
 
-    if (p === '/api/me' && req.method === 'GET') return send(res, 200, { user: publicUser(user), teams: repo.teamsForUser(user.id) });
+    if (p === '/api/me' && req.method === 'GET') {
+      const teams = repo.teamsForUser(user.id);
+      return send(res, 200, scopes ? { user: publicUser(user), teams: teams.filter((t) => t.id === scopes.team), scopes }
+        : { user: publicUser(user), teams });
+    }
+    // A scoped token uses its one team. Of the account it may only read who it is and sign itself out.
+    if (scopes && !p.startsWith('/api/teams/') && !(p === '/api/me/logout' && req.method === 'POST')) {
+      throw httpError(403, "this token is scoped and can't do that");
+    }
+    // Scoped tokens, for automation (server/scopes.js). Only a full sign-in can make, list or revoke them.
+    if (p === '/api/me/scoped-tokens' && req.method === 'POST') {
+      const wanted = parseScopes(b, repo.teamsForUser(user.id), { handle: user.handle, agentIdsIn: (teamId) => repo.agentIdsOf(teamId, user.id) });
+      if (repo.scopedTokens(user.id).length >= MAX_SCOPED_TOKENS) throw httpError(409, `you have ${MAX_SCOPED_TOKENS} scoped tokens; revoke one first`);
+      const label = typeof b.label === 'string' && b.label.trim() ? b.label.trim().slice(0, 60) : 'scoped token';
+      const token = newToken();
+      const hash = hashToken(token);
+      repo.createSession(user.id, hash, label, 'cli', wanted);
+      return send(res, 200, { token, id: hash.slice(0, 16), label, scopes: wanted });
+    }
+    if (p === '/api/me/scoped-tokens' && req.method === 'GET') return send(res, 200, repo.scopedTokens(user.id));
+    const revoke = /^\/api\/me\/scoped-tokens\/([a-f0-9]{16})$/.exec(p);
+    if (revoke && req.method === 'DELETE') {
+      if (!repo.deleteScopedToken(user.id, revoke[1])) throw httpError(404, 'unknown scoped token');
+      // Its long polls re-check their credential and end.
+      rt.wakeIf(ownedBy(user.id));
+      return send(res, 200, { ok: true });
+    }
     if (p === '/api/me/login-link' && req.method === 'POST') {
       // 60 seconds by default (`backchannel open`); up to 10 minutes for setting up another computer.
       const ttl = b.expiresInSeconds === undefined ? LOGIN_TTL_MS / 1000 : b.expiresInSeconds;
@@ -363,8 +429,16 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     const team = route && repo.teamById(route[1]);
     const member = team && repo.member(team.id, user.id);
     if (!member) throw httpError(404, 'unknown team');
+    if (scopes && scopes.team !== team.id) throw httpError(404, 'unknown team');
     const rest = route[2] || '/';
     let m;
+    // A scoped token: only the routes it's allowed (server/scopes.js), as its own agents, reading what it may read.
+    const scope = scopes && scopeFor(team, user, scopes, auth.sessionHash.slice(0, 16));
+    if (scope) {
+      const { agent } = scopedRoute(scopes, req.method, rest);
+      const acting = agent && repo.agent(team.id, agent);
+      if (acting && !scope.owns(acting)) throw httpError(403, 'this token can only use agents it registered');
+    }
 
     if (rest === '/' && req.method === 'GET') return send(res, 200, publicTeam(team, user.id));
     if (rest === '/' && req.method === 'PATCH') {
@@ -429,8 +503,10 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       requireRole(member, ['owner', 'member']);
       const id = String(b.id || '').toLowerCase();
       if (!HANDLE.test(id) || id === 'human') throw httpError(400, 'id must be a handle; "human" is reserved');
+      if (scope && !ownsHandle(scopes, id)) throw httpError(403, `this token only runs agents named ${scopes.agents}…`);
       const prev = repo.agent(team.id, id);
       if (prev && prev.ownerUserId !== user.id) throw httpError(409, 'agent belongs to another user');
+      if (scope && prev && !scope.owns(prev)) throw httpError(403, 'this token can only use agents it registered');
       // A person's handle is theirs: as an agent id it would pass for them in threads, and to older connectors, which match their owner by handle.
       const person = repo.userByHandle(id);
       if (person && person.id !== user.id) throw httpError(409, `@${id} is someone's handle; pick another id`);
@@ -451,6 +527,8 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         repos, workdir: str(b.workdir, 500), host: str(b.host, 100), platform: str(b.platform, 40), client: str(b.client, 40),
         approve: typeof b.approve === 'boolean' ? b.approve : null, persistent: b.persistent === true, service: b.service === true,
         connectedAt: Date.now(),
+        // Which scoped token runs it, if one does (registering again with a full sign-in takes it back).
+        ...(scope ? { scopedBy: scope.tokenId } : {}),
         registeredAt: prev?.registeredAt || Date.now() };
       repo.tx(() => { repo.clearDisconnect(team.id, id); repo.saveAgent(agent); });
       rt.presenceOf(team.id, id).lastSeen = Date.now();
@@ -510,6 +588,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
           return send(res, 200, { requeued: back.length });
         }
         if (b.threadId && (typeof b.threadId !== 'string' || !repo.threadExists(team.id, b.threadId))) throw httpError(404, 'unknown thread');
+        if (b.threadId && scope && !scope.canRead(b.threadId)) throw httpError(404, 'unknown thread');
         const pr = rt.presenceOf(team.id, a.id);
         pr.state = ['working', 'approval'].includes(b.state) ? b.state : 'idle';
         pr.stateThread = pr.state === 'idle' ? null : b.threadId || null;
@@ -539,7 +618,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     }
     if ((m = /^\/files\/([a-f0-9]+)(\/info)?$/.exec(rest)) && req.method === 'GET') {
       const file = repo.file(team.id, m[1]);
-      if (!file) throw httpError(404, 'unknown file');
+      if (!file || (scope && !repo.fileThreadIds(team.id, file.id).some(scope.canRead))) throw httpError(404, 'unknown file');
       if (m[2]) return send(res, 200, { ...fileView(file), sha256: file.sha256, createdAt: file.createdAt });
       const data = repo.fileData(team.id, file.id);
       // Always a download, never rendered on the hub's origin.
@@ -549,9 +628,12 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       return res.end(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
     }
     if (rest === '/messages' && req.method === 'POST') {
-      requireRole(member, ['owner', 'member']); return send(res, 200, postMessage(team, user, b));
+      requireRole(member, ['owner', 'member']); return send(res, 200, postMessage(team, user, b, scope));
     }
-    if (rest === '/messages' && req.method === 'GET') return send(res, 200, repo.recentMessages(team.id, 5000));
+    if (rest === '/messages' && req.method === 'GET') {
+      const recent = repo.recentMessages(team.id, 5000);
+      return send(res, 200, scope ? recent.filter((msg) => scope.canRead(msg.threadId)) : recent);
+    }
     // Delegations, newest first: `state=active|done` filters, `agent` keeps the ones it took part in, `limit` and
     // `before` (an item's cursor) page. Without `limit` every match is returned.
     if (rest === '/threads' && req.method === 'GET') {
@@ -569,6 +651,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       for (const row of repo.threads(team.id)) {
         if (cut && (row.updated > Number(cut[1]) || (row.updated === Number(cut[1]) && row.id >= cut[2]))) continue;
         if (agent && !row.participants.includes(agent)) continue;
+        if (scope && !scope.canReadRow(row)) continue;
         const t = view(row);
         if (state !== 'all' && t.active !== (state === 'active')) continue;
         out.push(t);
@@ -578,18 +661,18 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     }
     if (rest === '/threads/counts' && req.method === 'GET') {
       const view = threadView(team.id);
-      const all = repo.threads(team.id).map(view);
+      const all = repo.threads(team.id).filter((row) => !scope || scope.canReadRow(row)).map(view);
       const active = all.filter((t) => t.active).length;
       return send(res, 200, { active, done: all.length - active, total: all.length });
     }
     if ((m = /^\/threads\/([\w-]+)\/summary$/.exec(rest)) && req.method === 'GET') {
       const row = repo.thread(team.id, m[1]);
-      if (!row) throw httpError(404, 'unknown thread');
+      if (!row || (scope && !scope.canReadRow(row))) throw httpError(404, 'unknown thread');
       return send(res, 200, threadView(team.id)(row));
     }
     if ((m = /^\/threads\/([\w-]+)$/.exec(rest)) && req.method === 'GET') {
       const thread = repo.threadMessages(team.id, m[1]);
-      if (!thread.length) throw httpError(404, 'unknown thread');
+      if (!thread.length || (scope && !scope.canRead(m[1]))) throw httpError(404, 'unknown thread');
       return send(res, 200, thread);
     }
     throw httpError(404, 'no such endpoint');

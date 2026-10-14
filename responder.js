@@ -132,8 +132,9 @@ async function tailOf(hub, cwd, reply, allowed) {
 
 // Was `msg` posted by this agent's owner, as themselves or through one of their own agents (their live sessions)?
 // Decided by the account that posted it (`by`, set by the hub), never by the handle it shows: a handle is just a name.
+// Messages posted with a scoped token (automation running on the owner's account) don't count: that's not the owner.
 export function fromOwner(self, msg) {
-  if (!self.ownerUserId || msg.from === self.id) return false;
+  if (!self.ownerUserId || msg.from === self.id || msg.scoped) return false;
   return msg.by === self.ownerUserId;
 }
 

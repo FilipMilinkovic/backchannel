@@ -266,5 +266,38 @@ test("a connector knows its owner by the account a message came from, not by the
   assert.equal(fromOwner(self, msg('maya', 'user', undefined)), false);
   // Its own messages, and an agent that doesn't know its owner's account yet, never count.
   assert.equal(fromOwner(self, msg('maya-claude', 'agent', 'u-maya')), false);
-  assert.equal(fromOwner({ ...self, ownerUserId: null }, msg('maya', 'user', 'u-maya')), false);
+  assert.equal(fromOwner({ ...self, ownerUserId: null }, msg('maya', 'user', 'u-maya')), false);  // Automation on the owner's account (a scoped token) isn't the owner either.
+  assert.equal(fromOwner(self, { ...msg('cw-1', 'agent', 'u-maya'), scoped: true }), false);
+  assert.equal(fromOwnerInPerson(self, { ...msg('maya', 'user', 'u-maya'), scoped: true }), false);
+});
+
+test('a cloud worker runs a live session on a scoped token alone, from env vars, and can only talk to its coordinator', async (t) => {
+  const h = await startHub(t);
+  const steve = await h.bootstrap('steve');
+  const bob = await h.join(steve, 'member', 'bob');
+  const p = prefix(steve);
+  await h.ok(p + '/agents', steve.token, 'POST', { id: 'steve', kind: 'session' });
+  await h.ok(p + '/agents', bob.token, 'POST', { id: 'bob-claude' });
+  const { token } = await h.ok('/api/me/scoped-tokens', steve.token, 'POST', { team: steve.team.id, agents: 'cw-', postTo: ['steve'], label: 'av-cloud-worker' });
+
+  // No saved sign-in: everything comes from the environment, as in a container.
+  const home = tempDir(t, 'bc-cloud-');
+  const env = { ...process.env, HOME: home, HUB_URL: h.base, HUB_TOKEN: token, HUB_TEAM: steve.team.id, AGENT_ID: 'cw-1a2b3c4d',
+    BACKCHANNEL_STAND_IN_DELAY_MS: '999999999' };
+  const worker = mcpServer(t, 'mcp.js', { cwd: home, env });
+  await until(async () => (await h.ok(p + '/agents', steve.token)).find((a) => a.id === 'cw-1a2b3c4d' && a.online));
+
+  const sent = await worker.call('ask_agent', { agent: 'steve', message: 'WORKER-HELLO ENGR-1 @cw-1a2b3c4d', wait_seconds: 0 });
+  assert.match(sent, /^Sent to @steve \(thread [a-f0-9]+\)/);
+  const hello = (await h.ok(p + '/agents/steve/pending', steve.token)).messages[0];
+  assert.deepEqual([hello.from, hello.scoped, hello.text], ['cw-1a2b3c4d', true, '@steve WORKER-HELLO ENGR-1 @cw-1a2b3c4d']);
+  const noted = await h.ok(p + '/messages', steve.token, 'POST', { from: 'steve', inReplyTo: hello.id, text: 'noted, report here' });
+  assert.match(await worker.call('check_inbox', { wait_seconds: 10 }), /noted, report here/);
+  assert.match(await worker.call('reply', { message_id: noted.id, text: 'WORKER-STATE: pr-opened https://example.test/pr/1' }), /^Sent to @steve/);
+  assert.match(await worker.call('my_delegations', { include_done: true }), /"WORKER-HELLO ENGR-1 @cw-1a2b3c4d" \(to @steve\): answered/);
+
+  // Anyone else is out of reach.
+  const elsewhere = await worker.raw('ask_agent', { agent: 'bob-claude', message: 'hi', wait_seconds: 0 });
+  assert.ok(elsewhere.isError);
+  assert.match(elsewhere.text, /this token can only message @steve/);
 });
