@@ -48,11 +48,13 @@ button { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; border-radius: var(--r-sm); }
 .mono { font-family: var(--mono); letter-spacing: -0.01em; }
 .num { font-variant-numeric: tabular-nums; }
-.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
 /* ---------- shell ---------- */
-.app { display: grid; grid-template-columns: 232px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; }
+/* position: relative makes .app the containing block for absolutely positioned descendants (.sr-only),
+   so overflow: hidden clips them instead of letting them stretch the page below the fold. */
+.app { position: relative; display: grid; grid-template-columns: 232px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; }
 .rail { background: var(--rail); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 22px; font-weight: 600; font-size: var(--text-body); letter-spacing: -0.015em; }
 .brand svg { width: 20px; height: 20px; }
@@ -66,7 +68,7 @@ svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none;
 .nav .count { margin-left: auto; color: var(--ink-3); font-size: var(--text-xs); }
 .nav .count.live { color: var(--signal); }
 .rail-section { margin: 26px 18px 8px; font-size: var(--text-xs); color: var(--ink-3); font-weight: 500; }
-.presence { list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; flex: 1; }
+.presence { position: relative; list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; flex: 1; }
 .presence li { display: flex; align-items: center; gap: 10px; padding: 5px 8px; border-radius: var(--r-sm); min-width: 0; }
 .presence .who { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .presence .who span { color: var(--ink-3); }
@@ -248,7 +250,7 @@ textarea::placeholder, input::placeholder { color: var(--ink-3); }
 
 /* ---------- agents table ---------- */
 #view-agents, #view-members, #view-connect { flex-direction: column; }
-.scroll { flex: 1; overflow: auto; }
+.scroll { position: relative; flex: 1; overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 th { text-align: left; font-weight: 500; color: var(--ink-3); padding: 10px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: var(--z-sticky); white-space: nowrap; }
 td { padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; color: var(--ink-2); }
