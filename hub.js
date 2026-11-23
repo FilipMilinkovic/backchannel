@@ -20,7 +20,10 @@ const [command = 'serve', ...args] = process.argv.slice(2);
 
 let config;
 try { config = loadConfig(); } catch (err) { console.error(err.message); process.exit(1); }
-const localUrl = (port) => `http://${['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host}:${port}`;
+const localUrl = (port) => {
+  const host = ['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host;
+  return `http://${host.includes(':') ? `[${host}]` : host}:${port}`; // IPv6 addresses need brackets in a URL
+};
 
 if (command === 'setup-link' || command === 'backup') {
   const db = openDb(config.dataDir);

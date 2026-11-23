@@ -83,19 +83,23 @@ ${Object.entries(env).map(([k, v]) => `    <key>${xml(k)}</key>${str(v)}`).join(
 
 // systemd unescapes backslashes and quotes, expands % specifiers and $ variables.
 const sq = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+// WorkingDirectory= and append: paths are taken as written (no quotes, which would make the path relative and the unit
+// fail to load); only % specifiers are expanded there.
+const pct = (s) => String(s).replace(/%/g, '%%');
 function systemdUnit({ id, argv, cwd, env, log }) {
+  if ([cwd, log].some((p) => /[\n\r]/.test(p))) throw new Error('a background connector can\'t run in a folder whose path has a line break');
   return `[Unit]
 Description=Backchannel connector @${id}
 After=network-online.target
 
 [Service]
 ExecStart=${argv.map(sq).join(' ')}
-WorkingDirectory=${sq(cwd)}
+WorkingDirectory=${pct(cwd)}
 ${Object.entries(env).map(([k, v]) => `Environment=${sq(`${k}=${v}`)}`).join('\n')}
 Restart=on-failure
 RestartSec=30
-StandardOutput=append:${log}
-StandardError=append:${log}
+StandardOutput=append:${pct(log)}
+StandardError=append:${pct(log)}
 
 [Install]
 WantedBy=default.target
@@ -142,6 +146,14 @@ export function removeOwnFile(id) {
   try { fs.rmSync(serviceFile(id), { force: true }); return true; } catch { return false; }
 }
 
+// WorkingDirectory= of a unit: as written now, or quoted, as earlier versions wrote it.
+function unitDir(text) {
+  const v = /^WorkingDirectory=(.*)$/m.exec(text)?.[1];
+  if (!v) return null;
+  const quoted = /^"((?:[^"\\]|\\.)*)"$/.exec(v);
+  return quoted ? quoted[1].replace(/\\(.)/g, '$1').replace(/%%/g, '%').replace(/\$\$/g, '$') : v.replace(/%%/g, '%');
+}
+
 // The connector services installed on this computer: [{ id, file, cwd, log, running, pid }]. `running` is null when
 // it can't be told (dry run).
 export function installed() {
@@ -151,10 +163,11 @@ export function installed() {
   try { names = fs.readdirSync(dir()); } catch {}
   return names.map((n) => pattern.exec(n)?.[1]).filter(Boolean).sort().map((id) => {
     const file = serviceFile(id);
-    const text = fs.readFileSync(file, 'utf8');
+    let text = '';
+    try { text = fs.readFileSync(file, 'utf8'); } catch {} // a dangling link or unreadable file: still listed, so --stop can remove it
     const cwd = platform() === 'darwin'
       ? /<key>WorkingDirectory<\/key><string>([^<]*)<\/string>/.exec(text)?.[1]?.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
-      : /^WorkingDirectory="((?:[^"\\]|\\.)*)"$/m.exec(text)?.[1]?.replace(/\\(.)/g, '$1').replace(/%%/g, '%').replace(/\$\$/g, '$');
+      : unitDir(text);
     let running = null, pid = null;
     if (!dryRun()) {
       if (platform() === 'darwin') {

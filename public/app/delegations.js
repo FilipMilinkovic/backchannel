@@ -1,10 +1,17 @@
 // Delegations: the list, the detail pane, the picker and both composers (with attachments).
 import { select } from './main.js';
 import { S, agentById, canPost, display, ownerOf, post, senderName, tapi } from './state.js';
-import { addMessage, loadMessages, putThread, stripLead, thread, threads, workingIn } from './threads.js';
+import { addMessage, loadMessages, putThread, setMessages, stripLead, thread, threads, workingIn } from './threads.js';
 import { $, ACTIVE, BACKEND, ICON, LABEL, clock, elapsed, esc, glyph, md, rel, size, store } from './util.js';
 
 // ---------- render: list ----------
+// A short tag for messages that aren't ordinary requests or answers.
+const KIND_TAG = {
+  'for-owner': (m) => `For ${(m.to || []).map((id) => ownerOf(id) || display(id)).join(', ') || 'the owner'} in person`,
+  'needs-owner': () => 'Asks its owner',
+  fyi: () => 'FYI',
+};
+
 export function renderList() {
   $('newBtn').hidden = !canPost();
   const ts = threads();
@@ -30,7 +37,7 @@ export function renderList() {
   $('rows').innerHTML = shown.map((t) => {
     const to = t.to.length ? t.to.map(display).join(', ') : 'nobody';
     const n = t.count;
-    return `<li class="row${S.fresh.has(t.id) ? ' fresh' : ''}" role="option" tabindex="-1" data-id="${t.id}" aria-selected="${t.id === S.selected}">
+    return `<li class="row${S.fresh.has(t.id) ? ' fresh' : ''}" role="option" tabindex="-1" data-id="${esc(t.id)}" aria-selected="${t.id === S.selected}">
       <span class="glyph">${glyph(t.status)}</span>
       <span class="title">${esc(t.title)}</span>
       <span class="time num">${rel(t.updated)}</span>
@@ -44,7 +51,22 @@ export function renderList() {
 // ---------- render: detail ----------
 let renderedThread = null, renderedCount = 0;
 const loading = new Set();
+// The reply being written belongs to its delegation: switching to another one keeps it there, so it can't be sent to
+// the wrong thread. `draftFor` is the delegation the reply box holds now.
+const drafts = new Map();
+let draftFor = null;
+function swapDraft() {
+  if (draftFor === S.selected) return;
+  const text = $('replyText').value, files = pending.replyForm;
+  if (draftFor && (text.trim() || files.length)) drafts.set(draftFor, { text, files }); else drafts.delete(draftFor);
+  const next = drafts.get(S.selected) || { text: '', files: [] };
+  drafts.delete(S.selected);
+  $('replyText').value = next.text; pending.replyForm = next.files; renderPending('replyForm'); autosize($('replyText'));
+  $('replyError').textContent = '';
+  draftFor = S.selected;
+}
 export function renderDetail() {
+  swapDraft();
   const t = S.selected && thread(S.selected);
   $('view-delegations').classList.toggle('show-detail', !!(t || S.composing) && S.mobileDetail);
   $('viewerNote').hidden = canPost();
@@ -60,8 +82,8 @@ export function renderDetail() {
   const msgs = S.msgs.get(t.id);
   if (!msgs && !loading.has(t.id)) {
     loading.add(t.id);
-    loadMessages(t.id).then(() => S.selected === t.id && renderDetail())
-      .catch((err) => { $('replyError').textContent = `Couldn't load this delegation: ${err.message}`; })
+    loadMessages(t.id).then(() => { if (S.selected === t.id) { $('replyError').textContent = ''; renderDetail(); } })
+      .catch((err) => { if (S.selected === t.id) $('replyError').textContent = `Couldn't load this delegation: ${err.message}`; })
       .finally(() => loading.delete(t.id));
   }
   const hops = t.hops || 0, max = S.config?.maxHops ?? 8;
@@ -90,12 +112,13 @@ export function renderDetail() {
         const name = senderName(m);
         const you = name === 'You';
         const enter = !isNew && i >= renderedCount ? ' enter' : '';
-        return `<article class="msg ${m.kind || ''}${enter}">
+        return `<article class="msg ${esc(m.kind || '')}${enter}">
           <div class="mono-av ${you ? 'you' : ''}" aria-hidden="true">${esc((name.replace('@', '')[0] || '?'))}</div>
           <div>
             <div class="msg-head"><span class="name">${esc(name)}</span>
               ${a ? `<span class="meta">${esc([ownerOf(a.id), BACKEND[a.backend] || a.backend].filter(Boolean).join(' · '))}</span>` : ''}
               ${m.to?.length ? `<span class="meta">to ${esc(m.to.map(display).join(', '))}</span>` : ''}
+              ${KIND_TAG[m.kind] ? `<span class="kind-tag">${esc(KIND_TAG[m.kind](m))}</span>` : ''}
               <span class="meta num">${clock(m.ts)}</span></div>
             <div class="msg-body">${md(m.to?.length ? (stripLead(m.text) || m.text) : m.text)}</div>
             ${m.files?.length ? `<div class="files">${m.files.map((f) => `<button type="button" class="file" data-file="${esc(f.id)}" data-name="${esc(f.name)}" title="Download ${esc(f.name)}">${ICON.file}<span class="nm">${esc(f.name)}</span><span class="sz num">${size(f.size)}</span></button>`).join('')}</div>` : ''}
@@ -183,6 +206,7 @@ const summaryOf = (m) => ({ id: m.threadId, title: stripLead(m.text).slice(0, 80
 async function submit(form, textEl, errEl, btn, body) {
   const files = pending[form.id];
   const text = textEl.value.trim() || (files.length ? `Attached ${files.map((f) => f.name).join(', ')}.` : '');
+  if (btn.disabled) return null; // already sending (Enter submits the form even while the button is disabled), or nobody to send to
   errEl.textContent = '';
   if (!text) { errEl.textContent = 'Write a message first.'; textEl.focus(); return null; }
   btn.disabled = true;
@@ -206,7 +230,7 @@ $('newForm').addEventListener('submit', async (e) => {
   if (!to) return;
   const msg = await submit($('newForm'), $('newText'), $('newError'), $('newSend'), (text) => ({ text: `@${to} ${text}` }));
   if (!msg) return;
-  if (!S.msgs.has(msg.threadId)) S.msgs.set(msg.threadId, [msg]);
+  if (!S.msgs.has(msg.threadId)) setMessages(msg.threadId, [msg]);
   // The summary usually arrives on the event stream first; fetch it if not.
   if (!S.threads.has(msg.threadId)) putThread(await tapi(`/threads/${encodeURIComponent(msg.threadId)}/summary`).catch(() => null) || summaryOf(msg));
   if (S.filter === 'done') S.filter = 'active';

@@ -1,5 +1,10 @@
 # Backchannel
 
+[![CI](https://github.com/FilipMilinkovic/backchannel/actions/workflows/ci.yml/badge.svg)](https://github.com/FilipMilinkovic/backchannel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Node.js 22.13+](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen)
+![Zero dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
+
 **Your agent can ask their agent, so you don't have to ask them.**
 
 You're mid-task and need something from a teammate: how their API works, or a small change in their repo.
@@ -14,6 +19,44 @@ your Claude Code ──ask_agent──▶ hub ──▶ teammate's connector ─
 
 One person runs a **hub** (a small server). Everyone else installs the `backchannel` command from it and connects
 their agents. No runtime dependencies: Node.js 22.13+ (24 recommended) and one SQLite file.
+
+## What it does
+
+- **Agents get `@handles`.** Your live Claude Code or Codex session joins as `@you`. A connector you run in a repo
+  (`backchannel connect`) answers as `@you-claude`, with Claude Code, Codex, OpenAI or Grok behind it.
+- **Delegation as a tool call.** Your agent gets MCP tools: `list_agents`, `ask_agent`, `my_delegations`,
+  `check_inbox`, `reply` and `get_file`. It can ask by person or by repository, wait for the answer or keep working.
+- **Answers come from where the code is.** The other agent reads their repo on their machine and says which commit
+  and branch it read. Nothing gets copied to a server first.
+- **Safe by default.** Connectors are read-only and ask their owner before each request. Messages from other agents
+  are treated as quoted data, never as instructions. Secrets are filtered out of replies. Write access is opt-in, and
+  every change lands on its own branch in a separate worktree.
+- **Always reachable.** A connector can run as a background service. If a request to your live session sits unread,
+  a headless stand-in can answer it. When an agent needs its owner's decision, the delegation shows as
+  *waiting on the owner* instead of looking finished.
+- **A control room.** The web UI shows every delegation with its status, plus agents, members and invites. It also
+  creates setup commands. Scoped tokens let CI and cloud agents join without carrying your own token.
+- **Easy to run.** One Node process and one SQLite file. Deploy it with Docker, Railway or Fly.io, or run it on your
+  laptop.
+
+## Try it in two minutes
+
+On one computer, with Node.js 22.13+ and [Claude Code](https://code.claude.com) or Codex installed:
+
+```bash
+git clone https://github.com/FilipMilinkovic/backchannel.git && cd backchannel
+node hub.js                          # prints a one-time setup link; open it and pick a handle
+```
+
+On the hub's **Connect** page, click **Create setup command** and run it in another terminal. It installs the
+`backchannel` command from your hub and connects Claude Code and Codex. Then make an agent reachable in any repo:
+
+```bash
+cd ~/code/some-repo && backchannel connect     # @you-claude, read-only, asks you before each request
+```
+
+Open a new Claude Code session anywhere and say *"ask @you-claude what this repo does"*. To bring in teammates,
+deploy the hub somewhere they can reach (see [Run a hub](#run-a-hub)) and send them an invite link.
 
 ### Joining a team? Three steps
 
@@ -134,6 +177,7 @@ HOST=0.0.0.0 PUBLIC_URL=https://backchannel.your-tailnet.ts.net node hub.js   # 
    | `--id` | The agent's handle. Default: your handle plus the backend, like `maya-claude` |
    | `--no-approve` | Handle requests without asking. By default each request is shown in your terminal and waits for your yes |
    | `--write` | Lets Claude Code or Codex make requested changes, each request on a branch in a worktree of its own (see [Delegations](#delegations)). Read-only by default |
+   | `--no-fetch` | Don't give a read-only connector the `git_fetch` tool (see [Delegations](#delegations)) |
    | `--i-trust-this-team` | Required with `--write --no-approve`: anyone in the team could then run commands on this computer without asking you |
    | `--service` | Run it in the background instead (see [Always-on connectors](#always-on-connectors)). `--status` lists them, `--stop` removes one |
    | `--fresh` | Forget the conversation it kept and start a new one |
@@ -252,7 +296,9 @@ What happens when one agent asks another, beyond the message itself:
   an agent, waiting on its owner, answered. It also lists what others are waiting on you for.
 - **Read-only agents can look at history.** A read-only Claude Code connector gets Backchannel's own tools instead of a
   shell (`tools.js`): `git` runs read-only git commands (log, show, diff, blame, `branch -a`, …) with every argument
-  checked, and `list_dir` lists folders, both inside its folder, with secrets removed from the output. Where the installed
+  checked, `list_dir` lists folders, both inside its folder, with secrets removed from the output, and `git_fetch`
+  fetches from one of the repository's own remotes when asked about a commit or branch the checkout doesn't have yet
+  (it updates remote-tracking refs only, never the owner's branches or files; `--no-fetch` turns it off). Where the installed
   `claude` supports it, read-only runs use `--restricted` (no shell, no user or project settings). Connectors load only
   these tools, never the owner's own MCP servers.
 - **Answers say where they came from.** A coding agent's reply ends with the repos, commits and branches it read, from
@@ -270,6 +316,11 @@ What happens when one agent asks another, beyond the message itself:
   message to reply to), and so is the connector's terminal. When the owner replies, from a session, the CLI
   (`backchannel reply <id> "…"`) or the UI, the agent picks the request back up and sends the finished answer to
   whoever asked. Connectors remember what they're waiting for across restarts.
+- **Ask the owner in person, or just tell them.** Some requests aren't for the agent at all: approve a PR, resolve
+  review threads, make a product call. `ask_agent` with `for_owner: true` (`backchannel ask @maya-claude --for-owner
+  "…"`) skips the model: the agent passes it straight to its owner and the delegation shows *Waiting on <owner>* until
+  they answer. `fyi: true` (`--fyi`) sends an update that needs no reply ("PR merged", "deployed"): nobody owes an
+  answer, no agent runs on it, and it shows as an FYI instead of an open ask.
 
 ## Configuration
 
@@ -277,10 +328,10 @@ The hub reads environment variables only, and refuses to start with a clear mess
 
 | Variable | Default | |
 |---|---|---|
-| `PUBLIC_URL` | `http://HOST:PORT` (Railway: its domain) | The address people use. Invite, sign-in and install links point here. HTTPS enables HSTS |
+| `PUBLIC_URL` | `http://HOST:PORT` (Railway: its domain) | The address people use. Invite, sign-in and install links point here. HTTPS enables HSTS. The hub serves from the root, so no path |
 | `PORT`, `HOST` | `7777`, `127.0.0.1` | Use `HOST=0.0.0.0` to accept outside connections (the Docker image does) |
 | `DATA_DIR` | `./data` | Where `backchannel.db` lives. Must be persistent |
-| `TRUST_PROXY` | off (`railway` on Railway) | Where the client IP comes from: `fly` (Fly-Client-IP), `railway` (first X-Forwarded-For entry), `cloudflare` (CF-Connecting-IP), `xff` (last X-Forwarded-For hop). Only set it when that proxy is the only way in |
+| `TRUST_PROXY` | off (`railway` on Railway) | Where the client IP comes from: `fly` (Fly-Client-IP), `railway` (X-Real-IP, which Railway's edge sets, else the first X-Forwarded-For entry), `cloudflare` (CF-Connecting-IP), `xff` (last X-Forwarded-For hop). Only set it when that proxy is the only way in |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` (pretty in a terminal) | `json` or `pretty` |
 | `SENTRY_DSN` | off | Send server and browser errors to Sentry. `SENTRY_ENVIRONMENT` labels them |
@@ -365,6 +416,8 @@ the prefix; no saved sign-in is needed. Rotating your main token also revokes ev
   (`https://user:token@…`) are removed on the computer and again by the hub, so they're never stored or shown.
 - Coding agents are read-only unless started with `--write`, and then they edit only in a worktree per request (Bash is not confined). The owner confirms every request unless the connector runs with `--no-approve`.
 - Connectors load only Backchannel's own read-only tools, never the owner's MCP servers. Read-only ones get no shell.
+  Their `git_fetch` tool reaches the repository's existing remotes with the owner's git credentials (fetch only, no
+  push); start the connector with `--no-fetch` to keep it off the network.
   `--write --no-approve` also needs `--i-trust-this-team`, and the connector says who can reach it.
 - Messages from other agents are handed to agents as quoted data, never as instructions, and agents are told not to
   change files, run commands or share secrets because a message asked them to, without asking their user.
@@ -423,4 +476,15 @@ node scripts/seed.js     # a throwaway hub full of awkward demo data, for checki
 | `service.js` | `connect --service`: the launchd agent or systemd user unit that keeps a connector running |
 | `mcp.js` | MCP server that puts a live Claude Code or Codex session on the network |
 | `public/index.html` | The control room UI |
-| `docs/` | [Teams design](docs/TEAMS-PLAN.md), [production plan](docs/PRODUCTION-PLAN.md) |
+| `tools.js`, `worktree.js`, `safety.js` | Read-only git tools for connectors, write-mode worktrees, secret redaction and message quoting |
+| `docs/` | Design notes from earlier versions: [v1 scope](docs/V1-SCOPE.md), [teams](docs/TEAMS-PLAN.md), [production hub](docs/PRODUCTION-PLAN.md), [v3 plan](docs/V3-PLAN.md) |
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how the code is laid out
+and what a good change looks like, and [CHANGELOG.md](CHANGELOG.md) for what changed between versions. Please report
+security problems privately, as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)

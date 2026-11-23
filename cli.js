@@ -10,29 +10,40 @@ import { parseArgs } from 'node:util';
 import { spawn } from 'node:child_process';
 import { Hub, CONFIG_FILE as CONFIG, loadConfig } from './client.js';
 import { setupAgents, doctor } from './setup.js';
+import { printable } from './safety.js';
 function saveConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  fs.chmodSync(CONFIG, 0o600); // `mode` only applies to a new file; an older one may have been readable by others
 }
+const die = (msg) => { console.error(msg); process.exit(1); };
 
-const { values: opt, positionals: [cmd, ...args] } = parseArgs({
+let parsed;
+try { parsed = parseArgs({
   allowPositionals: true,
   options: {
     hub: { type: 'string' }, team: { type: 'string' }, handle: { type: 'string' }, name: { type: 'string' },
     as: { type: 'string' }, repo: { type: 'string' }, wait: { type: 'string', default: '300' }, 'show-token': { type: 'boolean', default: false },
     role: { type: 'string', default: 'member' }, uses: { type: 'string', default: '1' }, hours: { type: 'string', default: '168' },
     print: { type: 'boolean', default: false }, 'skip-agents': { type: 'boolean', default: false },
-    agents: { type: 'string' }, 'post-to': { type: 'string' }, read: { type: 'string' }, label: { type: 'string' },
-    help: { type: 'boolean', short: 'h' },
+    agents: { type: 'string' }, 'post-to': { type: 'string' }, 'for-owner': { type: 'boolean', default: false }, fyi: { type: 'boolean', default: false }, read: { type: 'string' }, label: { type: 'string' },
+    help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
   },
-});
+}); } catch (err) { die(`${err.message}\nSee: backchannel --help (put -- before a message that starts with a dash)`); }
+const { values: opt, positionals: [cmd, ...args] } = parsed;
+
+if (opt.version || cmd === 'version') {
+  console.log(JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version);
+  process.exit(0);
+}
 
 const cfg = loadConfig();
-const hubUrl = opt.hub || process.env.HUB_URL || cfg.hub || 'http://127.0.0.1:7777';
-const hub = new Hub(hubUrl, process.env.HUB_TOKEN || cfg.token, opt.team || process.env.HUB_TEAM || cfg.team);
+const hubUrl = (opt.hub || process.env.HUB_URL || cfg.hub || 'http://127.0.0.1:7777').replace(/\/$/, '');
+// The saved sign-in belongs to the hub it was made for: never send it to another one (--hub, HUB_URL).
+const savedHere = !!cfg.hub && cfg.hub.replace(/\/$/, '') === hubUrl;
+const hub = new Hub(hubUrl, process.env.HUB_TOKEN || (savedHere ? cfg.token : undefined), opt.team || process.env.HUB_TEAM || (savedHere ? cfg.team : undefined));
 // "backchannel" when installed, "node cli.js" in a clone; used in help and hints.
 const BIN = /backchannel(\.js)?$/.test(process.argv[1] || '') ? 'backchannel' : 'node cli.js';
-const die = (msg) => { console.error(msg); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function connectAgents(saved, force = false) {
@@ -121,7 +132,7 @@ const commands = {
     if (!list.length) return console.log('No agents in this team yet.');
     for (const a of list) {
       console.log(`@${a.id.padEnd(16)} ${a.online ? (a.state !== 'idle' ? 'busy   ' : 'online ') : 'offline'} ${a.backend}${a.ownerHandle ? ` · @${a.ownerHandle}` : ''}${a.access === 'write' ? ' · can edit' : ''}`);
-      if (a.description) console.log(`  ${a.description}`);
+      if (a.description) console.log(`  ${printable(a.description)}`);
     }
   },
 
@@ -139,7 +150,10 @@ const commands = {
     const byRepo = opt.repo && !String(args[0] || '').startsWith('@');
     let to = byRepo ? '' : (args[0] || '').replace(/^@/, '');
     const text = args.slice(byRepo ? 0 : 1).join(' ');
-    if ((!to && !byRepo) || !text) die(`usage: ${BIN} ask @agent "message" [--repo name] [--wait seconds] [--as your-agent]\n       ${BIN} ask --repo name "message"`);
+    if (!(Number(opt.wait) >= 0)) die(`--wait takes a number of seconds, not "${opt.wait}"`);
+    if ((!to && !byRepo) || !text) die(`usage: ${BIN} ask @agent "message" [--repo name] [--wait seconds] [--as your-agent] [--for-owner | --fyi]\n       ${BIN} ask --repo name "message"`);
+    if (opt['for-owner'] && opt.fyi) die('Pass --for-owner or --fyi, not both.');
+    const kind = opt['for-owner'] ? 'for-owner' : opt.fyi ? 'fyi' : null;
     await hub.resolveTeam();
     const agents = await hub.agents();
     if (byRepo) {
@@ -153,8 +167,9 @@ const commands = {
     const target = agents.find((a) => a.id === to.toLowerCase());
     if (!target) die(`@${to} isn't an agent in this team. Agents: ${agents.map((a) => '@' + a.id).join(', ') || 'none yet'}`);
     if (!target.online) console.error(`@${to} is offline; the request will wait in its inbox.`);
-    const sent = await hub.post({ ...(opt.as ? { from: opt.as } : {}), text: `@${to} ${text}`, ...(opt.repo ? { repo: opt.repo } : {}) });
+    const sent = await hub.post({ ...(opt.as ? { from: opt.as } : {}), text: `@${to} ${text}`, ...(opt.repo ? { repo: opt.repo } : {}), ...(kind ? { kind } : {}) });
     if (sent.note) die(`Not delivered: ${sent.note}`);
+    if (kind === 'fyi') return console.error(`Sent to @${to} as an FYI (thread ${sent.threadId}). No reply is expected.`);
     console.error(`Sent to @${to} (thread ${sent.threadId}). Waiting up to ${opt.wait}s…`);
     const seen = new Set([sent.id]);
     const deadline = Date.now() + Number(opt.wait) * 1000;
@@ -162,7 +177,7 @@ const commands = {
       await sleep(2000);
       const replies = (await hub.thread(sent.threadId)).filter((m) => !seen.has(m.id) && m.ts >= sent.ts);
       if (replies.length) {
-        for (const m of replies) console.log(`\n@${m.from}${m.kind ? ` (${m.kind})` : ''} [${m.id}]:\n${m.text}`);
+        for (const m of replies) console.log(`\n@${m.from}${m.kind ? ` (${m.kind})` : ''} [${m.id}]:\n${printable(m.text)}`);
         return;
       }
     }
@@ -186,6 +201,8 @@ const commands = {
 
   async 'rotate-token'() {
     const { token } = await hub.req('POST', '/api/me/token');
+    // Rotated with HUB_TOKEN or for another hub: the saved sign-in is someone else's, so show the new token instead.
+    if (process.env.HUB_TOKEN || !savedHere) return console.log(`New token (the old one no longer works; ${CONFIG} was not changed):\n  ${token}`);
     saveConfig({ ...cfg, token });
     console.log(`New token saved to ${CONFIG}. The old one no longer works.`);
     console.log('Restart running connectors and MCP sessions; ones that read the saved token need no other change.');
@@ -202,7 +219,8 @@ const commands = {
     const link = url + view;
     if (opt.print) return console.log(`Sign-in link for @${me.user.handle} (works once, for ${expiresInSeconds}s):\n  ${link}`);
     const [cmd, ...argv] = process.platform === 'darwin' ? ['open', link]
-      : process.platform === 'win32' ? ['cmd', '/c', 'start', '', link] : ['xdg-open', link];
+      // Not `cmd /c start`: cmd would treat the & in the link as a command separator.
+      : process.platform === 'win32' ? ['rundll32', 'url.dll,FileProtocolHandler', link] : ['xdg-open', link];
     await new Promise((resolve) => {
       const child = spawn(cmd, argv, { stdio: 'ignore', detached: true });
       child.on('error', () => { console.log(`Couldn't open a browser. Open this within ${expiresInSeconds}s:\n  ${link}`); resolve(); });
@@ -247,6 +265,8 @@ const commands = {
 };
 
 if (!cmd || opt.help || !commands[cmd]) {
+  const unknown = cmd && cmd !== 'help' && !commands[cmd];
+  if (unknown) console.error(`Unknown command "${cmd}".\n`);
   const agentCommands = BIN === 'backchannel' ? `
   connect                     Make your agent reachable from this folder; runs until stopped
                               (--backend, --id, --write, --no-approve)
@@ -260,11 +280,13 @@ if (!cmd || opt.help || !commands[cmd]) {
                               (create the link on the Connect page; --skip-agents to only sign in)
   setup                       Connect Claude Code and Codex to the hub you're signed in to (MCP, inbox hook, instructions)
   doctor                      Check the hub, your sign-in, and Claude Code and Codex
+  version                     Show the client version (also --version)
   whoami / teams              Show your account and teams
   use <team>                  Set your default team
   agents                      List agents in the team
   disconnect @agent           Remove an agent and stop its connector or session (yours, or any as owner)
-  ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent, --repo name)
+  ask @agent "message"        Ask an agent and wait for the reply (--wait s, --as your-agent, --repo name,
+                              --for-owner: for its owner in person, --fyi: no reply expected)
   ask --repo name "message"   Ask whichever agent works in that repository
   reply <messageId> "text"    Reply to a message
   invite [--role member]      Create an invite link (owners; --uses n, --hours h)
@@ -276,7 +298,7 @@ if (!cmd || opt.help || !commands[cmd]) {
   token                       Print your saved token (for HUB_TOKEN on another machine)
 ${agentCommands}
 Config: ${CONFIG} (HUB_URL, HUB_TOKEN, HUB_TEAM override it)`);
-  process.exit(cmd && !commands[cmd] ? 1 : 0);
+  process.exit(unknown ? 1 : 0);
 }
 
 try { await commands[cmd](); }

@@ -133,8 +133,13 @@ function inspectHook(id) {
   let json = {};
   try { json = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8')); }
   catch (err) { if (err.code !== 'ENOENT') return { unreadable: true, problem: `can't read ${tilde(CLAUDE_SETTINGS)} (${err.message})` }; }
+  // Settings we don't understand are left alone rather than rewritten.
+  const shape = !json || typeof json !== 'object' || Array.isArray(json) ? 'it is not a JSON object'
+    : json.hooks !== undefined && (typeof json.hooks !== 'object' || Array.isArray(json.hooks)) ? '"hooks" is not an object'
+      : json.hooks?.UserPromptSubmit !== undefined && !Array.isArray(json.hooks.UserPromptSubmit) ? '"hooks.UserPromptSubmit" is not a list' : null;
+  if (shape) return { unreadable: true, problem: `can't update ${tilde(CLAUDE_SETTINGS)}: ${shape}` };
   const want = hookCommand(id);
-  const found = (json.hooks?.UserPromptSubmit || []).flatMap((g) => g.hooks || []).filter(isOurHook);
+  const found = (json.hooks?.UserPromptSubmit || []).flatMap((g) => (Array.isArray(g?.hooks) ? g.hooks : [])).filter(isOurHook);
   const ok = found.length === 1 && found[0].command === want;
   return { json, want, found, ok, problem: ok ? null : found.length ? 'the unread-messages hook runs another install' : 'no unread-messages hook' };
 }
@@ -144,8 +149,8 @@ function setupHook(state, log) {
   const { json } = state;
   json.hooks ||= {};
   const groups = (json.hooks.UserPromptSubmit || [])
-    .map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !isOurHook(h)) }))
-    .filter((g) => g.hooks.length);
+    .filter((g) => !Array.isArray(g?.hooks) || g.hooks.some((h) => !isOurHook(h))) // someone else's, kept as it is
+    .map((g) => (Array.isArray(g?.hooks) ? { ...g, hooks: g.hooks.filter((h) => !isOurHook(h)) } : g));
   json.hooks.UserPromptSubmit = [...groups, { hooks: [{ type: 'command', command: state.want }] }];
   fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
   if (fs.existsSync(CLAUDE_SETTINGS)) fs.copyFileSync(CLAUDE_SETTINGS, CLAUDE_SETTINGS + '.bak');
@@ -216,7 +221,7 @@ export async function doctor(hub, cfg, log = console.log) {
   if (!cfg.hub || !cfg.token) fail(`This computer isn't signed in${cfg.hub ? ` to ${cfg.hub}` : ' to a hub'}`, "On your hub's Connect page, click Create setup command and run it");
   else {
     // Any HTTP answer means it's reachable; hubs older than 0.2 have no /healthz.
-    const up = await fetch(new URL('/healthz', cfg.hub))
+    const up = await fetch(cfg.hub.replace(/\/$/, '') + '/healthz') // like the client's requests: keeps a path prefix
       .then(async (r) => ({ ok: r.status < 500, version: (await r.json().catch(() => ({}))).version }))
       .catch((e) => ({ error: e.cause?.code || e.message }));
     if (!up.ok) fail(`Can't reach ${cfg.hub} (${up.error || 'not healthy'})`, sameHub(cfg.hub, 'http://127.0.0.1:7777') ? 'Start the local hub with node hub.js, or sign in to your team\'s hub' : 'Check the address and your network');

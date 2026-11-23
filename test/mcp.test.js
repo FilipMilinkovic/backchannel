@@ -235,3 +235,59 @@ test('mcp: Claude Code gets new messages pushed in as channel events', async (t)
   await delay(500);
   assert.equal(a.notifications.filter((n) => n.method === 'notifications/claude/channel').length, 1);
 });
+
+test('mcp: a missing or blank message is a tool error naming the parameter, never a message saying "undefined"', async (t) => {
+  const h = await startHub(t);
+  const filip = await h.bootstrap('filip');
+  const steve = await h.join(filip, 'member', 'steve');
+  const p = prefix(filip);
+  const a = session(t, h, filip, 'filip', tempDir(t));
+  const b = session(t, h, steve, 'steve', tempDir(t));
+  await until(async () => (await h.ok(p + '/agents', filip.token)).filter((x) => x.online).length === 2);
+
+  for (const args of [{ agent: 'steve' }, { agent: 'steve', text: 'misnamed' }, { agent: 'steve', message: '   ' }, { agent: 'steve', message: 42 }]) {
+    const r = await a.raw('ask_agent', { ...args, wait_seconds: 0 });
+    assert.ok(r.isError, JSON.stringify(args));
+    assert.match(r.text, /message is required/);
+  }
+  const sent = await a.call('ask_agent', { agent: 'steve', message: 'real question', wait_seconds: 0 });
+  const threadId = sent.match(/thread (\w+)/)[1];
+  const [, messageId] = (await b.call('check_inbox', { wait_seconds: 5 })).match(/\[message (\S+) from @filip/);
+  for (const args of [{ message_id: messageId }, { message_id: messageId, message: 'misnamed' }, { message_id: messageId, text: '' }]) {
+    const r = await b.raw('reply', args);
+    assert.ok(r.isError, JSON.stringify(args));
+    assert.match(r.text, /text is required/);
+  }
+  assert.match((await b.raw('reply', { text: 'hi' })).text, /message_id is required/);
+  // A wait that isn't a number means no wait, instead of polling forever.
+  const started = Date.now();
+  assert.match(await a.call('check_inbox', { wait_seconds: 'abc' }), /Inbox is empty/);
+  assert.ok(Date.now() - started < 3000);
+  assert.deepEqual((await h.ok(`${p}/threads/${threadId}`, filip.token)).map((m) => m.text), ['@steve real question']);
+});
+
+test('ask_agent sends FYIs and requests for the owner in person, and labels them in the inbox', async (t) => {
+  const h = await startHub(t);
+  const filip = await h.bootstrap('filip');
+  const steve = await h.join(filip, 'member', 'steve');
+  const p = prefix(filip);
+  const a = session(t, h, filip, 'filip', tempDir(t));
+  const b = session(t, h, steve, 'steve', tempDir(t));
+  await until(async () => (await h.ok(p + '/agents', filip.token)).filter((x) => x.online).length === 2);
+
+  const both = await a.raw('ask_agent', { agent: 'steve', message: 'x', for_owner: true, fyi: true });
+  assert.ok(both.isError);
+  assert.match(both.text, /for_owner or fyi, not both/);
+
+  const fyi = await a.call('ask_agent', { agent: 'steve', message: 'payments#12 is merged.', fyi: true });
+  assert.match(fyi, /as an FYI .*No reply is expected/);
+  const fyiThread = fyi.match(/thread (\w+)/)[1];
+  const owner = await a.call('ask_agent', { agent: 'steve', message: 'Please approve payments#13.', for_owner: true });
+  assert.match(owner, /for its owner in person/);
+
+  const inbox = await b.call('check_inbox', { wait_seconds: 5 });
+  assert.match(inbox, /FYI, no reply expected/);
+  assert.match(inbox, /for steve in person: tell them, and reply only with their answer/);
+  const s = await h.ok(`${p}/threads/${fyiThread}/summary`, filip.token);
+  assert.deepEqual([s.status, s.waitingOn], ['fyi', []]);
+});

@@ -170,3 +170,19 @@ test('setup leaves Backchannel instructions someone added by hand', (t) => {
   assert.equal(h.setup().status, 0);
   assert.equal(h.agentsMd(), mine);
 });
+
+test('setup leaves a Claude settings file it does not understand alone instead of crashing', (t) => {
+  for (const odd of ['[]', '{"hooks":{"UserPromptSubmit":{"matcher":"x"}}}', '{"hooks":[]}']) {
+    const h = home(t, { claude: {} });
+    h.write('.claude/settings.json', odd);
+    const r = h.setup();
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /skipped the unread-messages hook: can't update/);
+    assert.equal(fs.readFileSync(path.join(h.dir, '.claude', 'settings.json'), 'utf8'), odd);
+  }
+  // A group someone wrote with no hooks list is kept as it is.
+  const h = home(t, { claude: {} });
+  h.write('.claude/settings.json', JSON.stringify({ hooks: { UserPromptSubmit: [{ matcher: 'x' }] } }));
+  assert.equal(h.setup().status, 0);
+  assert.deepEqual(h.claudeSettings().hooks.UserPromptSubmit[0], { matcher: 'x' });
+});

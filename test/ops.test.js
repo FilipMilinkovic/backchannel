@@ -205,6 +205,13 @@ test('Railway defaults: public URL from its domain, client IP from X-Forwarded-F
   await h.api('/api/me', null, 'GET', undefined, { 'x-forwarded-for': '198.51.100.7, 100.64.0.2', 'x-request-id': 'rw' });
   await waitFor(() => h.logs().some((l) => l.requestId === 'rw'));
   assert.equal(h.logs().find((l) => l.requestId === 'rw').ip, '198.51.100.7');
+  // X-Real-IP, which Railway's edge always sets and never takes from the caller, wins over X-Forwarded-For.
+  await h.api('/api/me', null, 'GET', undefined, { 'x-real-ip': '198.51.100.8', 'x-forwarded-for': '6.6.6.6, 198.51.100.8', 'x-request-id': 'rw2' });
+  // A value that can't be an address is ignored.
+  await h.api('/api/me', null, 'GET', undefined, { 'x-forwarded-for': 'x'.repeat(500), 'x-request-id': 'rw3' });
+  await waitFor(() => h.logs().some((l) => l.requestId === 'rw3'));
+  assert.equal(h.logs().find((l) => l.requestId === 'rw2').ip, '198.51.100.8');
+  assert.equal(h.logs().find((l) => l.requestId === 'rw3').ip, '127.0.0.1');
 });
 
 test('trusted proxy headers are used only when TRUST_PROXY says so', async (t) => {

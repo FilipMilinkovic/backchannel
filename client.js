@@ -13,8 +13,15 @@ const TYPES = { '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'applicat
   '.webp': 'image/webp', '.svg': 'image/svg+xml', '.zip': 'application/zip', '.gz': 'application/gzip' };
 
 export const CONFIG_FILE = path.join(os.homedir(), '.backchannel', 'config.json');
+let warnedConfig = false;
 export function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (err) {
+    // Missing is normal before signing in; anything else (a hand edit gone wrong) is worth saying once.
+    if (err.code !== 'ENOENT' && !warnedConfig) { warnedConfig = true; console.error(`[backchannel] ignoring ${CONFIG_FILE}: ${err.message}. Sign in again to rewrite it.`); }
+    return {};
+  }
+  return cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : {};
 }
 
 // Settings from env (HUB_URL, HUB_TOKEN, HUB_TEAM), falling back to what `cli.js join` saved,
@@ -112,6 +119,9 @@ export function untoldActivity(now = Date.now()) {
   return { items, markTold: () => items.length && writeJson(TOLD_FILE, { at: Math.max(told, ...items.map((i) => i.at)) }) };
 }
 
+// Ids from the hub or from a model's tool call go into URL paths: encoded, so they can't point at another route.
+const enc = (s) => encodeURIComponent(String(s));
+
 export const formatSize = (n) => (n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`);
 
 export class Hub {
@@ -121,11 +131,14 @@ export class Hub {
     this.team = team || null;
   }
 
-  async req(method, p, body) {
+  // Every call ends within `timeoutMs`, so a connection that silently died (a laptop that slept, a dropped NAT entry)
+  // can't leave a connector waiting forever: long polls ask the hub to answer within 25 seconds.
+  async req(method, p, body, timeoutMs = 90_000) {
     const res = await fetch(this.url + p, {
       method,
       headers: { 'content-type': 'application/json', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { const e = new Error(data.error || `hub ${res.status}`); e.status = res.status; throw e; }
@@ -162,10 +175,10 @@ export class Hub {
 
   register(card) { return this.req('POST', this.t('/agents'), card); }
   agents() { return this.req('GET', this.t('/agents')); }
-  thread(id) { return this.req('GET', this.t(`/threads/${id}`)); }
+  thread(id) { return this.req('GET', this.t(`/threads/${enc(id)}`)); }
   post(msg) { return this.req('POST', this.t('/messages'), msg); }
-  status(id, state, threadId) { return this.req('POST', this.t(`/agents/${id}/status`), { state, threadId }); }
-  requeue(id, ids) { return this.req('POST', this.t(`/agents/${id}/requeue`), { ids }); }
+  status(id, state, threadId) { return this.req('POST', this.t(`/agents/${enc(id)}/status`), { state, threadId }); }
+  requeue(id, ids) { return this.req('POST', this.t(`/agents/${enc(id)}/requeue`), { ids }); }
   // Files: upload one from disk (returns { id, name, type, size }), read its details, or download its bytes.
   async upload(file) {
     const data = fs.readFileSync(file);
@@ -177,18 +190,18 @@ export class Hub {
     if (!res.ok) { const e = new Error(`${path.basename(file)}: ${body.error || `hub ${res.status}`}`); e.status = res.status; throw e; }
     return body;
   }
-  fileInfo(id) { return this.req('GET', this.t(`/files/${id}/info`)); }
+  fileInfo(id) { return this.req('GET', this.t(`/files/${enc(id)}/info`)); }
   async download(id) {
-    const res = await fetch(this.url + this.t(`/files/${id}`), { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    const res = await fetch(this.url + this.t(`/files/${enc(id)}`), { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
     if (!res.ok) { const body = await res.json().catch(() => ({})); const e = new Error(body.error || `hub ${res.status}`); e.status = res.status; throw e; }
     return Buffer.from(await res.arrayBuffer());
   }
   // `lease`: messages stay on the hub until acknowledged (or answered), and come back if this process dies first.
-  inbox(id, wait = 25, lease = false) { return this.req('GET', this.t(`/agents/${id}/inbox?wait=${wait}${lease ? '&lease=1' : ''}`)); }
-  ack(id, ids) { return this.req('POST', this.t(`/agents/${id}/ack`), { ids }); }
-  pending(id, after = 0, wait = 25) { return this.req('GET', this.t(`/agents/${id}/pending?wait=${wait}&after=${after}`)); }
+  inbox(id, wait = 25, lease = false) { return this.req('GET', this.t(`/agents/${enc(id)}/inbox?wait=${wait}${lease ? '&lease=1' : ''}`)); }
+  ack(id, ids) { return this.req('POST', this.t(`/agents/${enc(id)}/ack`), { ids }); }
+  pending(id, after = 0, wait = 25) { return this.req('GET', this.t(`/agents/${enc(id)}/pending?wait=${wait}&after=${enc(after)}`)); }
   // `lease` (seconds): keep the claimed messages leased instead of removing them, until answered or acknowledged.
-  async claim(id, ids, lease) { return (await this.req('POST', this.t(`/agents/${id}/claim`), { ids, ...(lease ? { lease } : {}) })).messages; }
+  async claim(id, ids, lease) { return (await this.req('POST', this.t(`/agents/${enc(id)}/claim`), { ids, ...(lease ? { lease } : {}) })).messages; }
 
   // Register, then long-poll the inbox forever, taking each message (one process per agent). Messages are leased and
   // acknowledged once handled, so one taken by a process that dies first is handed out again.

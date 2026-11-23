@@ -91,14 +91,14 @@ function renderAgentTable() {
   const list = [...S.agents].sort((a, b) => (b.online - a.online) || a.id.localeCompare(b.id));
   const repoLabel = (a) => (a.repos?.length ? a.repos.length === 1 ? a.repos[0].name : `${a.repos.length} repos` : a.repo || '');
   $('agentsBody').innerHTML = `<table>
-    <thead><tr><th>Agent</th><th>Owner</th><th class="col-hide">Runs on</th><th class="col-hide">Access</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
+    <thead><tr><th>Agent</th><th class="col-hide">Owner</th><th class="col-hide">Runs on</th><th class="col-hide">Access</th><th>Status</th><th class="col-hide"><span class="sr-only">Actions</span></th></tr></thead>
     <tbody>${list.map((a) => `<tr data-profile="${esc(a.id)}">
         <td><button class="link-h" type="button" data-profile="${esc(a.id)}" aria-label="Open @${esc(a.id)}'s profile">@${esc(a.id)}</button><div class="d" title="${esc(a.description)}">${esc(a.description)}</div></td>
-        <td>${esc(ownerOf(a.id))}${a.ownerUserId && S.me && a.ownerUserId === S.me.user.id ? '<span class="you-tag">you</span>' : ''}</td>
+        <td class="col-hide">${esc(ownerOf(a.id))}${a.ownerUserId && S.me && a.ownerUserId === S.me.user.id ? '<span class="you-tag">you</span>' : ''}</td>
         <td class="col-hide">${esc(BACKEND[a.backend] || a.backend)}${a.model ? ` <span class="mono" style="color:var(--ink-3)">${esc(a.model)}</span>` : ''}${a.kind === 'session' ? ' <span class="tag">live session</span>' : ''}</td>
         <td class="col-hide">${a.kind === 'session' ? `<span class="tag">asks others</span>${unguarded(a) ? ` ${accessTag(a)}` : ''}` : !isCoder(a) ? '<span class="tag">No files</span>' : accessTag(a)}${repoLabel(a) ? ` <span class="mono" style="color:var(--ink-3)">${esc(repoLabel(a))}</span>` : ''}</td>
         <td><span class="status-cell">${statusDot(a)}${agentStatus(a)}</span></td>
-        <td><div class="actions">
+        <td class="col-hide"><div class="actions">
           ${a.kind !== 'session' && a.online && canPost() ? `<button class="btn" type="button" data-delegate="${esc(a.id)}">Delegate</button>` : ''}
           ${disconnectButton(a)}
         </div></td></tr>`).join('')}</tbody></table>`;
@@ -162,12 +162,15 @@ function renderProfile() {
   // Activity, from the hub. Fetched when the profile opens, and again after one of its delegations moves.
   const act = S.activity[a.id];
   if (!act) {
-    S.activity[a.id] = { loading: true };
+    // Written into this team's activity map, so a reply that lands after a team switch goes nowhere. A failure is kept
+    // (and shown) rather than retried on every re-render; it's fetched again when one of the agent's delegations moves.
+    const activity = S.activity;
+    activity[a.id] = { loading: true };
     tapi(`/agents/${encodeURIComponent(a.id)}/activity`)
-      .then((r) => { S.activity[a.id] = r; }, () => { delete S.activity[a.id]; })
-      .then(() => S.profile === a.id && renderAgents());
+      .then((r) => { activity[a.id] = r; }, (err) => { activity[a.id] = { error: err.message }; })
+      .then(() => S.activity === activity && S.profile === a.id && renderAgents());
   }
-  const ready = act && !act.loading;
+  const ready = act && !act.loading && !act.error;
   const stat = (v) => (ready ? v : '–');
   // Live status for the ones this browser has loaded; the hub's for the rest.
   const recent = ready ? act.threads.map((t) => withLive(S.threads.get(t.id) || t)) : [];
@@ -207,7 +210,7 @@ function renderProfile() {
       ${recent.length ? `<ul class="rows">${recent.map((t) => `<li><button class="row" type="button" data-thread="${esc(t.id)}">
         <span class="glyph">${glyph(t.status)}</span><span class="title">${esc(t.title)}</span><span class="time num">${rel(t.updated)}</span>
         <span class="route"><b>${esc(senderName(t))}</b> to <b>${esc((t.to.length ? t.to.map(display).join(', ') : 'nobody'))}</b></span>
-        <span class="state ${t.status}">${LABEL[t.status]}</span></button></li>`).join('')}</ul>` : `<p class="note" style="margin:0">${ready ? 'No delegations yet.' : 'Loading…'}</p>`}
+        <span class="state ${t.status}">${LABEL[t.status]}</span></button></li>`).join('')}</ul>` : `<p class="note" style="margin:0">${ready ? 'No delegations yet.' : act?.error ? `Couldn’t load its activity: ${esc(act.error)}` : 'Loading…'}</p>`}
     </section>
     <section class="block"><h2>Connection</h2>${kv(conn)}
       ${a.online && canManage(a) ? `<p class="note">${a.kind === 'session' ? 'Disconnecting stops this session’s Backchannel connection. Starting a new session reconnects it.' : 'Disconnecting stops its connector and removes it from the team. Running the connect command again brings it back.'}</p>` : ''}

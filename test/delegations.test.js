@@ -53,12 +53,12 @@ test('claude runs with only Backchannel tools: no shell for read-only agents, an
   const { claudeArgs } = await import(`../backends.js?fresh=${Date.now()}`);
   const read = claudeArgs({ system: 's', write: false, root: '/repo' });
   assert.ok(read.includes('--strict-mcp-config') && read.includes('--restricted'));
-  assert.equal(read[read.indexOf('--allowedTools') + 1], 'Read,Glob,Grep,mcp__backchannel-tools__git,mcp__backchannel-tools__list_dir');
+  assert.equal(read[read.indexOf('--allowedTools') + 1], 'Read,Glob,Grep,mcp__backchannel-tools__git,mcp__backchannel-tools__git_fetch,mcp__backchannel-tools__list_dir');
   const mcp = JSON.parse(read[read.indexOf('--mcp-config') + 1]).mcpServers['backchannel-tools'];
   assert.deepEqual([mcp.args[0], mcp.env.BACKCHANNEL_TOOLS_ROOT], [path.join(ROOT, 'tools.js'), '/repo']);
   const write = claudeArgs({ system: 's', write: true, root: '/wt' });
   assert.ok(write.includes('--strict-mcp-config') && !write.includes('--restricted'));
-  assert.equal(write[write.indexOf('--allowedTools') + 1], 'Read,Glob,Grep,mcp__backchannel-tools__git,mcp__backchannel-tools__list_dir,Edit,Write,Bash');
+  assert.equal(write[write.indexOf('--allowedTools') + 1], 'Read,Glob,Grep,mcp__backchannel-tools__git,mcp__backchannel-tools__git_fetch,mcp__backchannel-tools__list_dir,Edit,Write,Bash');
 });
 
 test('answers say which repo, commit and branch they were read from', async (t) => {
@@ -300,4 +300,38 @@ test('a cloud worker runs a live session on a scoped token alone, from env vars,
   const elsewhere = await worker.raw('ask_agent', { agent: 'bob-claude', message: 'hi', wait_seconds: 0 });
   assert.ok(elsewhere.isError);
   assert.match(elsewhere.text, /this token can only message @steve/);
+});
+
+test('a request for the owner in person reaches them without a model run, and an FYI asks nobody', async (t) => {
+  const h = await startHub(t);
+  const maya = await h.bootstrap('maya');
+  const steve = await h.join(maya, 'member', 'steve');
+  const { home, env, claudeLog } = signedIn(t, h, maya);
+  const repo = gitRepo(t);
+  connector(t, ['--backend', 'claude-code', '--no-approve'], { cwd: repo.dir, env });
+  await until(async () => (await h.ok(`${prefix(maya)}/agents`, maya.token)).find((a) => a.id === 'maya-claude' && a.online));
+  const summary = (id) => h.ok(`${prefix(maya)}/threads/${id}/summary`, maya.token);
+  const turns = () => (fs.existsSync(env.FAKE_CLAUDE_LOG) ? claudeLog().filter((l) => l.turn).length : 0);
+  const before = turns();
+
+  // For the owner: passed straight on, the delegation waits on Maya, and the connector notes it for her sessions.
+  const passed = await ask(h, steve, 'maya-claude', 'Please approve payments#12 at 1a2b3c4.', undefined, { kind: 'for-owner' });
+  assert.equal(passed.kind, 'needs-owner');
+  assert.equal(passed.needsOwner, 'Please approve payments#12 at 1a2b3c4.');
+  assert.deepEqual(passed.to, ['steve']);
+  assert.match(passed.text, /^Passed to maya: this request is for them in person/);
+  assert.equal((await summary(passed.threadId)).status, 'owner');
+  const note = await until(() => { const n = JSON.parse(fs.readFileSync(path.join(home, '.backchannel', 'connector-maya-claude.json'), 'utf8')); return n.waiting?.length && n; });
+  assert.equal(note.waiting[0].requestId, passed.inReplyTo);
+
+  // An FYI: no reply, nobody owes anything, and it reads as an FYI.
+  const fyi = await h.ok(`${prefix(maya)}/messages`, steve.token, 'POST', { text: '@maya-claude payments#12 is merged.', kind: 'fyi' });
+  await delay(1500);
+  assert.equal((await h.ok(`${prefix(maya)}/threads/${fyi.threadId}`, maya.token)).length, 1, 'nobody answered the FYI');
+  const s = await summary(fyi.threadId);
+  assert.deepEqual([s.status, s.waitingOn, s.active], ['fyi', [], false]);
+  assert.equal(turns(), before, 'neither ran the model');
+
+  // Both kinds start a request; neither can be used as an answer.
+  for (const kind of ['fyi', 'for-owner']) assert.equal((await h.api(`${prefix(maya)}/messages`, steve.token, 'POST', { text: '@maya-claude x', kind, threadId: passed.threadId, inReplyTo: passed.id })).status, 400, kind);
 });

@@ -15,8 +15,10 @@ import { backends } from './backends.js';
 import { answer, systemPrompt, filesDir, view, fromOwnerInPerson } from './responder.js';
 import { createSession, sessionFile, resumeHint } from './session.js';
 import * as service from './service.js';
+import { printable } from './safety.js';
 
-const { values: opt } = parseArgs({
+let parsed;
+try { parsed = parseArgs({
   allowNegative: true,
   options: {
     id: { type: 'string' },
@@ -30,6 +32,7 @@ const { values: opt } = parseArgs({
     approve: { type: 'boolean', default: true }, // owner confirms each request in this terminal (--no-approve to skip)
     'i-trust-this-team': { type: 'boolean', default: false }, // required for --write --no-approve
     persistent: { type: 'boolean', default: true }, // coding agents keep one conversation across requests
+    fetch: { type: 'boolean', default: true },      // read-only Claude Code may git fetch from the repo's remotes
     fresh: { type: 'boolean', default: false },     // forget that conversation and start a new one
     service: { type: 'boolean', default: false },   // install as a background service instead of running here
     stop: { type: 'boolean', default: false },      // stop and remove a background service
@@ -38,19 +41,23 @@ const { values: opt } = parseArgs({
     team: { type: 'string', default: process.env.HUB_TEAM },
     help: { type: 'boolean', short: 'h' },
   },
-});
+}); } catch (err) { console.error(`${err.message}\nSee: backchannel connect --help`); process.exit(1); }
+const { values: opt } = parsed;
 const USAGE = `usage: backchannel connect [--backend claude-code|codex|openai|grok|echo] [--cwd dir] [--id handle] [--write] [--no-approve]
-                          [--service | --stop | --status] [--no-persistent] [--fresh]
+                          [--service | --stop | --status] [--no-persistent] [--fresh] [--no-fetch] [--team name] [--model name]
   Defaults: Claude Code (or Codex if that's what's installed), the current folder, @<you>-claude, read-only,
   and it asks you in this terminal before handling each request.
   --write with --no-approve also needs --i-trust-this-team: anyone in the team could then run commands on this computer.
   Coding agents keep one conversation across requests and pick it up again after a restart. --fresh starts a new
   one; --no-persistent runs each request on its own, as before.
+  Claude Code can fetch new commits from the repo's remotes (git fetch, never touching your branches or files) when
+  it's asked about a commit it doesn't have yet. --no-fetch turns that off.
   --service runs the connector in the background instead (launchd on macOS, systemd on Linux): it starts at login,
   restarts if it crashes and handles requests without asking. --status lists background connectors; --stop removes one.`;
 const die = (msg) => { console.error(msg); process.exit(1); };
 if (opt.help) { console.log(USAGE); process.exit(0); }
 const SERVICE = process.env.BACKCHANNEL_SERVICE === '1'; // running as the background service
+if (!opt.fetch) process.env.BACKCHANNEL_NO_FETCH = '1'; // backends.js passes it on to the tools (tools.js)
 // A service's output goes to a log file, so each line gets a time.
 if (SERVICE) for (const k of ['log', 'error']) { const f = console[k].bind(console); console[k] = (...a) => f(new Date().toISOString(), ...a); }
 const tilde = (p) => (p && (p === os.homedir() || p.startsWith(os.homedir() + path.sep)) ? '~' + p.slice(os.homedir().length) : p);
@@ -87,6 +94,7 @@ if (opt.stop) {
   process.exit(0);
 }
 
+if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) die(`${cwd} isn't a folder. Run connect in the repo it should answer about, or pass --cwd.`);
 const onPath = (cmd) => spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd]).status === 0;
 const backend = opt.backend || (onPath('claude') ? 'claude-code' : onPath('codex') ? 'codex' : null);
 if (!backend) die(`Neither claude nor codex is on your PATH. Install one, or pick a backend with --backend.\n${USAGE}`);
@@ -119,7 +127,9 @@ const describe = (owner) => opt.about || (isCoder
 let description = describe(opt.owner);
 const hub = hubFromEnv({ url: opt.hub, team: opt.team });
 // Set once we know who you are: --id, or your handle plus the backend (maya-claude, maya-codex).
-let id = opt.id?.toLowerCase();
+let id = opt.id?.toLowerCase().replace(/^@/, '');
+// The hub's rule for handles; checked here too, because the id also names files and the background service.
+if (id !== undefined && !/^[a-z][a-z0-9_-]{0,31}$/.test(id)) die(`--id must be a handle: a letter, then up to 31 letters, digits, - or _ (got "${opt.id}")`);
 const card = { id, name: opt.name || id, backend, model: opt.model, owner: opt.owner, description,
   access: isCoder && opt.write ? 'write' : 'read', repo: isCoder ? path.basename(cwd) : null, approve: opt.approve, ...machineInfo() };
 const rl = opt.approve ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
@@ -167,18 +177,24 @@ rl?.on('SIGINT', () => stop(0));
 
 async function approve(msg) {
   if (!rl || fromOwnerInPerson(self, msg)) return true; // the owner's own messages (answers to NEEDS_OWNER) need no approval
+  // An FYI and a request for the owner in person don't run the agent: nothing to approve. Show them instead.
+  if (msg.kind === 'fyi' || msg.kind === 'for-owner') {
+    console.log(`\n── ${msg.kind === 'fyi' ? 'FYI' : 'for you'} from @${msg.from} ──\n${printable(msg.text)}\n`);
+    return true;
+  }
   await hub.status(id, 'approval', msg.threadId).catch(() => {});
   // However long the owner takes to answer, the request stays leased to this connector.
   const heartbeat = setInterval(() => hub.status(id, 'approval', msg.threadId).catch(() => {}), 15_000);
   try {
-    console.log(`\n── request from @${msg.from} ──\n${msg.text}${msg.files?.length ? `\n(attached: ${msg.files.map((f) => f.name).join(', ')})` : ''}\n`);
+    // Shown as plain text: escape sequences in a request can't hide or rewrite what is being approved.
+    console.log(`\n── request from @${msg.from} ──\n${printable(msg.text)}${msg.files?.length ? `\n(attached: ${printable(msg.files.map((f) => f.name).join(', '))})` : ''}\n`);
     const a = (await rl.question(`Let @${id} handle this? [y/N] `)).trim().toLowerCase();
     return a === 'y' || a === 'yes';
   } finally { clearInterval(heartbeat); }
 }
 
 async function handle(msg) {
-  console.log(`← @${msg.from}: ${msg.text.slice(0, 120)}`);
+  console.log(`← @${msg.from}: ${printable(msg.text.slice(0, 120))}`);
   if (!(await approve(msg))) {
     await hub.post({ from: id, threadId: msg.threadId, inReplyTo: msg.id, kind: 'declined', text: `${card.owner || 'My owner'} declined this request.` });
     await hub.status(id, 'idle', msg.threadId).catch(() => {});
@@ -194,9 +210,9 @@ async function handle(msg) {
       ...(sent?.needsOwner ? { needsOwner: sent.needsOwner, messageId: sent.id } : {}),
       ...(sent?.change ? { branch: sent.change.branch, repo: sent.change.repo } : {}) });
     if (!sent) { console.log('  (no reply)'); return; }
-    console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${sent.text.slice(0, 120)}`);
+    console.log(`→ ${sent.to.map((t) => '@' + t).join(' ') || '(nobody)'}: ${printable(sent.text.slice(0, 120))}`);
     if (sent.change) console.log(`  changes on ${sent.change.branch} in ${sent.change.repo} (${sent.change.stat})`);
-    if (sent.needsOwner) console.log(`  waiting on you: ${sent.needsOwner}\n  Answer in the thread, or: backchannel reply ${sent.id} "…"`);
+    if (sent.needsOwner) console.log(`  waiting on you: ${printable(sent.needsOwner)}\n  Answer in the thread, or: backchannel reply ${sent.id} "…"`);
   } catch (err) {
     console.error(`  backend error: ${err.message}`);
     note({ from: msg.from, threadId: msg.threadId, request: msg.text.slice(0, 140), reply: null, error: err.message.slice(0, 200) });
@@ -242,6 +258,7 @@ try {
     if (opt.write) args.push('--write');
     if (opt['i-trust-this-team']) args.push('--i-trust-this-team');
     if (!opt.persistent) args.push('--no-persistent');
+    if (!opt.fetch) args.push('--no-fetch');
     for (const k of ['name', 'owner', 'about', 'model']) if (opt[k]) args.push(`--${k}`, opt[k]);
     if (opt.fresh) fs.rmSync(sessionFile(id), { force: true }); // once, now: not on every restart
     const { log } = service.install({ id, args, cwd });

@@ -31,9 +31,10 @@ const STATE_DIR = path.join(os.homedir(), '.backchannel');
 const STATE_FILE = path.join(STATE_DIR, `inbox-${id}.json`);
 function writeState() {
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
     const unread = [...unclaimed.values()].map((m) => ({ id: m.id, from: m.from, threadId: m.threadId, preview: m.text.slice(0, 140) }));
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ id, pid: process.pid, updated: Date.now(), unread, answered }, null, 2));
+    // Other people's messages: readable by this user only.
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ id, pid: process.pid, updated: Date.now(), unread, answered }, null, 2), { mode: 0o600 });
   } catch (err) { log(`could not write ${STATE_FILE}: ${err.message}`); }
 }
 
@@ -137,7 +138,7 @@ async function syncStatus() {
 setInterval(() => { if (handling.size) syncStatus(); }, 60_000).unref();
 // Messages that ask us for something (anything but an answer to our own ask) put the thread in `handling`.
 function noteRead(msgs) {
-  for (const m of msgs) if (!m.reply && m.kind !== 'error' && m.kind !== 'declined') handling.set(m.threadId, Date.now());
+  for (const m of msgs) if (!m.reply && m.kind !== 'error' && m.kind !== 'declined' && m.kind !== 'fyi') handling.set(m.threadId, Date.now());
   return syncStatus();
 }
 
@@ -178,7 +179,7 @@ const answered = []; // what the stand-in did, until the session's agent has bee
 let standInBusy = false;
 let standingIn = null; // the request it claimed and is answering right now
 function standInWants(m) {
-  if (m.kind === 'error' || m.kind === 'declined' || m.note || standInFailed.has(m.id)) return false;
+  if (m.kind === 'error' || m.kind === 'declined' || m.kind === 'fyi' || m.note || standInFailed.has(m.id)) return false; // FYIs wait for the session
   if (asked.has(m.threadId)) return false; // a conversation this session started
   if (m.reply && !standInSent.has(m.inReplyTo)) return false; // an answer to something this session sent
   return true;
@@ -272,7 +273,8 @@ function unreadNote() {
 
 const attachments = (m) => (m.files?.length ? `\nAttached files (save with get_file):\n${m.files.map((f) => `- ${f.name} (${formatSize(f.size)}, ${f.type}), file_id ${f.id}`).join('\n')}` : '');
 // Message text is quoted as data: it comes from other people's agents.
-const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}${m.kind === 'needs-owner' ? `; @${m.from} is waiting on its owner, and its final answer will come in this thread` : ''}]\n${quote(m.text, m.from)}${attachments(m)}`).join('\n\n');
+const fmt = (msgs) => msgs.map((m) => `[message ${m.id} from @${m.from}, thread ${m.threadId}${m.kind === 'needs-owner' ? `; @${m.from} is waiting on its owner, and its final answer will come in this thread`
+  : m.kind === 'for-owner' ? `; for ${owner} in person: tell them, and reply only with their answer` : m.kind === 'fyi' ? '; FYI, no reply expected' : ''}]\n${quote(m.text, m.from)}${attachments(m)}`).join('\n\n');
 
 // Agents that work in `repo`, best first: online, always on, connectors before live sessions, your own agents last.
 function byRepo(agents, repo) {
@@ -285,6 +287,19 @@ function byRepo(agents, repo) {
 }
 const repoNames = (agents) => [...new Set(agents.filter((a) => a.id !== id).flatMap((a) => (a.repos || []).map((r) => r.name)))].sort();
 const ago = (ts) => { const m = Math.round((Date.now() - ts) / 60_000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+// Tool arguments come from a model and can be missing or misnamed: a missing message must not go out as "undefined".
+const badArg = (msg) => Object.assign(new Error(msg), { status: 400 });
+function textArg(value, name) {
+  if (typeof value !== 'string' || !value.trim()) throw badArg(`${name} is required: pass the text to send as ${name} (a non-empty string)`);
+  return value;
+}
+// Seconds to wait: a number, or the default when it's missing or not a number (NaN would never time out).
+const secondsArg = (value, fallback) => (Number.isFinite(Number(value)) && value !== null && value !== '' ? Number(value) : fallback);
+function idArg(value, name, required = false) {
+  if (value === undefined || value === null || value === '') { if (required) throw badArg(`${name} is required: pass the id check_inbox or ask_agent showed`); return undefined; }
+  if (typeof value !== 'string' || value.length > 200) throw badArg(`${name} must be an id (a string) like the ones check_inbox and ask_agent show`);
+  return value.trim();
+}
 // Outgoing text loses anything that looks like a credential; the agent is told when that happened.
 function outgoing(text) {
   const { text: clean, count } = redactSecrets(text);
@@ -321,11 +336,18 @@ const tools = [
         message: { type: 'string', description: 'Self-contained request with all the context the other agent needs' },
         thread_id: { type: 'string', description: 'Optional: continue an existing thread' },
         files: FILES_PARAM,
-        wait_seconds: { type: 'number', description: 'How long to wait for the reply (default 240, max 900). 0 returns right away' },
+        wait_seconds: { type: 'number', description: 'How long to wait for the reply (default 240, max 900; default 0 with for_owner or fyi). 0 returns right away' },
+        for_owner: { type: 'boolean', description: "The request is for the agent's owner in person: something only they can do or decide, like approving a PR, resolving review threads or a product decision. Their agent passes it on without trying to answer, and the delegation waits on the owner" },
+        fyi: { type: 'boolean', description: 'Just an update that needs no answer (a status report, "PR merged", "deployed"). Nobody owes a reply and no agent runs on it' },
       },
       required: ['message'],
     },
-    run: async ({ agent, repo, message, thread_id, files, wait_seconds = 240 }) => {
+    run: async ({ agent, repo, message, thread_id, files, wait_seconds, for_owner, fyi }) => {
+      textArg(message, 'message');
+      thread_id = idArg(thread_id, 'thread_id');
+      if (for_owner && fyi) throw Object.assign(new Error('pass for_owner or fyi, not both'), { status: 400 });
+      const msgKind = for_owner ? 'for-owner' : fyi ? 'fyi' : null;
+      wait_seconds = secondsArg(wait_seconds, msgKind ? 0 : 240);
       let handle = agent ? String(agent).replace(/^@/, '').toLowerCase() : null;
       let routed = '';
       if (repo !== undefined && (String(repo).length > 200 || !/^\w[\w.-]*(?:\/\w[\w.-]*)*$/.test(String(repo)))) throw Object.assign(new Error('repo must be a repository name, like account-api'), { status: 400 });
@@ -339,11 +361,13 @@ const tools = [
         routed = `Asked @${handle}, ${whose ? `${whose}'s ` : 'an '}${found[0].kind === 'session' ? 'live session' : 'agent'} in ${repo}${found[0].online ? '' : ' (offline: the request waits until it is back)'}.${found.length > 1 ? ` Others that work in ${repo}: ${found.slice(1, 4).map((a) => '@' + a.id).join(', ')}.` : ''}\n`;
       }
       const uploaded = await uploadAll(files);
-      const out = outgoing(String(message));
-      const sent = await hub.post({ from: id, text: `@${handle} ${out.text}`, threadId: thread_id, files: uploaded.map((f) => f.id), ...(repo ? { repo: String(repo) } : {}) });
+      const out = outgoing(message);
+      const sent = await hub.post({ from: id, text: `@${handle} ${out.text}`, threadId: thread_id, files: uploaded.map((f) => f.id), ...(repo ? { repo: String(repo) } : {}), ...(msgKind ? { kind: msgKind } : {}) });
       if (sent.note) return `Not delivered: ${sent.note}`;
       if (!sent.to.length) return `@${handle} is not on the network. Call list_agents to see who is.`;
       asked.set(sent.threadId, sent.ts);
+      if (fyi) return `${routed}Sent to @${handle} as an FYI (thread ${sent.threadId}). No reply is expected.${out.note}`;
+      if (for_owner && wait_seconds <= 0) return `${routed}Sent to @${handle} for its owner in person (thread ${sent.threadId}). The delegation waits on them; their answer arrives as an unread Backchannel message in that thread, and my_delegations shows where it stands.${out.note}`;
       if (wait_seconds <= 0) return `${routed}Sent to @${handle} (thread ${sent.threadId}). Carry on with your work: the answer arrives as an unread Backchannel message${channel ? ', pushed into this session,' : ''} in that thread. my_delegations shows where it stands.${out.note}`;
       const replies = await waitFor((m) => m.threadId === sent.threadId, Math.min(wait_seconds, 900), sent.threadId);
       await noteRead(replies); // a question back counts as a request to us
@@ -383,7 +407,9 @@ const tools = [
         wait_seconds: { type: 'number', description: 'Wait up to this long if nothing is there yet (default 0)' },
       },
     },
-    run: async ({ thread_id, wait_seconds = 0 }) => {
+    run: async ({ thread_id, wait_seconds }) => {
+      thread_id = idArg(thread_id, 'thread_id');
+      wait_seconds = secondsArg(wait_seconds, 0);
       const msgs = await waitFor((m) => !thread_id || m.threadId === thread_id, Math.min(wait_seconds, 900), thread_id);
       await noteRead(msgs);
       return msgs.length ? fmt(msgs) : 'Inbox is empty.';
@@ -398,8 +424,10 @@ const tools = [
       required: ['message_id', 'text'],
     },
     run: async ({ message_id, text, files }) => {
+      message_id = idArg(message_id, 'message_id', true);
+      textArg(text, 'text');
       const uploaded = await uploadAll(files);
-      const out = outgoing(String(text));
+      const out = outgoing(text);
       const sent = await hub.post({ from: id, inReplyTo: message_id, text: out.text, files: uploaded.map((f) => f.id) });
       handling.delete(sent.threadId);
       await syncStatus();
@@ -419,8 +447,9 @@ const tools = [
       required: ['file_id'],
     },
     run: async ({ file_id, save_to }) => {
+      file_id = idArg(file_id, 'file_id', true);
       const dir = save_to ? path.resolve(String(save_to).replace(/^~(?=$|\/)/, os.homedir())) : path.join(os.tmpdir(), 'backchannel-files');
-      const { path: saved, info, data } = await saveFile(hub, String(file_id), dir);
+      const { path: saved, info, data } = await saveFile(hub, file_id, dir);
       const text = /^text\/|json|xml|yaml|javascript|sql|x-diff/.test(info.type) && data.length <= 50_000 && !data.includes(0) ? data.toString('utf8') : null;
       return `Saved ${info.name} (${formatSize(info.size)}, ${info.type}) to ${saved}${text === null ? '' : `\n\n--- ${info.name} ---\n${text}`}`;
     },
@@ -455,6 +484,7 @@ async function handle(req) {
           ...MESSAGE_RULES.map((r) => `- ${r}`),
           `- If you know the repository but not whose agent works in it, call ask_agent with repo instead of agent.`,
           `- For long tasks, call ask_agent with wait_seconds: 0 and keep working. The answer arrives as an unread message; my_delegations shows where your asks stand. An agent waiting on its owner answers later, in the same thread.`,
+          `- For something only the other person can do or decide (approve a PR, resolve review threads, a product call), pass for_owner: true: their agent hands it to them instead of spending a turn saying it can't. For a status update nobody has to answer, pass fyi: true. A message marked for your own owner in person: tell them, and reply only with their answer.`,
           `- To share a file (log, diff, screenshot, spec), pass its path in \`files\` on ask_agent or reply. Download files you receive with get_file.`,
           `- Tell the user briefly when you delegated something or answered another agent.`,
         ].join('\n'),
