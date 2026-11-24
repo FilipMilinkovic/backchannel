@@ -11,9 +11,11 @@ export const thread = (id) => { const t = S.threads.get(id); return t && withLiv
 export function withLive(t) {
   const live = workingIn(t.id);
   const waiting = (t.waitingOn || []).filter((id) => agentById(id));
-  const status = live.some((l) => l.state === 'approval') ? 'approval' : live.some((l) => l.state === 'working') ? 'working'
-    : t.lastKind === 'error' ? 'error' : t.lastKind === 'declined' ? 'declined' : t.note ? 'stalled'
-      : t.lastKind === 'needs-owner' && waiting.length ? 'owner' : waiting.length ? 'queued' : 'answered';
+  // Mirrors present() in server/threads.js: a lone FYI is never being worked on.
+  const status = t.kind === 'fyi' && t.count === 1 && !waiting.length ? 'fyi'
+    : live.some((l) => l.state === 'approval') ? 'approval' : live.some((l) => l.state === 'working') ? 'working'
+      : t.lastKind === 'error' ? 'error' : t.lastKind === 'declined' ? 'declined' : t.note ? 'stalled'
+        : t.lastKind === 'needs-owner' && waiting.length ? 'owner' : waiting.length ? 'queued' : 'answered';
   return { ...t, waiting, status };
 }
 
@@ -54,14 +56,26 @@ export async function loadMessages(id, { force = false } = {}) {
   const team = S.team;
   const msgs = await tapi(`/threads/${encodeURIComponent(id)}`);
   if (team !== S.team) return null;
-  S.msgs.set(id, msgs);
-  return msgs;
+  // Messages that arrived on the event stream while this was loading may be missing from the response.
+  setMessages(id, [...msgs, ...(S.msgs.get(id) || [])]);
+  return S.msgs.get(id);
+}
+
+// Messages heard on the event stream for threads whose messages aren't loaded yet. Kept for a while, so a load
+// that races the stream (opening a thread, or a reply arriving before the hub answers a new delegation) loses none.
+const unloaded = [];
+// Sets a thread's messages (with any heard before it was loaded), oldest first, without duplicates.
+export function setMessages(id, list) {
+  const seen = new Set();
+  const all = [...list, ...unloaded.filter((m) => m.threadId === id)].filter((m) => !seen.has(m.id) && seen.add(m.id));
+  S.msgs.set(id, all.sort((a, b) => a.ts - b.ts));
 }
 
 // A message this browser posted or heard about: added to its thread if that thread is loaded.
 export function addMessage(m) {
   const list = S.msgs.get(m.threadId);
-  if (list && !list.some((x) => x.id === m.id)) list.push(m);
+  if (!list) { unloaded.push(m); if (unloaded.length > 200) unloaded.shift(); return; }
+  if (!list.some((x) => x.id === m.id)) list.push(m);
 }
 
 // A summary from the event stream (or after posting). A thread we didn't know about adds to the total.

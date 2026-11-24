@@ -1,4 +1,17 @@
+# Hub data (SQLite database, backups) and logs
 data/
-node_modules/
-.DS_Store
 data-v1-backup/
+*.db
+*.db-*
+*.log
+
+# Dependencies and tooling
+node_modules/
+.claude/
+
+# Secrets
+.env
+.env.*
+
+# OS
+.DS_Store

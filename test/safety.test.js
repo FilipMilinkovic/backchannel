@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { quote, redactSecrets, isSecretPath, attachProblem } from '../safety.js';
+import { quote, redactSecrets, isSecretPath, attachProblem, printable } from '../safety.js';
 import { claudeArgs } from '../backends.js';
 import { tempDir } from './helpers.js';
 
@@ -16,6 +16,13 @@ test('quote marks text as data, and the text cannot close the tag', () => {
   assert.equal(q.split(`</${tag}>`).length, 2, 'the closing tag appears exactly once');
   assert.notEqual(tag, quote('x', 'a').match(/untrusted-[a-f0-9]{6}/)[0]);
   assert.match(quote('x', 'a"><b'), /from="@ab"/);
+});
+
+test('printable keeps text and line breaks but shows terminal escapes and bidi overrides instead of obeying them', () => {
+  assert.equal(printable('fix the bug\r\nin app.js\twell'), 'fix the bug\nin app.js\twell');
+  const shown = printable('rm -rf ~\x1b[2K\rexplain the README\u202e');
+  assert.ok(!/[\x1b\r\u202e]/.test(shown), shown);
+  assert.match(shown, /rm -rf ~\\u001b\[2K\\u000dexplain the README\\u202e/);
 });
 
 test('redactSecrets removes credentials and leaves ordinary code alone', () => {
@@ -38,6 +45,16 @@ test('redactSecrets removes credentials and leaves ordinary code alone', () => {
   assert.doesNotMatch(pem.text, /b3BlbnNzaC1rZXk/);
   const code = 'const token = getToken(req);\nif (apiKey) send(apiKey);\nTOKEN_TTL = 60\nUse `sk-` keys from the dashboard.';
   assert.deepEqual(redactSecrets(code), { text: code, count: 0 });
+  // Passwords in URLs, JWTs, bearer headers and *_PASS lines; placeholders and plain URLs stay.
+  for (const [text, gone] of [['DATABASE_URL=postgres://app:hunter2@db:5432/x', 'hunter2'], ['git clone https://bob:s3cr3tpass@github.com/x/y', 's3cr3tpass'],
+    ['DB_PASS=hunter22', 'hunter22'], ['curl -H "Authorization: Bearer abcdefghijklmnopqrstuvwxyz12" x', 'abcdefghijklmn'],
+    [`jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.${'s'.repeat(43)}`, 'eyJzdWIi']]) {
+    const r = redactSecrets(text);
+    assert.equal(r.count, 1, text);
+    assert.ok(!r.text.includes(gone), r.text);
+  }
+  const plain = 'const url = `postgres://${user}:${pass}@${host}`;\nssh://git@github.com/x\nCOMPASS_URL=https://compass.io\npostgres://u:<password>@h';
+  assert.deepEqual(redactSecrets(plain), { text: plain, count: 0 });
 });
 
 test('secret files are never attached; ordinary files are', (t) => {
@@ -53,6 +70,10 @@ test('secret files are never attached; ordinary files are', (t) => {
   assert.equal(attachProblem(file('notes.md', '# Notes\nAll good.')), null);
   assert.equal(attachProblem(file('image.bin', Buffer.from([0, 1, 2, 3]))), null);
   assert.equal(isSecretPath(path.join(dir, 'environment.md')), false);
+  for (const name of ['.envrc', 'production.env']) assert.ok(isSecretPath(path.join(dir, name)), name);
+  // A harmless name that links to a credentials file is still a credentials file.
+  fs.symlinkSync(path.join(dir, '.env'), path.join(dir, 'notes-link.txt'));
+  assert.match(attachProblem(path.join(dir, 'notes-link.txt')), /credentials/);
 });
 
 test('connectors run Claude Code with credentials denied, read-only or not', () => {

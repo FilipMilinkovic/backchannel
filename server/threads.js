@@ -7,7 +7,9 @@
 export function stripLead(text) { return String(text).replace(/^(\s*[,:;]*\s*@[a-zA-Z][\w-]*)+[\s,:;]*/, '').trim(); }
 export function titleOf(text) {
   const plain = stripLead(text)
-    .replace(/```[\s\S]*?```/g, ' ').replace(/[*`#>]+|\b__?|__?\b(?!\w)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+    .replace(/```[\s\S]*?```/g, ' ')
+    // Markdown out: headings and quotes only where a line starts, so "payments#12" and "a > b" stay as written.
+    .replace(/^[ \t]*(?:#{1,6}|>+)[ \t]*/gm, '').replace(/[*`]+|\b__?|__?\b(?!\w)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
   const firstLine = plain.split(/\n/).map((l) => l.trim()).find(Boolean) || '';
   const sentences = firstLine.split(/(?<=[.!?])\s+/);
   const greeting = /^(hi|hey|hello|thanks|ok(ay)?|quick question)\b|\bhere[.!]?$|^(i'?m|i am|this is)\b.{0,40}\b(agent|claude|codex|code|session)[.!]?$/i;
@@ -23,6 +25,7 @@ export function titleOf(text) {
 // someone else. Writing to whoever asked always settles that ask.
 // Messages from before the hub recorded `reply` count as replies when an agent sent them with inReplyTo.
 // A question an agent passes to its owner (kind needs-owner) changes nothing: the agent still owes the answer.
+// An FYI asks nobody anything.
 export function debtsOf(msgs, isAgent) {
   const byId = new Map(msgs.map((m) => [m.id, m]));
   let debts = []; // { debtor, creditor }
@@ -32,7 +35,7 @@ export function debtsOf(msgs, isAgent) {
     const isReply = m.kind === 'error' || m.kind === 'declined' || (m.reply ?? (m.fromKind === 'agent' && !!m.inReplyTo));
     const answering = isReply && parent && parent.from !== m.from ? parent.from : null;
     const to = m.to || [];
-    const asks = m.note ? [] : to.filter((r) => r !== m.from && r !== answering && isAgent(r));
+    const asks = m.note || m.kind === 'fyi' ? [] : to.filter((r) => r !== m.from && r !== answering && isAgent(r));
     debts = debts.filter((d) => d.debtor !== m.from || !((isReply && !asks.length) || to.includes(d.creditor)));
     for (const r of asks) if (!debts.some((d) => d.debtor === r && d.creditor === m.from)) debts.push({ debtor: r, creditor: m.from });
   }
@@ -44,7 +47,7 @@ export function buildThread(msgs, isAgent) {
   const first = msgs[0], last = msgs[msgs.length - 1];
   return {
     title: first.title || titleOf(first.text),
-    from: first.from, fromKind: first.fromKind || null, to: first.to || [],
+    from: first.from, fromKind: first.fromKind || null, to: first.to || [], kind: first.kind || null,
     participants: [...new Set(msgs.flatMap((m) => [m.from, ...(m.to || [])]))],
     debts: debtsOf(msgs, isAgent),
     lastFrom: last.from, lastKind: last.kind || null, note: !!last.note, hops: last.hop || 0,
@@ -57,9 +60,11 @@ export const ACTIVE = new Set(['working', 'approval', 'queued', 'owner']);
 // A summary as the API returns it. `live` lists the states of online agents working in this thread right now.
 export function present(row, { isAgent, live = [] }) {
   const waitingOn = [...new Set(row.debts.map((d) => d.debtor))].filter(isAgent);
-  const status = live.includes('approval') ? 'approval' : live.includes('working') ? 'working'
-    : row.lastKind === 'error' ? 'error' : row.lastKind === 'declined' ? 'declined' : row.note ? 'stalled'
-      : row.lastKind === 'needs-owner' && waitingOn.length ? 'owner' : waitingOn.length ? 'queued' : 'answered';
+  // A lone FYI asks nothing, so nobody is working on it, whatever a reader's presence says.
+  const status = row.kind === 'fyi' && row.count === 1 && !waitingOn.length ? 'fyi'
+    : live.includes('approval') ? 'approval' : live.includes('working') ? 'working'
+      : row.lastKind === 'error' ? 'error' : row.lastKind === 'declined' ? 'declined' : row.note ? 'stalled'
+        : row.lastKind === 'needs-owner' && waitingOn.length ? 'owner' : waitingOn.length ? 'queued' : 'answered';
   const { debts, ...rest } = row;
   return { ...rest, waitingOn, status, active: ACTIVE.has(status), cursor: `${row.updated}:${row.id}` };
 }

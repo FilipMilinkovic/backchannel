@@ -8,7 +8,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { claudeArgs, claudeBin, childEnv, codexExec, turnTimeout, toolPaths } from './backends.js';
+import { claudeArgs, claudeBin, childEnv, codexExec, turnTimeout, toolPaths, track } from './backends.js';
 
 export const sessionFile = (id) => path.join(os.homedir(), '.backchannel', 'sessions', `${id}.json`);
 const MAX_THREADS = 200, MAX_IDS = 200;
@@ -92,7 +92,7 @@ export class ClaudeSession extends Session {
     const resume = this.saved.conversation;
     for (const d of this.o.dirs) fs.mkdirSync(d, { recursive: true });
     const args = claudeArgs({ system: this.o.system(), model: this.o.model, write: this.o.write, dirs: this.o.dirs, stream: true, resume, root: this.o.cwd });
-    const child = spawn(claudeBin(), args, { cwd: this.o.cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = track(spawn(claudeBin(), args, { cwd: this.o.cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] }));
     const proc = { child, resume, started: false, err: '' };
     this.#proc = proc;
     child.stdin.on('error', () => {}); // the process died; its exit handler reports it
@@ -139,6 +139,7 @@ export class ClaudeSession extends Session {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#turn = null;
+        if (this.#proc === proc) this.#proc = null; // the next turn starts a new process even if this one is slow to exit
         proc.child.kill('SIGTERM'); // the next turn resumes the conversation in a new process
         reject(new Error('claude timed out'));
       }, turnTimeout());
@@ -191,6 +192,8 @@ export function createSession(backend, o) {
 // How the owner can open the conversation themselves.
 export function resumeHint(backend, cwd, conversation) {
   if (!conversation) return null;
-  const dir = cwd.replace(os.homedir(), '~');
+  const home = cwd === os.homedir() || cwd.startsWith(os.homedir() + path.sep) ? '~' + cwd.slice(os.homedir().length) : cwd;
+  // Quoted when it needs to be, so the command can be pasted as it is (the ~ stays outside the quotes).
+  const dir = /^[\w@%+=:,./~-]+$/.test(home) ? home : home.startsWith('~/') ? `~/'${home.slice(2).replace(/'/g, `'\\''`)}'` : `'${home.replace(/'/g, `'\\''`)}'`;
   return backend === 'codex' ? `cd ${dir} && codex resume ${conversation}` : `cd ${dir} && claude --resume ${conversation}`;
 }

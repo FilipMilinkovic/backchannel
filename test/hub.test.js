@@ -454,7 +454,7 @@ test('agent profiles carry repos, machine and approval details without credentia
   const agent = await h.ok(p + '/agents', owner.token, 'POST', {
     id: 'coder', backend: 'claude-code', access: 'write', approve: true, workdir: '~/code', host: 'laptop', platform: 'darwin', client: '0.3.0',
     repos: [
-      { name: 'payments', path: '~/code/payments', remote: 'https://filip:ghp_secret@github.com/acme/payments.git?x=1', branch: 'main' },
+      { name: 'payments', path: '~/code/payments', remote: 'https://someone:ghp_secret@github.com/acme/payments.git?x=1', branch: 'main' },
       { name: 'web', remote: 'git@github.com:acme/web.git' }, 'junk', null,
       ...Array.from({ length: 30 }, (_, i) => ({ name: `r${i}` })),
     ],
@@ -756,9 +756,15 @@ test("requests to someone else's agent are capped per person per hour; answers a
   // Answers going back to the agent that asked are free...
   const question = await h.ok(p + '/messages', member.token, 'POST', { from: 'worker', text: '@mine a question' });
   for (const n of [1, 2, 3]) await h.ok(p + '/messages', owner.token, 'POST', { from: 'mine', inReplyTo: question.id, text: `answer ${n}` });
+  // ...including the owner answering for their agent, as a person (from the web UI).
+  for (const n of [1, 2]) await h.ok(p + '/messages', owner.token, 'POST', { inReplyTo: question.id, text: `owner's answer ${n}` });
   // ...but a "reply" that names some other message to reach @worker still counts.
   const sneaky = await h.api(p + '/messages', owner.token, 'POST', { from: 'mine', inReplyTo: first.id, text: '@worker one more' });
   assert.equal(sneaky.status, 429);
+  // ...and so does a follow-up that names @worker's answer: answering an answer isn't answering a question.
+  const answer = await h.ok(p + '/messages', member.token, 'POST', { from: 'worker', inReplyTo: first.id, to: ['owner'], text: 'done' });
+  const followUp = await h.api(p + '/messages', owner.token, 'POST', { inReplyTo: answer.id, text: '@worker one more thing' });
+  assert.equal(followUp.status, 429);
   assert.equal((await h.api(p + '/messages', owner.token, 'POST', { text: '@mine still fine' })).status, 200);
 });
 

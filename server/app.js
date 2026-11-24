@@ -60,19 +60,26 @@ export function createApp({ config, repo, log, reporter, version, root }) {
     let ip = null;
     if (config.trustProxy === 'fly') ip = header('fly-client-ip');
     else if (config.trustProxy === 'cloudflare') ip = header('cf-connecting-ip');
-    else if (config.trustProxy === 'railway') ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || null;
-    else if (config.trustProxy === 'xff') {
+    else if (config.trustProxy === 'railway') {
+      // Railway's edge sets X-Real-IP on every request and replaces any copy the caller sent; whether it also replaces
+      // X-Forwarded-For (or appends to it, leaving the first entry to the caller) isn't settled, so that's only a fallback.
+      ip = header('x-real-ip') || String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || null;
+    } else if (config.trustProxy === 'xff') {
       // The right-most entry is the one our own proxy added; anything left of it is client-supplied.
       ip = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean).pop() || null;
     }
-    return ip || req.socket.remoteAddress || 'unknown';
+    // An address is at most 45 characters; anything longer isn't one (and would only bloat the rate limiter's keys).
+    return (ip && ip.length <= 64 ? ip : null) || req.socket.remoteAddress || 'unknown';
   }
 
   async function readBody(req) {
     if (!/^application\/json\b/i.test(req.headers['content-type'] || 'application/json')) throw httpError(415, 'send JSON (content-type: application/json)');
     if (Number(req.headers['content-length'] || 0) > MAX_BODY) throw httpError(413, 'body too large');
-    let raw = '';
-    for await (const chunk of req) { raw += chunk; if (raw.length > MAX_BODY) throw httpError(413, 'body too large'); }
+    // Decoded once at the end: a multi-byte character split across two chunks would otherwise turn into U+FFFD.
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) { size += chunk.length; if (size > MAX_BODY) throw httpError(413, 'body too large'); chunks.push(chunk); }
+    const raw = Buffer.concat(chunks, size).toString('utf8');
     if (!raw) return {};
     let body;
     try { body = JSON.parse(raw); } catch { throw httpError(400, 'invalid JSON'); }

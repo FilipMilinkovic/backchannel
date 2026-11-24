@@ -37,23 +37,36 @@ export function armed(btn, label) {
 }
 
 // `profile`: an agent id, to show that agent's profile in the Agents view (#agents/<id>).
+// Where the agents table was scrolled when a profile opened from it, so going back lands on the same rows.
+let agentsTableTop = 0;
 export function setView(v, profile = null) {
   if (!['delegations', 'agents', 'members', 'connect'].includes(v)) v = 'delegations';
   const changed = S.view !== v || S.profile !== (v === 'agents' ? profile : null);
+  const wasTable = S.view === 'agents' && !S.profile, wasProfile = S.view === 'agents' && !!S.profile;
+  if (changed && wasTable) agentsTableTop = $('agentsBody').scrollTop;
   S.view = v; S.profile = v === 'agents' ? profile : null;
+  if (changed && S.profile && S.activity[S.profile]?.error) delete S.activity[S.profile]; // try again
   if (v === 'members') loadInvites().then(() => S.view === 'members' && renderMembers());
   document.querySelectorAll('.view').forEach((el) => el.classList.toggle('active', el.id === `view-${v}`));
   const hash = S.profile ? `agents/${encodeURIComponent(S.profile)}` : v;
   // Opening a profile adds a history entry, so the browser's Back returns to the list.
   if (location.hash !== '#' + hash) history[S.profile ? 'pushState' : 'replaceState'](null, '', '#' + hash);
   renderAll();
-  if (changed && v === 'agents') $('agentsBody').scrollTop = 0;
+  // The table and profiles share one scroller: a profile starts at its top, and the table comes back where it was.
+  if (changed && v === 'agents') $('agentsBody').scrollTop = !S.profile && wasProfile ? agentsTableTop : 0;
 }
 // "#agents/steve" -> ['agents', 'steve']; "#members" -> ['members', null].
 const parseHash = (h) => { const [v, id] = h.split('/'); return [v, v === 'agents' && id ? decodeURIComponent(id) : null]; };
 
 export function select(id, { focusReply = false } = {}) {
   S.selected = id; S.composing = !id; S.mobileDetail = true;
+  // An older delegation (opened from an agent's activity) may not be loaded yet: fetch its summary first.
+  if (id && !S.threads.has(id)) {
+    const team = S.team;
+    tapi(`/threads/${encodeURIComponent(id)}/summary`)
+      .then((t) => { if (team === S.team && !S.threads.has(id)) S.threads.set(id, t); }, () => {})
+      .then(() => { if (S.selected === id) { renderList(); renderDetail(); } });
+  }
   renderList(); renderDetail();
   if (focusReply && id) $('replyText').focus();
 }
@@ -66,7 +79,7 @@ function startNew(to) {
 }
 
 // ---------- events ----------
-let es = null;
+let es = null, retry = null, retryMs = 1000;
 // After a reconnect: fresh summaries, and the open thread's messages again.
 async function catchUp(team) {
   try {
@@ -75,13 +88,25 @@ async function catchUp(team) {
     renderAll();
   } catch {}
 }
-export function connect() {
-  if (es) es.close();
+export function connect(reconnecting = false) {
+  disconnect();
   const team = S.team;
-  let helloSeen = false;
-  es = new EventSource(`/api/teams/${encodeURIComponent(team)}/events?token=${encodeURIComponent(S.token)}`);
-  es.onopen = () => { S.connected = true; renderRail(); };
-  es.onerror = () => { S.connected = false; renderRail(); };
+  let helloSeen = reconnecting;
+  const source = es = new EventSource(`/api/teams/${encodeURIComponent(team)}/events?token=${encodeURIComponent(S.token)}`);
+  es.onopen = () => { S.connected = true; retryMs = 1000; renderRail(); };
+  es.onerror = () => {
+    S.connected = false; renderRail();
+    // The browser retries a dropped stream by itself, but not one answered with an error (a proxy's 502 while the hub
+    // restarts, too many streams, a revoked token): retry with backoff, after checking the sign-in still works.
+    if (source.readyState !== EventSource.CLOSED || source !== es) return;
+    retry = setTimeout(async () => {
+      retry = null;
+      if (source !== es || team !== S.team) return;
+      try { await api('/api/me'); } catch (err) { if (err.status === 401 || !S.me) return; } // a 401 signed out already
+      if (source === es && team === S.team) connect(true);
+    }, retryMs);
+    retryMs = Math.min(retryMs * 2, 30_000);
+  };
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (team !== S.team) return;
@@ -97,7 +122,7 @@ export function connect() {
     if (ev.type === 'members') {
       if (ev.members) S.members = ev.members;
       const mine = S.members.find((m) => S.me && m.userId === S.me.user.id);
-      if (!mine) { refreshAccount(); return; } // removed from this team
+      if (!mine) { refreshAccount().catch(() => {}); return; } // removed from this team
       if (mine.role !== S.role) { S.role = mine.role; loadInvites().then(renderAll); }
     }
     if (ev.type === 'agents') S.agents = ev.agents;
@@ -122,7 +147,10 @@ document.addEventListener('click', async (e) => {
   const t = e.target.closest('button, [data-id], [data-profile], a');
   if (!t) return;
   if (t.dataset.view) return setView(t.dataset.view);
-  if (t.dataset.file) return downloadFile(t.dataset.file, t.dataset.name).catch((err) => { $('replyError').textContent = `Couldn't download ${t.dataset.name}: ${err.message}`; });
+  if (t.dataset.file) return downloadFile(t.dataset.file, t.dataset.name).catch((err) => {
+    const msg = `Couldn't download ${t.dataset.name}: ${err.message}`;
+    if ($('replyForm').hidden) alert(msg); else $('replyError').textContent = msg;
+  });
   if (t.dataset.unattach) { pending[t.dataset.unattach].splice(Number(t.dataset.i), 1); return renderPending(t.dataset.unattach); }
   if (t.dataset.goto) return setView(t.dataset.goto);
   if (t.dataset.filter) { S.filter = t.dataset.filter; store.set('bc.filter', S.filter); return renderList(); }
@@ -169,8 +197,20 @@ async function copy(btn, text) {
   const orig = btn.dataset.label || btn.textContent;
   btn.dataset.label = orig;
   try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
-  catch { btn.textContent = 'Copy failed'; }
-  setTimeout(() => (btn.textContent = orig), 1600);
+  catch { btn.textContent = copyFallback(text) ? 'Copied' : 'Copy failed'; }
+  clearTimeout(btn.copyTimer);
+  btn.copyTimer = setTimeout(() => (btn.textContent = orig), 1600);
+}
+// The Clipboard API is missing outside secure contexts (a hub served over plain http on a LAN address).
+function copyFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  const prev = document.activeElement;
+  document.body.append(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  ta.remove(); prev?.focus?.();
+  return ok;
 }
 
 async function showCard(id) {
@@ -182,7 +222,7 @@ async function showCard(id) {
 }
 $('teamSelect').addEventListener('change', (e) => {
   if (e.target.value === '__new') { e.target.value = S.team; return showGate('newteam'); }
-  switchTeam(e.target.value);
+  switchTeam(e.target.value).catch((err) => { if (err.status !== 401) showGate('down', err.message); });
 });
 // keyboard: N new · J/K move · Esc back · 1-4 views
 document.addEventListener('keydown', (e) => {
@@ -219,7 +259,7 @@ function gate(html) {
   $('gate').querySelector('input')?.focus();
 }
 function showGate(kind, note = '') {
-  if (es) { es.close(); es = null; }
+  disconnect();
   if (kind === 'signin') {
     gate(`<h1>Sign in</h1>
       <p>${note ? esc(note) : 'Paste your access token. Easier: run <span class="mono">backchannel open</span> on your computer and this page opens signed in. New here? Open the invite link a teammate sent you.'}</p>
@@ -229,9 +269,13 @@ function showGate(kind, note = '') {
         <button class="btn primary" type="submit">Sign in</button></form>`);
     $('signinForm').onsubmit = async (e) => {
       e.preventDefault();
+      const btn = e.target.querySelector('button[type=submit]');
+      if (btn.disabled) return;
+      btn.disabled = true;
       S.token = $('tokenIn').value.trim();
       try { await refreshAccount(true); }
       catch (err) { S.token = ''; $('gateError').textContent = err.status === 401 ? "That token isn't valid on this hub." : `Couldn't sign in: ${err.message}`; }
+      finally { btn.disabled = false; }
     };
   } else if (kind === 'down') {
     gate(`<h1>Can't reach the hub</h1><p>${esc(note)}. Check that <span class="mono">node hub.js</span> is running, then retry.</p>
@@ -246,8 +290,12 @@ function showGate(kind, note = '') {
       ${kind === 'newteam' ? '<div class="alt"><button type="button" id="cancelGate">Cancel</button></div>' : `<div class="alt">Wrong account? <button type="button" id="gateSignout">Sign out</button></div>`}`);
     $('teamForm').onsubmit = async (e) => {
       e.preventDefault();
+      const btn = e.target.querySelector('button[type=submit]');
+      if (btn.disabled) return;
+      btn.disabled = true;
       try { const { team } = await api('/api/teams', { method: 'POST', body: JSON.stringify({ name: $('teamName').value.trim() }) }); store.set('bc.team', team.id); await refreshAccount(); }
       catch (err) { $('gateError').textContent = `Couldn't create the team: ${err.message}`; }
+      finally { btn.disabled = false; }
     };
     if ($('cancelGate')) $('cancelGate').onclick = () => { $('gate').hidden = true; $('app').hidden = false; connect(); };
     if ($('gateSignout')) $('gateSignout').onclick = () => signOut();
@@ -290,6 +338,7 @@ async function showJoin(code) {
   $('joinForm').onsubmit = async (e) => {
     e.preventDefault();
     const btn = e.target.querySelector('button[type=submit]');
+    if (btn.disabled) return;
     btn.disabled = true;
     try {
       const res = await api(`/api/invites/${encodeURIComponent(code)}/accept`, { method: 'POST',
@@ -324,6 +373,11 @@ async function showJoin(code) {
   };
 }
 
+function disconnect() {
+  if (es) { es.close(); es = null; }
+  clearTimeout(retry); retry = null;
+}
+
 export function signOut(note) {
   // Revoke this browser's session on the hub (a main token is left alone; rotate it from Connect).
   if (S.token) fetch('/api/me/logout', { method: 'POST', headers: { authorization: `Bearer ${S.token}` } }).catch(() => {});
@@ -346,10 +400,14 @@ async function switchTeam(teamId) {
   S.role = S.teams.find((t) => t.id === teamId)?.role || null;
   Object.assign(S, { agents: [], members: [], invites: [], live: {}, selected: null, composing: true, config: null,
     threads: new Map(), msgs: new Map(), counts: null, olderCursor: undefined, activity: {} });
+  // The previous team's invite link and errors don't belong here.
+  $('newLink').hidden = true; $('newLinkUrl').textContent = ''; $('iError').textContent = ''; $('newError').textContent = '';
   const [team, agents, members] = await Promise.all([tapi(''), tapi('/agents'), tapi('/members'), loadThreads(teamId)]);
+  if (S.team !== teamId) return; // switched again meanwhile
   S.config = team; S.role = team.role || S.role; S.agents = agents; S.members = members;
   for (const a of agents) if (a.state && a.state !== 'idle') S.live[a.id] = { state: a.state, threadId: a.stateThread, since: Date.now() };
   await loadInvites();
+  if (S.team !== teamId) return;
   $('gate').hidden = true; $('app').hidden = false;
   const [v, profile] = parseHash(location.hash.slice(1));
   setView(['delegations', 'agents', 'members', 'connect'].includes(v) ? v : 'delegations', profile);
@@ -363,6 +421,9 @@ async function boot() {
   const login = location.hash.match(/^#login\/([a-f0-9]+)(?:&view=(\w+))?/);
   if (login) {
     history.replaceState(null, '', '#' + (login[2] || 'delegations'));
+    // The link replaces this browser's session. Sending the old token (rotated, or from an earlier hub at this address)
+    // would get the exchange refused, so it goes first.
+    S.token = ''; store.set('bc.token', '');
     try {
       const res = await api(`/api/login/${login[1]}`, { method: 'POST', body: JSON.stringify({ label: navigator.platform ? `browser on ${navigator.platform}` : 'browser' }) });
       S.token = res.token; store.set('bc.token', res.token);

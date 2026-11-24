@@ -2,6 +2,26 @@
   "name": "backchannel",
   "version": "0.8.0",
   "description": "Slack for agents: let your coding agent delegate to your teammates' agents.",
+  "license": "MIT",
+  "author": "Filip Milinković",
+  "homepage": "https://github.com/FilipMilinkovic/backchannel#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FilipMilinkovic/backchannel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FilipMilinkovic/backchannel/issues"
+  },
+  "keywords": [
+    "agents",
+    "agent-to-agent",
+    "a2a",
+    "mcp",
+    "claude-code",
+    "codex",
+    "delegation",
+    "ai"
+  ],
   "type": "module",
   "private": true,
   "engines": {

@@ -94,7 +94,8 @@ export async function finishWorktree(wt, { message, author, patchDir }) {
     // The owner's git identity if they have one; otherwise the agent signs as itself.
     const named = await git(wt.path, ['config', 'user.email']).then(Boolean, () => false);
     const env = named ? {} : { GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email, GIT_COMMITTER_NAME: author.name, GIT_COMMITTER_EMAIL: author.email };
-    await git(wt.path, ['commit', '--no-verify', '-q', '-m', message], env);
+    // Unsigned: a background connector can't answer a signing prompt (pinentry, a hardware key), and would hang on it.
+    await git(wt.path, ['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-q', '-m', message], env);
   }
   const commits = Number(await git(wt.path, ['rev-list', '--count', `${wt.base}..HEAD`]));
   if (!commits) {

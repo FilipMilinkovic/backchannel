@@ -20,6 +20,7 @@ async function chatCompletions({ baseUrl, apiKey, model, system, prompt }) {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }] }),
+    signal: AbortSignal.timeout(turnTimeout()),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`${res.status} ${body.error?.message || JSON.stringify(body).slice(0, 300)}`);
@@ -35,15 +36,27 @@ export function childEnv() {
   return env;
 }
 
+// Coding agents this process started. They're stopped when it exits, however it exits (Ctrl-C, a service being
+// stopped, a live session closing): one left running would keep working, and editing, on a request that is handed
+// out again.
+const children = new Set();
+export function track(child) {
+  children.add(child);
+  child.once('exit', () => children.delete(child));
+  return child;
+}
+process.on('exit', () => { for (const c of children) try { c.kill('SIGTERM'); } catch {} });
+
 export const turnTimeout = () => Number(process.env.CODER_TIMEOUT_MIN || 15) * 60_000;
 export const claudeBin = () => process.env.CLAUDE_BIN || 'claude';
 
 export function run(cmd, args, { cwd, input, timeoutMs = turnTimeout() }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = track(spawn(cmd, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] }));
     const name = path.basename(cmd);
     let out = '', err = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error(`${name} timed out`)); }, timeoutMs);
+    child.stdin.on('error', () => {}); // it exited before reading its input (EPIPE): 'close' reports why
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (err += d));
     child.on('error', (e) => { clearTimeout(timer); reject(new Error(`could not start ${name}: ${e.message}`)); });
@@ -67,14 +80,14 @@ export function claudeSupports(flag) {
 }
 
 const TOOLS = fileURLToPath(new URL('./tools.js', import.meta.url));
-export const READ_TOOLS = ['Read', 'Glob', 'Grep', 'mcp__backchannel-tools__git', 'mcp__backchannel-tools__list_dir'];
+export const READ_TOOLS = ['Read', 'Glob', 'Grep', 'mcp__backchannel-tools__git', 'mcp__backchannel-tools__git_fetch', 'mcp__backchannel-tools__list_dir'];
 
 // Arguments for `claude -p`. Credentials (.env files, keys, ~/.ssh, …) are denied by permission rules in every mode.
 // Only Backchannel's own read-only tools (tools.js) are loaded, never the owner's MCP servers (which would include
 // Backchannel itself). Read-only runs also get --restricted where claude has it: no shell, no user or project settings.
 // `stream` keeps the process open and takes one turn per line on stdin (session.js); `resume` continues a conversation.
 export function claudeArgs({ system, model, write, dirs = [], stream = false, resume, root }) {
-  const mcp = { mcpServers: { 'backchannel-tools': { command: process.execPath, args: [TOOLS], env: { BACKCHANNEL_TOOLS_ROOT: root || process.cwd() } } } };
+  const mcp = { mcpServers: { 'backchannel-tools': { command: process.execPath, args: [TOOLS], env: { BACKCHANNEL_TOOLS_ROOT: root || process.cwd(), ...(process.env.BACKCHANNEL_NO_FETCH === '1' ? { BACKCHANNEL_NO_FETCH: '1' } : {}) } } } };
   const args = ['-p', '--output-format', 'stream-json', '--verbose', '--append-system-prompt', system, '--settings', claudeDenySettings(),
     '--strict-mcp-config', '--mcp-config', JSON.stringify(mcp)];
   if (stream) args.push('--input-format', 'stream-json');
@@ -123,15 +136,18 @@ async function claudeOnce({ prompt, cwd, ...o }) {
 // thread id Codex reported, if any.
 export async function codexExec({ input, model, cwd, write, resume }) {
   // Codex's sandbox decides what it may touch; its read-only sandbox still lets it run read-only commands like git log.
-  const outFile = path.join(os.tmpdir(), `codex-reply-${process.pid}-${Date.now()}.txt`);
+  // In a folder of its own: a predictable name in a shared /tmp could be planted by another user.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-reply-'));
+  const outFile = path.join(tmp, 'reply.txt');
   const args = ['exec', '--json', '--skip-git-repo-check', '--sandbox', write ? 'workspace-write' : 'read-only', '--output-last-message', outFile];
   if (model) args.push('--model', model);
   if (resume) args.push('resume', resume);
   args.push('-');
   try {
     const out = await run(codexBin(), args, { cwd, input });
+    if (!fs.existsSync(outFile)) throw new Error(`codex finished without a reply: ${out.trim().slice(-300) || 'no output'}`);
     return { reply: fs.readFileSync(outFile, 'utf8'), thread: codexThread(out) };
-  } finally { fs.rmSync(outFile, { force: true }); }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
 
 // The thread id in `codex exec --json` output: `thread.started` in current versions, `session_configured` in older ones.
@@ -146,18 +162,19 @@ export function codexThread(out) {
 }
 
 export const backends = {
+  // `o` comes first: its model is undefined unless --model was given, and must not replace the default.
   openai: (o) => chatCompletions({
+    ...o,
     baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
     apiKey: process.env.OPENAI_API_KEY,
     model: o.model || process.env.OPENAI_MODEL || 'gpt-5',
-    ...o,
   }),
 
   grok: (o) => chatCompletions({
+    ...o,
     baseUrl: process.env.XAI_BASE_URL || 'https://api.x.ai/v1',
     apiKey: process.env.XAI_API_KEY || process.env.GROK_API_KEY,
     model: o.model || process.env.XAI_MODEL || 'grok-4',
-    ...o,
   }),
 
   // Claude Code in headless mode, working inside the owner's repo.

@@ -152,7 +152,18 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
     if (b.files !== undefined && (!Array.isArray(b.files) || b.files.length > MAX_ATTACHMENTS || b.files.some((f) => typeof f !== 'string'))) {
       throw httpError(400, `files must be an array of at most ${MAX_ATTACHMENTS} file ids`);
     }
-    const files = [...new Set(b.files || [])].map((fid) => repo.file(team.id, fid) || (() => { throw httpError(404, `unknown file ${fid}`); })());
+    // A scoped token attaches only files it could download: ones in threads it reads, or not attached anywhere yet (its
+    // own uploads). Otherwise attaching a file to its own thread would make any file readable to it.
+    const attachable = (f) => {
+      if (!scope) return true;
+      const ids = repo.fileThreadIds(team.id, f.id);
+      return !ids.length || ids.some(scope.canRead);
+    };
+    const files = [...new Set(b.files || [])].map((fid) => {
+      const f = repo.file(team.id, fid);
+      if (!f || !attachable(f)) throw httpError(404, `unknown file ${fid}`);
+      return f;
+    });
     let parent = b.inReplyTo ? repo.message(b.inReplyTo) : null;
     if (b.inReplyTo && (!parent || parent.teamId !== team.id)) throw httpError(404, 'unknown parent message');
     const thread = b.threadId ? repo.threadMessages(team.id, b.threadId) : null;
@@ -173,6 +184,12 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       reply: !!b.inReplyTo };
     if (files.length) msg.files = files.map(fileView);
     if (b.kind === 'error' || b.kind === 'declined') msg.kind = b.kind;
+    // A request for the agent's owner in person (approve a PR, make a decision): the agent passes it on without
+    // running its model. An FYI asks nothing: nobody owes an answer, and agents don't run on it.
+    if (b.kind === 'for-owner' || b.kind === 'fyi') {
+      if (b.inReplyTo) throw httpError(400, `a ${b.kind} message starts a request; it can't answer one`);
+      msg.kind = b.kind;
+    }
     // An agent that can't finish without its owner: the delegation stays open, waiting on that person.
     if (b.kind === 'needs-owner' && fromKind === 'agent') {
       msg.kind = 'needs-owner';
@@ -201,10 +218,14 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       msg.note = `hop limit (${team.maxHops}) reached; not delivered. Post a new message to continue.`;
     }
     // New requests and follow-ups to someone else's agent count against a per-person hourly quota. An answer going back
-    // to the agent that asked doesn't.
+    // to the agent that asked doesn't: the parent must be that agent's request (not one of its answers) addressed to the
+    // sender, or naming any message from the agent would make follow-ups free.
+    // (Addressed to the sender, or to an agent of theirs: an owner answering for their agent from the UI.)
+    const answersAsk = msg.reply && parent && !parent.reply
+      && (parent.to || []).some((h) => h === from || repo.agent(team.id, h)?.ownerUserId === user.id);
     if (!msg.note && limits.agentRequests) {
       for (const id of targets) {
-        if (repo.agent(team.id, id).ownerUserId === user.id || (msg.reply && id === parent?.from)) continue;
+        if (repo.agent(team.id, id).ownerUserId === user.id || (answersAsk && id === parent.from)) continue;
         try { limits.agentRequests.take(`${team.id}/${id}/${user.id}`); } catch (err) {
           const minutes = Math.max(1, Math.ceil((err.retryAfter || 60) / 60));
           throw Object.assign(httpError(429, `@${id} takes at most ${config.limits.agentRequestsPerHour} requests an hour from you. Try again in ${minutes} minute${minutes > 1 ? 's' : ''}.`), { retryAfter: err.retryAfter });
@@ -491,7 +512,7 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
       return send(res, 200, { ok: true });
     }
     if (rest === '/events' && req.method === 'GET') {
-      const release = limits.streams.acquire(user.id);
+      const release = limits.streams.acquire(limitKey(auth)); // the same budget as long polls
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
       res.write(`data: ${JSON.stringify({ type: 'hello', agents: agentList(team.id), config: teamConfig(team), members: members(team.id), role: member.role })}\n\n`);
       res.on('close', release);
@@ -523,7 +544,10 @@ export function createApi({ repo, rt, config, publicUrl, limits }) {
         .map((r) => ({ name: str(r.name, 200) || 'repo', path: str(r.path, 500), remote: cleanRemote(str(r.remote, 500)), branch: str(r.branch, 200) }));
       const agent = { id, teamId: team.id, ownerUserId: user.id, name: str(b.name, 200) || id, backend: str(b.backend, 40) || 'unknown',
         model: str(b.model, 100), owner: str(b.owner, 200), description: str(b.description, 2000) || '', kind: b.kind === 'session' ? 'session' : 'agent',
-        access: b.access === 'write' ? 'write' : 'read', repo: str(b.repo, 200), skills: Array.isArray(b.skills) ? b.skills.slice(0, 50) : [],
+        access: b.access === 'write' ? 'write' : 'read', repo: str(b.repo, 200),
+        // Agent Card skills, kept to their text fields: anything else would be stored and broadcast to the team as sent.
+        skills: (Array.isArray(b.skills) ? b.skills.slice(0, 50) : []).filter((s) => s && typeof s === 'object')
+          .map((s) => ({ id: str(s.id, 100) || 'skill', name: str(s.name, 200) || str(s.id, 100) || 'skill', description: str(s.description, 1000) || '' })),
         repos, workdir: str(b.workdir, 500), host: str(b.host, 100), platform: str(b.platform, 40), client: str(b.client, 40),
         approve: typeof b.approve === 'boolean' ? b.approve : null, persistent: b.persistent === true, service: b.service === true,
         connectedAt: Date.now(),

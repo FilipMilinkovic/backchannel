@@ -115,6 +115,7 @@ export async function rotateToken(btn) {
   } catch (err) { $('tokenMsg').textContent = `Couldn't rotate: ${err.message}`; }
   finally { btn.disabled = false; btn.dataset.armed = ''; btn.textContent = 'Rotate'; }
 }
+let hopsTimer;
 $('hopsForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const n = Number($('hopsInput').value);
@@ -122,7 +123,10 @@ $('hopsForm').addEventListener('submit', async (e) => {
   $('hopsInput').setAttribute('aria-invalid', 'false'); $('hopsSave').disabled = true;
   try { S.config = { ...S.config, ...(await post('', { maxHops: n }, 'PATCH')) }; $('hopsMsg').style.color = ''; $('hopsMsg').textContent = 'Saved'; }
   catch (err) { $('hopsMsg').style.color = 'var(--danger)'; $('hopsMsg').textContent = err.message; }
-  finally { $('hopsSave').disabled = false; setTimeout(() => ($('hopsMsg').textContent = ''), 2000); }
+  finally { $('hopsSave').disabled = false; }
+  // "Saved" fades; an error stays until the next try.
+  clearTimeout(hopsTimer);
+  if ($('hopsMsg').textContent === 'Saved') hopsTimer = setTimeout(() => ($('hopsMsg').textContent = ''), 2000);
 });
 
 for (const id of ['cHandle', 'cOwner', 'cBackend', 'cFolder', 'cWrite', 'cApprove', 'cService']) $(id).addEventListener('input', buildConnector);

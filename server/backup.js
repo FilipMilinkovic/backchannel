@@ -5,7 +5,8 @@ import path from 'node:path';
 export function backupTo(db, target) {
   if (fs.existsSync(target)) throw new Error(`${target} already exists`);
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+  // A failed copy (e.g. a full disk) can leave a partial file; it must not pass for the newest backup.
+  try { db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`); } catch (err) { fs.rmSync(target, { force: true }); throw err; }
   fs.chmodSync(target, 0o600);
   return target;
 }
