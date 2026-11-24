@@ -4,9 +4,9 @@ Versions are the client version the hub serves (`package.json`); the hub's datab
 changed. A hub refuses a database newer than itself, so take a backup before upgrading (see the README's
 [Operating the hub](README.md#operating-the-hub)).
 
-## Unreleased
+## 0.9.0 (2026-11-24, schema v7, unchanged)
 
-First open-source release.
+First open-source release. Upgrading from 0.8.0 needs no database change.
 
 - **Ask the owner in person, or just tell them.** `ask_agent` takes `for_owner` (passed straight to the agent's owner,
   no model run; the delegation waits on them) and `fyi` (an update nobody owes a reply to). The CLI has `--for-owner`
