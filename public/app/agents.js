@@ -67,12 +67,13 @@ export async function disconnectAgent(btn) {
   }
 }
 
-// Re-rendering replaces the buttons; keep keyboard focus on the same one.
+// Re-rendering replaces the buttons; keep keyboard focus on the same one. preventScroll, because live updates re-render
+// while you scroll: without it every agent coming or going would jump the table back to the last button you clicked.
 function keepFocus(container, render) {
   const el = document.activeElement;
   const key = el && container.contains(el) && ['disconnect', 'delegate', 'profile', 'thread', 'card', 'action'].find((k) => el.dataset[k] !== undefined);
   render();
-  if (key) container.querySelector(`[data-${key}="${CSS.escape(el.dataset[key])}"]`)?.focus();
+  if (key) container.querySelector(`[data-${key}="${CSS.escape(el.dataset[key])}"]`)?.focus({ preventScroll: true });
 }
 
 export function renderAgents() {

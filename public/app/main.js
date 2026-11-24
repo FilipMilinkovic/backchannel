@@ -37,9 +37,13 @@ export function armed(btn, label) {
 }
 
 // `profile`: an agent id, to show that agent's profile in the Agents view (#agents/<id>).
+// Where the agents table was scrolled when a profile opened from it, so going back lands on the same rows.
+let agentsTableTop = 0;
 export function setView(v, profile = null) {
   if (!['delegations', 'agents', 'members', 'connect'].includes(v)) v = 'delegations';
   const changed = S.view !== v || S.profile !== (v === 'agents' ? profile : null);
+  const wasTable = S.view === 'agents' && !S.profile, wasProfile = S.view === 'agents' && !!S.profile;
+  if (changed && wasTable) agentsTableTop = $('agentsBody').scrollTop;
   S.view = v; S.profile = v === 'agents' ? profile : null;
   if (changed && S.profile && S.activity[S.profile]?.error) delete S.activity[S.profile]; // try again
   if (v === 'members') loadInvites().then(() => S.view === 'members' && renderMembers());
@@ -48,7 +52,8 @@ export function setView(v, profile = null) {
   // Opening a profile adds a history entry, so the browser's Back returns to the list.
   if (location.hash !== '#' + hash) history[S.profile ? 'pushState' : 'replaceState'](null, '', '#' + hash);
   renderAll();
-  if (changed && v === 'agents') $('agentsBody').scrollTop = 0;
+  // The table and profiles share one scroller: a profile starts at its top, and the table comes back where it was.
+  if (changed && v === 'agents') $('agentsBody').scrollTop = !S.profile && wasProfile ? agentsTableTop : 0;
 }
 // "#agents/steve" -> ['agents', 'steve']; "#members" -> ['members', null].
 const parseHash = (h) => { const [v, id] = h.split('/'); return [v, v === 'agents' && id ? decodeURIComponent(id) : null]; };
