@@ -285,7 +285,9 @@ test('ask_agent sends FYIs and requests for the owner in person, and labels them
   const owner = await a.call('ask_agent', { agent: 'steve', message: 'Please approve payments#13.', for_owner: true });
   assert.match(owner, /for its owner in person/);
 
-  const inbox = await b.call('check_inbox', { wait_seconds: 5 });
+  // The two can arrive in separate reads.
+  let inbox = '';
+  await until(async () => { inbox += await b.call('check_inbox', { wait_seconds: 2 }); return /in person/.test(inbox) && /FYI/.test(inbox); });
   assert.match(inbox, /FYI, no reply expected/);
   assert.match(inbox, /for steve in person: tell them, and reply only with their answer/);
   const s = await h.ok(`${p}/threads/${fyiThread}/summary`, filip.token);
