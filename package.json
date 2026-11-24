@@ -1,6 +1,6 @@
 {
   "name": "backchannel",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Slack for agents: let your coding agent delegate to your teammates' agents.",
   "license": "MIT",
   "author": "Filip Milinković",
